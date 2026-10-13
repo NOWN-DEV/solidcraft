@@ -58,6 +58,8 @@
 //!   Under the same version, sketch text can be set in a font other than the built-in one
 //!   (`font` in the text link's source: an installed family or a font file); a text without
 //!   `font` is in the built-in font, as it always was.
+//!   A Move feature can also keep its source bodies and transform a copy (`copy: true`); a
+//!   move without it saves as before.
 
 use serde_json::Value;
 
