@@ -81,6 +81,10 @@
 //!   bend (`rim.bend0`, `rim.bend1`). Version 16 designs need no transformation; the version
 //!   stamp makes 0.8.0 (which reads up to 16) ask for an update instead of meeting names it
 //!   can't resolve.
+//!   A sketch's link to a projected edge can also keep the edge's persistent name (`edge_name`,
+//!   beside `face_name`) and is then found by it, wherever the edge went. A link without it is
+//!   the edge nearest its point, as it always was, and takes the name when its sketch is next
+//!   edited.
 
 use serde_json::Value;
 
