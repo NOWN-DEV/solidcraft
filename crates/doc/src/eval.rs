@@ -924,7 +924,14 @@ impl Model {
             let f = if !explicit_emboss && f.face_names.iter().any(|n| !n.is_empty()) {
                 let mut g = f.clone();
                 let mut notes = Vec::new();
-                for (p, n) in g.kind.face_points_mut().into_iter().zip(&f.face_names) {
+                // A hole's position is a place on its face, not a pick of the face: it follows
+                // the face along the hole's axis and never slides sideways to the face's nearest
+                // point when the face no longer reaches it.
+                let hole_axis = match &f.kind {
+                    FeatureKind::Hole { direction, points: None, .. } => direction.normalized(),
+                    _ => None,
+                };
+                for (k, (p, n)) in g.kind.face_points_mut().into_iter().zip(&f.face_names).enumerate() {
                     if n.is_empty() {
                         continue;
                     }
@@ -933,7 +940,18 @@ impl Model {
                             if let Some(note) = hit.note(n) {
                                 notes.push(note);
                             }
-                            *p = hit.point;
+                            match (k, hole_axis) {
+                                (0, Some(axis)) => match hit.along(&state, *p, axis) {
+                                    Some(q) => *p = q,
+                                    // The place still lies on the face (the axis may run along it).
+                                    None if hit.on_point => {}
+                                    None => notes.push(format!(
+                                        "the hole's position [{}, {}, {}] is no longer on face `{n}`: it stays where it was placed",
+                                        p.x, p.y, p.z
+                                    )),
+                                },
+                                _ => *p = hit.point,
+                            }
                         }
                         None => notes.push(format!("face `{n}` no longer exists; using the face at the picked point")),
                     }
@@ -1045,10 +1063,12 @@ pub fn select_profiles(ss: &SolvedSketch, sel: &ProfileSel) -> Result<Vec<Region
     }
     let out: Vec<Region2> = match sel {
         // "All" means what was drawn: projected reference geometry (a face's auto-projected
-        // edges) only counts when the drawn curves alone make no profile.
+        // edges) only counts when the drawn curves alone make no profile. Text is drawn, and
+        // its letters keep their counters as holes (the counters are not filled in).
         ProfileSel::All => {
             let drawn = solidcraft_sketch::find_drawn_profiles(&ss.sketch);
-            if drawn.is_empty() { ps.iter().map(|p| p.region.clone()).collect() } else { drawn.into_iter().map(|p| p.region).collect() }
+            let chosen = if drawn.is_empty() { ps.clone() } else { drawn };
+            solidcraft_sketch::without_text_counters(&ss.sketch, chosen).into_iter().map(|p| p.region).collect()
         }
         ProfileSel::Indices { indices } => {
             let mut v = Vec::new();
@@ -1305,7 +1325,9 @@ fn apply_traced(state: &mut ModelState, f: &Feature, tools: Vec<Traced>, op: Ope
             });
             let live: std::collections::BTreeSet<&str> = state.bodies.iter().map(|b| b.name.as_str()).collect();
             state.threads.retain(|t| live.contains(t.body.as_str()));
-            // A cut can leave a body in pieces: each piece becomes its own body ("Bar", "Bar (1)").
+            // A cut can leave a body in pieces: each piece becomes its own body ("Bar", "Bar (1)"),
+            // numbered on past names already taken (a body cut in pieces before).
+            let mut taken: std::collections::BTreeSet<String> = state.bodies.iter().map(|b| b.name.clone()).collect();
             let mut split: Vec<ModelBody> = Vec::new();
             for mb in std::mem::take(&mut state.bodies) {
                 if !affected.contains(&mb.name) || state.sheets.iter().any(|s| s.body == mb.name) {
@@ -1321,7 +1343,12 @@ fn apply_traced(state: &mut ModelState, f: &Feature, tools: Vec<Traced>, op: Ope
                 // (so pieces of one face in different bodies are told apart).
                 let lineages = crate::lineage::Lineage::lumps(&mb.body, mb.lineage().as_deref(), &pieces);
                 for (k, (p, lineage)) in pieces.into_iter().zip(lineages).enumerate() {
-                    let name = if k == 0 { mb.name.clone() } else { format!("{} ({k})", mb.name) };
+                    let name = if k == 0 {
+                        mb.name.clone()
+                    } else {
+                        (k..=k + taken.len()).map(|j| format!("{} ({j})", mb.name)).find(|n| !taken.contains(n)).unwrap_or_default()
+                    };
+                    taken.insert(name.clone());
                     split.push(ModelBody::new(name, p, mb.feature).with_lineage(lineage));
                 }
             }
