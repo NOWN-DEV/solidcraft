@@ -1046,7 +1046,6 @@ fn a_through_hole_into_a_shelled_box_rim() {
 }
 
 #[test]
-#[ignore = "fails until #560 is fixed"]
 fn a_hole_through_a_sheet_metal_base() {
     let mut c: Vec<Value> = rectangle(json!("XY"), [0., 0.], [60., 40.]).into();
     c.extend([

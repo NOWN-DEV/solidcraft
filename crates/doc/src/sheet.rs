@@ -1143,10 +1143,21 @@ impl SheetBody {
                 }
             }
             for (pi, panel) in &panels {
-                let clipped = material_boolean(panel, std::slice::from_ref(&pocket.region), kernel::BoolOp::Intersect, work)?;
-                if clipped.is_empty() {
+                if material_boolean(panel, std::slice::from_ref(&pocket.region), kernel::BoolOp::Intersect, work)?.is_empty() {
                     continue;
                 }
+                // The tool spans the cut-outs inside it (a counterbore's hole, whichever was made
+                // first): a wall of its own along a cut-out's wall would only touch it, which the
+                // cut cannot resolve. An island of the pocket that holds material stays.
+                let outline: Vec<Region2> = panel.iter().map(|r| Region2 { outer: r.outer.clone(), holes: Vec::new() }).collect();
+                let mut spanning = Region2 { outer: pocket.region.outer.clone(), holes: Vec::new() };
+                for island in &pocket.region.holes {
+                    let inside = Region2 { outer: island.ccw(), holes: Vec::new() };
+                    if !material_boolean(panel, std::slice::from_ref(&inside), kernel::BoolOp::Intersect, work)?.is_empty() {
+                        spanning.holes.push(island.clone());
+                    }
+                }
+                let clipped = material_boolean(&outline, std::slice::from_ref(&spanning), kernel::BoolOp::Intersect, work)?;
                 let w = if self.flat { self.frame_mat() } else { self.world(*pi) };
                 let plane = plane_of(&w, Vec3::ZERO, Vec3::X, Vec3::Y)?;
                 // BRep replay is costlier than planar clipping; share the command budget.
@@ -2730,6 +2741,20 @@ impl SheetBody {
         None
     }
 
+    /// The normal (world) of the panel whose material holds a world point; the flat sheet's
+    /// while it is unfolded. `None` in a bend and outside the sheet.
+    pub fn panel_normal_at(&self, p: Vec3) -> Option<Vec3> {
+        let flat = if self.flat { self.flat_regions().ok()? } else { Vec::new() };
+        let panels = if self.flat { vec![(None, self.base.clone())] } else { self.panels() };
+        panels.into_iter().find_map(|(pi, region)| {
+            let world = self.world(pi);
+            let q = apply_point(&mat_inverse(&world)?, p);
+            let q2 = Vec2::new(q.x, q.y);
+            let inside = q.z > 0.0 && q.z < self.t && if self.flat { flat.iter().any(|r| r.contains(q2)) } else { region.contains(q2) };
+            inside.then(|| apply_vector(&world, Vec3::Z))
+        })
+    }
+
     /// The plane of the flat face with this persistent name (see [`panel_face_at`](Self::panel_face_at)).
     /// A face named while the sheet was folded follows its panel; one named unfolded (`flat`)
     /// is the flat sheet's own plane.
@@ -3410,6 +3435,26 @@ mod tests {
         s.flat = true;
         assert_eq!(face(&s, Vec3::new(50.0, -10.0, 2.5)).map(|f| f.0).as_deref(), Some("flat:top"));
         assert!(s.panel_face("flat:bottom").is_some());
+    }
+
+    #[test]
+    fn the_panel_that_holds_a_point_gives_its_normal() {
+        // A 100 x 60 x 2.5 plate with a flange up from its y = 0 edge. The bend (inner radius
+        // 2.5) turns about the line y = 5, z = 5: the base's panel is y > 5, the flange's z > 5
+        // with its material at 0 < y < 2.5.
+        let mut s = plate(100.0, 60.0);
+        s.add_flange(Vec3::new(50.0, 0.0, 2.5), 20.0, std::f64::consts::FRAC_PI_2, 2.5, "inside", false).unwrap();
+        let along =
+            |s: &SheetBody, p: [f64; 3], axis: Vec3| s.panel_normal_at(Vec3::new(p[0], p[1], p[2])).is_some_and(|n| n.cross(axis).len() < 1e-9);
+        let none = |s: &SheetBody, p: [f64; 3]| s.panel_normal_at(Vec3::new(p[0], p[1], p[2])).is_none();
+        assert!(along(&s, [50.0, 30.0, 1.0], Vec3::Z));
+        assert!(along(&s, [50.0, 1.0, 12.0], Vec3::Y));
+        // In the bend, above the base and beyond the flange's end there is no panel.
+        assert!(none(&s, [50.0, 2.0, 2.0]) && none(&s, [50.0, 30.0, 3.0]) && none(&s, [50.0, 1.0, 21.0]));
+        // Unfolded it is one flat sheet, the flange lying at y < 5 − BA (BA = π/2 · 3.6).
+        s.flat = true;
+        assert!(along(&s, [50.0, 30.0, 1.0], Vec3::Z) && along(&s, [50.0, -10.0, 1.0], Vec3::Z));
+        assert!(none(&s, [50.0, 1.0, 12.0]) && none(&s, [50.0, -20.0, 1.0]));
     }
 
     #[test]

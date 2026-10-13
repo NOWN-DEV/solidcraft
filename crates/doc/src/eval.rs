@@ -3417,7 +3417,13 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
         FeatureKind::Hole { thread, diameter, .. } => {
             let (spots, dir) = hole_spots(st, f)?;
             let tools = feature_tools(doc, vals, f, st)?;
-            apply_op(st, f, tools, Operation::Cut, &[])?;
+            // A hole square to a sheet metal panel is flat machining too.
+            let handled = if st.sheets.is_empty() { Vec::new() } else { more::sheet_holes(f, st, &tools, &spots, dir)? };
+            if handled.is_empty() {
+                apply_op(st, f, tools, Operation::Cut, &[])?;
+            } else {
+                apply_beside_sheet_cut(st, f, tools.into_iter().map(Traced::unnamed).collect(), Operation::Cut, &[], &handled)?;
+            }
             if let Some(d) = thread {
                 // A point on each hole's wall, a little below the entry.
                 let r = val(vals, diameter, Kind::Length)? / 2.0;

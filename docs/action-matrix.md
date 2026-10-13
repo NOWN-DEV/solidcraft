@@ -80,7 +80,7 @@ resolves; it is recorded as `<action>+edit`.
 
 ## Results
 
-**30567 of 35576 actions pass (85.9%)** on 104 designs; the edit round passes 1370 of 1386.
+**30622 of 35576 actions pass (86.1%)** on 104 designs; the edit round passes 1371 of 1387.
 
 ### By category
 
@@ -89,7 +89,7 @@ resolves; it is recorded as `<action>+edit`.
 | body | 472 | 471 | 99.8% |
 | curved | 1848 | 1814 | 98.2% |
 | edge | 18763 | 17469 | 93.1% |
-| face | 9323 | 5679 | 60.9% |
+| face | 9323 | 5734 | 61.5% |
 | vertex | 5170 | 5134 | 99.3% |
 
 ### By action
@@ -110,7 +110,7 @@ resolves; it is recorded as `<action>+edit`.
 | `face.angle_plane` | 1004 | 980 | 97.6% | 51 / 51 |
 | `face.draft_neutral` | 895 | 246 | 27.5% | 8 / 8 |
 | `face.extrude` | 1123 | 465 | 41.4% | 25 / 26 |
-| `face.hole` | 1123 | 726 | 64.6% | 40 / 43 |
+| `face.hole` | 1123 | 781 | 69.5% | 41 / 44 |
 | `face.midplane` | 686 | 674 | 98.3% | 25 / 26 |
 | `face.offset_plane` | 1123 | 586 | 52.2% | 26 / 26 |
 | `face.press_pull` | 1123 | 465 | 41.4% | 25 / 26 |
@@ -130,7 +130,7 @@ resolves; it is recorded as `<action>+edit`.
 | corpus/m0-revolve-primitives | 344 | 300 | 87.2% |
 | corpus/modern-path-pattern | 299 | 294 | 98.3% |
 | corpus/modern-plastic | 830 | 634 | 76.4% |
-| corpus/modern-sheet-metal | 394 | 273 | 69.3% |
+| corpus/modern-sheet-metal | 394 | 279 | 70.8% |
 | corpus/move-bodies | 262 | 262 | 100.0% |
 | corpus/naming-split-pieces | 285 | 224 | 78.6% |
 | corpus/split-body-pieces | 304 | 280 | 92.1% |
@@ -204,16 +204,16 @@ resolves; it is recorded as `<action>+edit`.
 | oracle/64-sketch-tangent-arc-chain | 173 | 142 | 82.1% |
 | oracle/65-sketch-gear-tooth | 170 | 144 | 84.7% |
 | oracle/66-sketch-linkage | 201 | 195 | 97.0% |
-| oracle/67-sm-base-flange | 131 | 105 | 80.2% |
-| oracle/68-sm-edge-flange | 263 | 187 | 71.1% |
-| oracle/69-sm-tray | 919 | 599 | 65.2% |
-| oracle/70-sm-flange-45 | 261 | 185 | 70.9% |
-| oracle/71-sm-custom-rule | 394 | 278 | 70.6% |
-| oracle/72-sm-contour-flange | 394 | 273 | 69.3% |
-| oracle/73-sm-hem | 395 | 272 | 68.9% |
+| oracle/67-sm-base-flange | 131 | 107 | 81.7% |
+| oracle/68-sm-edge-flange | 263 | 191 | 72.6% |
+| oracle/69-sm-tray | 919 | 609 | 66.3% |
+| oracle/70-sm-flange-45 | 261 | 189 | 72.4% |
+| oracle/71-sm-custom-rule | 394 | 284 | 72.1% |
+| oracle/72-sm-contour-flange | 394 | 279 | 70.8% |
+| oracle/73-sm-hem | 395 | 275 | 69.6% |
 | oracle/74-sm-unfold-refold | 619 | 439 | 70.9% |
-| oracle/75-sm-bracket-holes | 479 | 323 | 67.4% |
-| oracle/76-sm-thickness-variant | 263 | 187 | 71.1% |
+| oracle/75-sm-bracket-holes | 479 | 329 | 68.7% |
+| oracle/76-sm-thickness-variant | 263 | 191 | 72.6% |
 | regressions/join_struts_on_bore_wall | 544 | 424 | 77.9% |
 | regressions/loft_cut_beside_round_hole | 386 | 305 | 79.0% |
 | regressions/oblique_cut_of_cylinder | 306 | 269 | 87.9% |
@@ -224,13 +224,13 @@ resolves; it is recorded as `<action>+edit`.
 | typical/loft | 218 | 180 | 82.6% |
 | typical/multi-body-join-cut | 309 | 284 | 91.9% |
 | typical/revolved-part | 161 | 153 | 95.0% |
-| typical/sheet-metal-bracket | 311 | 230 | 74.0% |
+| typical/sheet-metal-bracket | 311 | 234 | 75.2% |
 | typical/stacked-extrude | 283 | 275 | 97.2% |
 | typical/sweep | 280 | 185 | 66.1% |
 
 ## Causes
 
-Every failure, grouped by cause (5025 in all). Faces that can't take an attached sketch fail four
+Every failure, grouped by cause (4970 in all). Faces that can't take an attached sketch fail four
 actions each (`face.sketch`, `face.offset_plane`, and `face.press_pull` and `face.extrude`, which
 make a legacy face sketch there).
 
@@ -243,9 +243,9 @@ make a legacy face sketch there).
 | 380 | #493 | Cut walls, hole faces and chamfer faces have no source | `face.extrude` 95, `face.offset_plane` 95, `face.press_pull` 95, `face.sketch` 95 | 17 | corpus/split-body-pieces `Body1 (1)/F4:side:l1` |
 | 336 | #557 | Pattern and mirror copies share or lose their faces' sources | `face.extrude` 84, `face.offset_plane` 84, `face.press_pull` 84, `face.sketch` 84 | 6 | demo/pi-case `Body1/F6:top` |
 | 285 | #558 | Picks on a moved or pasted component miss (construction geometry, Hole, Press Pull, Project) | `edge.normal_plane` 55, `edge.axis` 51, `vertex.plane_three_points` 36, `face.extrude` 34 | 2 | corpus/components-arm `ArmBody (Arm:2)/F4:+x` |
-| 226 | #559 | A through-all Hole along a wall or beside curved faces: the cut fails | `face.hole` 226 | 46 | corpus/m0-revolve-primitives `Body1/F2:end` |
-| 155 | #560 | Hole on a sheet metal face is refused | `face.hole` 155 | 12 | corpus/modern-sheet-metal `Body1/F2:face:0` |
+| 186 | #559 | A through-all Hole along a wall or beside curved faces: the cut fails | `face.hole` 186 | 37 | corpus/m0-revolve-primitives `Body1/F2:end` |
 | 146 | #561 | Loft, Sweep and Coil faces have no source | `face.offset_plane` 38, `face.sketch` 38, `face.extrude` 35, `face.press_pull` 35 | 10 | oracle/16-sweep `Tube/F3:end` |
+| 140 |  | Hole into the edge of sheet metal (a rim face, or the end face of a bend) is refused: a hole has to be square to a flat panel (expected, not filed). Six of these are panel faces of oracle/74-sm-unfold-refold that take a hole under the names they have now; the baseline has their old names | `face.hole` 140 | 12 | oracle/67-sm-base-flange `Body1/F2:face:3` |
 | 116 | #431 | Fillet or chamfer along a curved edge: the ball doesn't fit along the edge | `edge.chamfer` 68, `edge.fillet` 48 | 16 | corpus/modern-sheet-metal `Body1/F2:face:14\|F2:face:16` |
 | 100 | #492 | A face split into pieces by a later feature | `face.extrude` 25, `face.offset_plane` 25, `face.press_pull` 25, `face.sketch` 25 | 5 | corpus/issue-489-stacked-join `Body1/F2:top#[F2:side:l1,F4:side:l5]` |
 | 98 | #491 | A face that a Join merged from two features' faces | `face.sketch` 27, `face.offset_plane` 25, `face.extrude` 23, `face.press_pull` 23 | 12 | corpus/issue-489-stacked-join `Body1/F2:side:l2` |

@@ -594,7 +594,10 @@ fn poly_area(p: &[Vec2]) -> f64 {
 
 /// Current unmodified extrusion caps, including placement, certify the tool's depth.
 /// Tessellation can drift in thickness at distant coordinates and cannot certify a slab.
-fn sheet_tool_span(body: &Body, source: &Plane) -> Option<(f64, f64, f64, Option<(Plane, Region2)>)> {
+/// `as_built` is a tool nothing has touched since its extrude (a hole's drill): its caps are
+/// where their sources say. The plane the kernel fits to the far cap of a long drill can lie
+/// some 1e-11 mm off them, more than the roundoff a cap's current plane is allowed.
+fn sheet_tool_span(body: &Body, source: &Plane, as_built: bool) -> Option<(f64, f64, f64, Option<(Plane, Region2)>)> {
     use kernel::FaceSource;
     #[derive(PartialEq)]
     enum Signature<'a> {
@@ -638,7 +641,7 @@ fn sheet_tool_span(body: &Body, source: &Plane) -> Option<(f64, f64, f64, Option
                     && p.x.dot(p.y).abs() <= 1e-10
                     && p.normal().cross(n).len() <= 1e-10
             };
-            let current = body.planar_face(index)?;
+            let current = if as_built { plane } else { body.planar_face(index)? };
             if !valid(&plane) || !valid(&current) {
                 return None;
             }
@@ -673,7 +676,7 @@ pub(super) fn sheet_cut(
     }
     let Some(ss) = st.sketch(*sketch).cloned() else { return Ok(Vec::new()) };
     let regions = solidcraft_sketch::merge_regions(&select_profiles(&ss, profiles)?);
-    sheet_prism_cut(f, st, &ss.plane, &regions, *operation, tools, targets, constructor, extent.to.is_some())
+    sheet_prism_cut(f, st, &ss.plane, &regions, *operation, tools, targets, constructor, extent.to.is_some(), false)
 }
 
 /// Whether a cut of `f` with these targets (else its participants, else its component's
@@ -714,7 +717,70 @@ pub(super) fn sheet_primitive_cut(f: &Feature, st: &mut ModelState, tool: &Body,
     let Some(normal) = normal else { return Ok(Vec::new()) };
     let Some((plane, region, interval)) = prism.along(normal) else { return Ok(Vec::new()) };
     let tools = kernel::extrude(&plane, std::slice::from_ref(&region), interval.0, interval.1)?;
-    sheet_prism_cut(f, st, &plane, std::slice::from_ref(&region), operation, &tools, &[], None, false)
+    sheet_prism_cut(f, st, &plane, std::slice::from_ref(&region), operation, &tools, &[], None, false, false)
+}
+
+/// A hole in sheet metal is machined like the extrude cut of its circle: square to a panel it
+/// is a round cut-out of the flat pattern there, and a counterbore or a blind hole a round
+/// pocket. Returns the sheet bodies the hole reaches, machined or left as they are; none when
+/// a drill is not such a prism here (the generic preflight then decides).
+pub(super) fn sheet_holes(f: &Feature, st: &mut ModelState, tools: &[Body], spots: &[Vec3], dir: Vec3) -> Result<Vec<String>> {
+    let reached: Vec<crate::sheet::SheetBody> = st.sheets.iter().filter(|sh| sheet_eligible(f, st, &[], sh)).cloned().collect();
+    if reached.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The panel a drill enters decides: only a hole along its normal has a flat form.
+    for sh in &reached {
+        if spots.iter().any(|spot| sh.panel_normal_at(*spot + dir * (sh.t * 0.05)).is_some_and(|n| n.cross(dir).len() > 1e-6)) {
+            return Err(DocError::Invalid(
+                "a hole in sheet metal must be square to the panel it enters: this one is slanted to the panel or drilled into the edge of the sheet; drill it along the panel's normal from one of its flat faces".into(),
+            ));
+        }
+    }
+    let axis = Plane::from_normal(Vec3::ZERO, -dir).ok_or_else(|| DocError::Invalid("hole axis".into()))?;
+    // Drills of one depth interval (the holes at the points of one sketch) are cut together,
+    // like the circles of one sketch; a counterbore and its hole one after the other.
+    let mut groups: Vec<(f64, f64, f64, Vec<Body>)> = Vec::new();
+    for tool in tools {
+        let Some((lo, hi, roundoff, Some(_))) = sheet_tool_span(tool, &axis, true) else {
+            // A countersink or a drill point: a cone leaves neither a cut-out nor a pocket.
+            for sh in &reached {
+                if let Some(mb) = st.body(&sh.body)
+                    && super::sheet_boolean_changes(&mb.body, std::slice::from_ref(tool), Operation::Cut)?
+                {
+                    return Err(DocError::Invalid(
+                        "not supported yet: a countersink or a drill point in sheet metal (a cone has no flat cut-out or pocket); use a simple or counterbored hole through the sheet".into(),
+                    ));
+                }
+            }
+            continue;
+        };
+        match groups.iter_mut().find(|g| (g.0 - lo).abs() <= g.2 + roundoff && (g.1 - hi).abs() <= g.2 + roundoff) {
+            Some(group) => {
+                (group.0, group.1, group.2) = (group.0.min(lo), group.1.max(hi), group.2.max(roundoff));
+                group.3.push(tool.clone());
+            }
+            None => groups.push((lo, hi, roundoff, vec![tool.clone()])),
+        }
+    }
+    for (_, _, _, drills) in &groups {
+        if sheet_prism_cut(f, st, &axis, &[], Operation::Cut, drills, &[], None, true, true)?.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(reached.into_iter().map(|sh| sh.body).collect())
+}
+
+/// A full circle as the plain circle of its frame; any other region as it is.
+fn plain_circle(region: Region2) -> Region2 {
+    match region.outer.segs.as_slice() {
+        [Seg2::Arc { center, radius, sweep: a, .. }, Seg2::Arc { center: c, radius: r, sweep: b, .. }]
+            if region.holes.is_empty() && center == c && radius == r && ((a + b).abs() - std::f64::consts::TAU).abs() < 1e-9 =>
+        {
+            Region2 { outer: Loop2::circle(*center, *radius), holes: Vec::new() }
+        }
+        _ => region,
+    }
 }
 
 /// A primitive tool's exact geometry, for [`sheet_primitive_cut`].
@@ -772,6 +838,9 @@ fn sheet_prism_cut(
     targets: &[String],
     constructor: Option<&ExtrudeConstructor>,
     footprints_bound: bool,
+    // A hole's drills: as built, each kept as the plain circle of its panel (the form a sketch
+    // circle or a Cylinder cut has there), wherever the drill's own seam lies.
+    drills: bool,
 ) -> Result<Vec<String>> {
     let n = plane.normal();
     let mut work = sheet::FlatWork::new();
@@ -784,7 +853,7 @@ fn sheet_prism_cut(
     let mut cap_roundoff: f64 = 0.0;
     let mut current_footprints = Vec::new();
     for tool in tools {
-        let Some((lo, hi, roundoff, footprint)) = sheet_tool_span(tool, plane) else {
+        let Some((lo, hi, roundoff, footprint)) = sheet_tool_span(tool, plane, drills) else {
             // Modified tools need a current geometric prism certificate. The generic
             // sheet preflight permits actual no-change, otherwise refuses stale metadata.
             return Ok(Vec::new());
@@ -887,6 +956,7 @@ fn sheet_prism_cut(
             } else {
                 regions.iter().map(|r| sh.region_to_flat(pi, plane, r)).collect::<Result<Vec<_>>>()?
             };
+            let mapped = if drills { mapped.into_iter().map(plain_circle).collect() } else { mapped };
             if operation == Operation::Intersect {
                 if z1 <= z0 {
                     sh.holes.push(panel);

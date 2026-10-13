@@ -132,6 +132,13 @@ A Box cut, or a Cylinder cut whose axis is the sheet's normal, machines the shee
 extrude of its footprint: through the sheet it is a cut-out (a cylinder a round one), and
 part way it is a pocket. A primitive cut at any other angle, or across a folded bend, is refused.
 
+Hole machines the sheet the same way from a flat face of any panel, the base or a flange, on
+either side: square to that panel, a through hole (plain or tapped) is a round cut-out of the
+flat pattern and a `CIRCLE` in the DXF, and a counterbore or a blind flat-bottomed hole is a
+round pocket. A hole slanted to the panel, one drilled into the edge of the sheet, a
+countersink and a drill point are refused with the reason; a hole that reaches a bend needs
+the sheet unfolded first.
+
 Parallel, untapered extrude cuts also preserve shallow pockets through Unfold / Refold.
 The pocket floor and side walls remain solid geometry; overlapping cuts from opposite sides
 become a through hole wherever they remove the whole thickness. Flat-pattern JSON lists
