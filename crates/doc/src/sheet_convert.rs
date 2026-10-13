@@ -178,7 +178,7 @@ fn inset(pts: &[Vec2], by: &[f64]) -> Result<(Vec<Vec2>, Vec<Option<usize>>)> {
     }
     // Every edge still runs the way it did, and the outline is still one simple loop.
     let m = out.len();
-    let kept = (0..m).all(|j| match (from.get(j).copied().flatten().and_then(&moved), out.get(j), out.get((j + 1) % m)) {
+    let kept = (0..m).all(|j| match (from.get(j).copied().flatten().and_then(moved), out.get(j), out.get((j + 1) % m)) {
         (Some((_, d)), Some(&a), Some(&b)) => (b - a).dot(d) > 1e-9,
         _ => true,
     });
