@@ -2923,7 +2923,6 @@ fn a_pattern_of_a_reduced_fillet_rounds_each_copy_alike() {
 /// half-round front R 4.6 tangent to them) grows by d = z · tan 5° with mitred corners:
 /// A(d) = A₀ + P·d + (2 + π/2)·d², integrated over the 10 mm height.
 #[test]
-#[ignore = "fails until #546 is fixed"]
 fn tapered_extrude_of_a_profile_mixing_lines_and_an_arc() {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "D"}));
@@ -2952,10 +2951,28 @@ fn feature_replies_list_only_the_bodies_they_created() {
     assert_eq!(r["bodies"], json!(["Base"]), "{r}");
 }
 
+/// A feature reply also says which existing bodies it changed and which are gone, so a client
+/// that skips the full body list (MCP `batch` with `verbose: false`, #530) still sees every effect.
+#[test]
+fn feature_replies_list_the_bodies_they_changed_and_removed() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "A"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new", "body_name": "B"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [40, 0, 0], "operation": "new", "body_name": "C"}));
+    // A pocket in A changes A only.
+    let r = run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 10, "corner": [3, 3, 5], "operation": "cut", "targets": ["A"]}));
+    assert_eq!((&r["created_bodies"], &r["changed_bodies"], &r["removed_bodies"]), (&json!([]), &json!(["A"]), &json!([])), "{r}");
+    // Joining C into B changes B and removes C.
+    let r = run(&mut s, "solid.combine", json!({"target": "B", "tools": ["C"], "operation": "join"}));
+    assert_eq!((&r["changed_bodies"], &r["removed_bodies"]), (&json!(["B"]), &json!(["C"])), "{r}");
+    // A new body changes nothing else.
+    let r = run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "corner": [0, 50, 0], "operation": "new", "body_name": "D"}));
+    assert_eq!((&r["created_bodies"], &r["changed_bodies"], &r["removed_bodies"]), (&json!(["D"]), &json!([]), &json!([])), "{r}");
+}
+
 /// Drafting a cylinder's side face 5° from the base plane makes a cone frustum (#547): radius 10
 /// at the base, 10 − 20 · tan 5° at the top.
 #[test]
-#[ignore = "fails until #547 is fixed"]
 fn draft_on_a_cylinder_side_makes_a_frustum() {
     let mut s = Session::default();
     run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 20}));
