@@ -127,7 +127,10 @@ keeps its envelope and the flat pattern is the outside lengths less a bend deduc
 2·(R + T)·tan(θ/2) − θ·(R + K·T). A bend can be picked on either skin of a shell; bends turn
 either way, follow one another and take any angle (the walls of a tapered tray at 72°). An
 edge between two faces of the sheet that is no bend is cut open, each side half the rule's
-**gap** from the plane halfway between the two, like the corners of a tray. The result is an
+**gap** from the plane halfway between the two, like the corners of a tray. A bend drawn as a
+chamfer (a flat strip between two faces, the chord of the bend's arc, as models without bend
+radii draw one) is picked in the middle of the strip: the two faces then meet at their virtual
+sharp in one bend of the rule's radius, and the strip is no face of the sheet. The result is an
 ordinary sheet body: edge flanges, cuts, Unfold, the flat pattern and its exports work on it,
 and it follows the solid when a parameter changes (the edges and the fixed face are found by
 their names). Without bend edges Convert expects a plate, as before. Either way round walls

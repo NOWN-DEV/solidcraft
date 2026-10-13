@@ -11,6 +11,11 @@
 //! two panels that is no bend is cut open: each panel ends square to the sheet, half the rule's
 //! gap from the plane halfway between the two.
 //!
+//! A bend can also be a chamfer: a flat strip between two faces, as a model without bend radii
+//! draws a bend (the chord of its arc). Picked in its middle, the strip is no face of the sheet:
+//! the faces on either side are taken out to where their planes meet, and that line is the
+//! bend's virtual sharp, bent with the rule's radius at the angle between the two faces.
+//!
 //! The result is the model every sheet metal feature builds ([`SheetBody`]): the fixed face is
 //! the base panel and every other panel a flange on its parent's edge, its outline taken through
 //! the inverse of its fold. Unfold, the flat pattern, the bend table and cuts then work as on a
@@ -277,6 +282,101 @@ fn behind(b: &Body, mesh: &Mesh, f: usize) -> Option<(usize, f64)> {
     (normal.dot(n) < -1.0 + 1e-9).then_some((g, (o - point).dot(n)))
 }
 
+/// A chamfer picked as a bend: the planar face `strip` between the planar faces `a` and `b`,
+/// which meet in that bend at the line where their planes cross.
+#[derive(Clone, Copy)]
+struct Chamfer {
+    strip: usize,
+    a: usize,
+    b: usize,
+}
+
+/// The chamfer a bend point picks: a point on the middle half of a planar face that runs
+/// between two planar faces along two parallel edges, the two faces' planes crossing in a line
+/// parallel to them and the strip facing between the two (as the chord of a bend's arc does).
+/// A point on any other face, or near a chamfer's edge, picks an edge as before.
+fn chamfer_at(mb: &ModelBody, mesh: &Mesh, p: Vec3, tol: f64) -> Option<Chamfer> {
+    let b = &mb.body;
+    let (d, f) = crate::appearance::nearest_face(mb, p)?;
+    if d > tol {
+        return None;
+    }
+    let strip = outline(b, mesh, f, tol).ok()?;
+    let plane = |g: usize| match face_surface(b, g) {
+        Some(FaceSurface::Plane { normal, .. }) => Some(normal),
+        _ => None,
+    };
+    let m = strip.pts.len();
+    let edge = |i: usize| -> Option<(Vec3, Vec3, usize)> {
+        let (p, q) = (*strip.pts.get(i)?, *strip.pts.get((i + 1) % m)?);
+        Some((p, (q - p).normalized()?, strip.across.get(i).copied().flatten()?))
+    };
+    let mut sides = Vec::new();
+    for i in 0..m {
+        for j in i + 1..m {
+            let (Some((pa, da, a)), Some((pb, db, bb))) = (edge(i), edge(j)) else { continue };
+            let (Some(na), Some(nb)) = (plane(a), plane(bb)) else { continue };
+            let Some(sharp) = na.cross(nb).normalized() else { continue };
+            let lined_up = da.dot(db) < -1.0 + 1e-7 && sharp.dot(da).abs() > 1.0 - 1e-7;
+            if a != bb && a != f && bb != f && lined_up && strip.n.dot(na) > 1e-9 && strip.n.dot(nb) > 1e-9 {
+                sides.push((pa, pb, da, a, bb));
+            }
+        }
+    }
+    let &[(pa, pb, d, a, bb)] = sides.as_slice() else { return None };
+    // Its middle half: a quarter of its width or more from either edge.
+    let off = |o: Vec3| (p - o - d * (p - o).dot(d)).len();
+    let width = off(pa) + off(pb);
+    (off(pa) >= width / 4.0 && off(pb) >= width / 4.0).then_some(Chamfer { strip: f, a, b: bb })
+}
+
+/// Face `g`'s outline with each picked chamfer along it taken out: the edge along the chamfer
+/// moves to where `g`'s plane meets the plane of the face across the chamfer (its corners
+/// sliding along the edges before and after it), and runs along that face.
+fn without_chamfers(b: &Body, mut face: Face, g: usize, chamfers: &[Chamfer], tol: f64) -> Result<Face> {
+    for c in chamfers {
+        let other = if c.a == g {
+            c.b
+        } else if c.b == g {
+            c.a
+        } else {
+            continue;
+        };
+        let Some(FaceSurface::Plane { normal: n, point: o }) = face_surface(b, other) else {
+            return err("the face across a chamfer picked as a bend is not flat");
+        };
+        let m = face.pts.len();
+        let along: Vec<usize> = (0..m).filter(|i| face.across.get(*i).copied().flatten() == Some(c.strip)).collect();
+        let &[k] = along.as_slice() else {
+            return err("not supported yet: a chamfer picked as a bend that runs along a face more than once");
+        };
+        // Its corners slide along the edges before and after it: those must be straight.
+        if [k + m - 1, k + 1].iter().any(|i| face.round.get(i % m).is_some_and(Option::is_some)) {
+            return err("not supported yet: a round edge of a face that ends at a chamfer picked as a bend");
+        }
+        // Each end of the edge slides along the edge on its other side, out to the other plane.
+        let slide = |corner: usize, before: usize| -> Option<Vec3> {
+            let (p, q) = (*face.pts.get(corner % m)?, *face.pts.get(before % m)?);
+            let d = (p - q).normalized()?;
+            let s = (o - p).dot(n) / d.dot(n);
+            (s.is_finite() && s >= -tol).then_some(p + d * s)
+        };
+        let (Some(p), Some(q)) = (slide(k, k + m - 1), slide(k + 1, k + 2)) else {
+            return err("a face beside a chamfer picked as a bend does not reach the face across it");
+        };
+        if let Some(x) = face.pts.get_mut(k) {
+            *x = p;
+        }
+        if let Some(x) = face.pts.get_mut((k + 1) % m) {
+            *x = q;
+        }
+        if let Some(x) = face.across.get_mut(k) {
+            *x = Some(other);
+        }
+    }
+    Ok(face)
+}
+
 /// How far a panel's edge along a rip moves in, so that the panel, cut square to the sheet,
 /// stays half the gap from the plane halfway between it and the panel `y` across the rip.
 /// `e` is the edge's direction round panel `x`.
@@ -393,17 +493,18 @@ fn drawn(trimmed: &[Vec2], from: &[Option<usize>], pts: &[Vec2], round: &[Option
 
 /// Names of the edges of `body` at the bend points, to find them again after the body changes.
 /// A point on no edge gets none: the conversion then says so, instead of bending the edge that
-/// happens to be nearest.
+/// happens to be nearest. A point on a chamfer gets none either: it stays that chamfer's point.
 pub fn bend_edge_names(st: &crate::ModelState, body: &str, pts: &[Vec3]) -> Vec<String> {
     let Some(b) = st.body(body) else { return Vec::new() };
-    let (mesh, near) = (b.mesh(), (b.body.size() * 2e-3).max(1e-3));
-    let on = |p: &Vec3| mesh.edges.iter().any(|e| e.windows(2).any(|w| p.dist_to_segment(w[0], w[1]) <= near));
+    let (mesh, near, tol) = (b.mesh(), (b.body.size() * 2e-3).max(1e-3), (b.body.size() * 1e-6).max(1e-6));
+    let on =
+        |p: &Vec3| chamfer_at(b, &mesh, *p, tol).is_none() && mesh.edges.iter().any(|e| e.windows(2).any(|w| p.dist_to_segment(w[0], w[1]) <= near));
     pts.iter().zip(crate::naming::edge_names_at(b, pts)).map(|(p, name)| if on(p) { name } else { String::new() }).collect()
 }
 
 /// Convert body `mb` to a sheet under the rule `rule` with values `rv`: `face` is a point on the
-/// fixed face and `bends` are points on the sharp edges that become bends (the body's
-/// coordinates, mm). See the module docs.
+/// fixed face and `bends` are points on the sharp edges that become bends, or in the middle of
+/// chamfers that do (the body's coordinates, mm). See the module docs.
 pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, bends: &[Vec3]) -> Result<SheetBody> {
     if bends.is_empty() || bends.len() > MAX_BENDS {
         return err(format!("pick 1…{MAX_BENDS} bend edges"));
@@ -421,10 +522,15 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
     let Some((_, f0)) = crate::appearance::nearest_face(mb, face).filter(|(d, _)| *d <= near) else {
         return err(format!("no face of the body at the fixed face point {}", at(face)));
     };
-    let fixed = outline(b, &mesh, f0, tol).map_err(|e| DocError::Invalid(format!("the fixed face can't be a face of the sheet: {e}")))?;
-    // The two faces along each bend edge.
+    // The two faces along each bend edge, or on either side of each chamfer.
     let mut picks = Vec::with_capacity(bends.len());
+    let mut chamfers: Vec<Chamfer> = Vec::new();
     for p in bends {
+        if let Some(c) = chamfer_at(mb, &mesh, *p, tol) {
+            picks.push((*p, (c.a, c.b)));
+            chamfers.push(c);
+            continue;
+        }
         let dist = |e: &Vec<Vec3>| e.windows(2).map(|w| p.dist_to_segment(w[0], w[1])).fold(f64::INFINITY, f64::min);
         let edge = mesh.edges.iter().zip(&mesh.edge_faces).map(|(e, faces)| (dist(e), faces)).min_by(|x, y| x.0.total_cmp(&y.0));
         match edge.filter(|(d, _)| *d <= near).map(|(_, faces)| faces.as_slice()) {
@@ -433,6 +539,11 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
             None => return err(format!("no edge of the body at the bend point {}", at(*p))),
         }
     }
+    if let Some((p, _)) = picks.iter().find(|(_, (x, y))| chamfers.iter().any(|c| c.strip == *x || c.strip == *y)) {
+        return err(format!("the bend at {} is on a chamfer picked as a bend (pick the chamfer or its edges, not both)", at(*p)));
+    }
+    let face_of = |f: usize| outline(b, &mesh, f, tol).and_then(|face| without_chamfers(b, face, f, &chamfers, tol));
+    let fixed = face_of(f0).map_err(|e| DocError::Invalid(format!("the fixed face can't be a face of the sheet: {e}")))?;
     // A shell: the same small distance of material behind the fixed face and the faces at every
     // bend. It keeps its thickness, and a bend picked on one skin is that bend on the other too.
     let thin = behind(b, &mesh, f0).map(|(_, d)| d).filter(|d| *d > 0.0 && d * d * 16.0 <= area_about(&fixed.pts, fixed.n));
@@ -469,8 +580,8 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
                 }
                 return err(format!("the bend at {} closes a loop of bends (leave one of its edges unpicked: it is cut open)", at(p)));
             }
-            let child = outline(b, &mesh, to, tol)
-                .map_err(|e| DocError::Invalid(format!("the face across the bend at {} can't be a face of the sheet: {e}", at(p))))?;
+            let child =
+                face_of(to).map_err(|e| DocError::Invalid(format!("the face across the bend at {} can't be a face of the sheet: {e}", at(p))))?;
             let Some(parent) = panels.get(&from) else { continue };
             let theta = parent.face.n.dot(child.n).clamp(-1.0, 1.0).acos();
             if !(theta > 1e-6 && theta < std::f64::consts::PI - 1e-6) {

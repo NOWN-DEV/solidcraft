@@ -42,7 +42,8 @@ pub static COMMANDS: &[CommandSpec] = &[
              such as an engraved label, become pockets of the sheet), or that face's name from model.faces; rule?; \
              bends?: [[x,y,z] on sharp edges] (a solid or a shelled body: `face` is the fixed face and the flat faces reached from it \
              across these edges become the sheet; a shell keeps its thickness, a solid takes the rule's inward; \
-             edges between two of those faces that are no bends are cut open with the rule's gap)",
+             edges between two of those faces that are no bends are cut open with the rule's gap; \
+             a point in the middle of a chamfer between two faces makes it one bend at their virtual sharp)",
         ),
     CommandSpec::new("sheet.manage_rules", "Sheet Metal Rules", rules).at("SHEET METAL", "MODIFY").icon("sheet_rules").params(
         "name (new or existing); thickness?, k_factor?, bend_radius?, relief_width?, relief_depth?, corner_relief?, hem_gap?, gap? (expressions; `Thickness` is the rule's; \

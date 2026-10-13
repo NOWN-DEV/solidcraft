@@ -386,6 +386,73 @@ fn bend_edges_changed_in_an_edit_are_the_ones_bent() {
     assert!((volume(&mut s) - expect).abs() < 2e-3 * expect, "{} vs {expect}", volume(&mut s));
 }
 
+/// A channel 40 wide with walls 30 high (outside sizes), 2 thick and 100 long, its two corners
+/// drawn as chamfers, as a model without bend radii draws a bend: 4 along each outer face and 2
+/// along each inner one, the chords of an R 2 bend's outside (R + T) and inside (R).
+fn chamfered_channel(s: &mut Session) {
+    let pts = [[0, 30], [0, 4], [4, 0], [36, 0], [40, 4], [40, 30], [38, 30], [38, 4], [36, 2], [4, 2], [2, 4], [2, 30]];
+    run(s, "sketch.create", json!({"plane": "XY", "name": "Channel"}));
+    run(s, "sketch.line", json!({"points": pts, "closed": true}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "solid.extrude", json!({"sketch": "Channel", "distance": 100, "body_name": "Channel"}));
+}
+
+#[test]
+fn a_chamfer_picked_in_its_middle_is_one_bend_at_the_virtual_sharp() {
+    // The rule's radius bends, not the one the chamfers stand for.
+    let (t, k, r) = (2.0, 0.5, 3.0);
+    let mut s = Session::default();
+    rule(&mut s, "Test", t, k, r, 0.5);
+    chamfered_channel(&mut s);
+    // The middle of each outer chamfer.
+    run(&mut s, "sheet.convert", json!({"body": "Channel", "face": [20, 0, 50], "bends": [[2, 2, 50], [38, 2, 50]]}));
+    let rows = bend_rows(&mut s);
+    assert!(rows.len() == 2 && rows.iter().all(|row| row.0 == 90 && row.1 == "up" && (row.2 - 100.0).abs() < 1e-6), "{rows:?}");
+    // The outside lengths to the virtual sharps less a 90° deduction each:
+    // 30 + 40 + 30 - 2 (2 (R + T) - π/2 (R + K T)) = 100 - 2 (10 - 2π) = 92.5664.
+    let across = 100.0 - 2.0 * deduction(FRAC_PI_2, r, t, k);
+    assert!((across - 92.566371).abs() < 1e-6);
+    assert!(same_size(flat_size(&mut s), (across, 100.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    // The envelope of the sharp corners stays; the chamfers are gone into the bends.
+    let (lo, hi) = bbox(&mut s);
+    assert!(
+        lo.iter().all(|v| v.abs() < 1e-6) && (hi[0] - 40.0).abs() < 1e-6 && (hi[1] - 30.0).abs() < 1e-6 && (hi[2] - 100.0).abs() < 1e-6,
+        "{lo:?} {hi:?}"
+    );
+    // Three flat strips and two quarter rounds on the neutral radius R + T/2.
+    let expect = t * 100.0 * (2.0 * (30.0 - (r + t)) + (40.0 - 2.0 * (r + t)) + PI * (r + t / 2.0));
+    assert!((volume(&mut s) - expect).abs() < 2e-3 * expect, "{} vs {expect}", volume(&mut s));
+    // The design keeps the chamfers' points and reopens to the same sheet.
+    let saved = s.doc.to_json();
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&saved).unwrap());
+    assert!(same_size(flat_size(&mut reopened), (across, 100.0), 1e-6), "{:?}", flat_size(&mut reopened));
+
+    // Picked on the inner skin, from the inside of the base: the same sheet, bent down.
+    let mut b = Session::default();
+    rule(&mut b, "Test", t, k, r, 0.5);
+    chamfered_channel(&mut b);
+    run(&mut b, "sheet.convert", json!({"body": "Channel", "face": [20, 2, 50], "bends": [[3, 3, 50], [37, 3, 50]]}));
+    assert!(bend_rows(&mut b).iter().all(|row| row.0 == 90 && row.1 == "down"), "{:?}", bend_rows(&mut b));
+    assert!(same_size(flat_size(&mut b), (across, 100.0), 1e-6), "{:?}", flat_size(&mut b));
+    assert!((volume(&mut b) - expect).abs() < 2e-3 * expect, "{} vs {expect}", volume(&mut b));
+
+    // Points on a chamfer's edges pick those edges, as before: four 45° bends with the
+    // chamfers as narrow faces of the sheet.
+    let mut e = Session::default();
+    rule(&mut e, "Test", t, k, r, 0.5);
+    chamfered_channel(&mut e);
+    run(&mut e, "sheet.convert", json!({"body": "Channel", "face": [20, 0, 50], "bends": [[0, 4, 50], [4, 0, 50], [36, 0, 50], [40, 4, 50]]}));
+    let rows = bend_rows(&mut e);
+    assert!(rows.len() == 4 && rows.iter().all(|row| row.0 == 45), "{rows:?}");
+    // A chamfer and one of its edges at once is refused.
+    let mut f = Session::default();
+    rule(&mut f, "Test", t, k, r, 0.5);
+    chamfered_channel(&mut f);
+    let both = f.execute("sheet.convert", &json!({"body": "Channel", "face": [20, 0, 50], "bends": [[2, 2, 50], [4, 0, 50]]}));
+    let msg = both.err().map(|x| x.to_string()).unwrap_or_default();
+    assert!(msg.contains("not both"), "{msg}");
+}
+
 #[test]
 fn edge_flanges_and_cuts_work_on_a_converted_sheet() {
     let mut s = Session::default();

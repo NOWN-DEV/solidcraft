@@ -179,6 +179,10 @@
 //!   neighbouring edges as they are (`neighbours: false`). An Extend without them builds the
 //!   planar extension it always did and saves as before; 0.11.0 asks for an update instead of
 //!   dropping them and extending a plane by the distance.
+//!   Under the same version, a Convert to Sheet Metal bend point can lie in the middle of a
+//!   chamfer (a flat strip between two faces), which then is one bend at the two faces' virtual
+//!   sharp; 0.11.0 bent the chamfer's nearest edge instead or found no edge there. Bend points
+//!   on edges convert as before.
 
 use serde_json::Value;
 
