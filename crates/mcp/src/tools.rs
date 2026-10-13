@@ -68,6 +68,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({
                     "command": string("Command id (see list_commands)"),
                     "params": {"type": "object", "description": "The command's parameters"},
+                    "verbose": {"type": "boolean", "description": "false: omit the full feature body list and sketch ids repeated outside `created`; keep created_bodies, changed_bodies and removed_bodies (default true)"},
                 }),
                 &["command"],
             ),
@@ -155,10 +156,13 @@ pub fn tool_definitions() -> Vec<Value> {
             "Render the design and return it as a PNG image. Headless: a CPU render of the model, fitted to the view. \
              Connected to the app: a screenshot of the window (source \"window\", the default) or a render of the model \
              with the app's camera (source \"model\"). Both show an active section (inspect.section) with its cut face \
-             capped. `view` first turns the camera to a standard view.",
+             capped. `view` first turns the camera to a standard view or a saved named view (view.save), `camera` to              any camera (as view.apply).",
             obj(
                 json!({
-                    "view": {"type": "string", "enum": VIEWS, "description": "Standard view (default: keep the current one; headless starts at iso)"},
+                    "view": string(
+                        "Standard view (iso, home, front, back, top, bottom, left, right, fit) or the name of a saved named view                          (default: keep the current one; headless starts at iso)"
+                    ),
+                    "camera": {"type": "object", "description": "Look from this camera instead: {target: [x,y,z], yaw, pitch, distance, fov?}                         (radians, mm; as view.save and view.apply)"},
                     "path": string("Also keep the PNG at this path"),
                     "width": {"type": "integer", "description": "Render width in pixels (model renders; default 960)"},
                     "height": {"type": "integer", "description": "Render height in pixels (model renders; default 600)"},
@@ -341,7 +345,8 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
         }
         "execute" => {
             let id = str_arg(a, "command").ok_or("`command` is required")?;
-            exec(b, id, a.get("params").cloned().filter(Value::is_object).unwrap_or(json!({})))
+            let v = exec(b, id, a.get("params").cloned().filter(Value::is_object).unwrap_or(json!({})))?;
+            Ok(if a.get("verbose").and_then(Value::as_bool).unwrap_or(true) { v } else { compact(v) })
         }
         "inspect_design" => {
             let measure = a.get("measure").and_then(Value::as_bool).unwrap_or(true);
@@ -481,7 +486,7 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     text_result(&json!({"ok": true, "completed": results.len(), "results": results}), false)
 }
 
-/// A step's result without what the design already had (`batch` with `verbose: false`): a
+/// A command's result without what the design already had (`execute` or `batch` with `verbose: false`): a
 /// feature's full body list (its created, changed and removed bodies stay), and the sketch ids
 /// a sketch command repeats outside `created`.
 fn compact(mut v: Value) -> Value {
@@ -513,12 +518,24 @@ fn screenshot(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
 }
 
 fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Value), String> {
-    if let Some(v) = str_arg(a, "view") {
-        b.call("ui.view", json!({"view": v}))?;
-        // Turning to a standard view also frames the model (like a axis view click).
-        if v != "fit" && v != "home" {
-            b.call("ui.view", json!({"view": "fit"}))?;
+    let apply = |b: &mut dyn Backend, params: Value| b.call("engine.execute", json!({"command": "view.apply", "params": params}));
+    match (str_arg(a, "view"), a.get("camera").filter(|c| !c.is_null())) {
+        (Some(_), Some(_)) => return Err("screenshot: give `view` or `camera`, not both".into()),
+        (None, Some(c)) => {
+            apply(b, json!({"camera": c}))?;
         }
+        (Some(v), None) if VIEWS.contains(&v) => {
+            b.call("ui.view", json!({"view": v}))?;
+            // Turning to a standard view also frames the model (like a axis view click).
+            if v != "fit" && v != "home" {
+                b.call("ui.view", json!({"view": "fit"}))?;
+            }
+        }
+        // A saved named view.
+        (Some(v), None) => {
+            apply(b, json!({"view": v}))?;
+        }
+        (None, None) => {}
     }
     let keep = str_arg(a, "path").filter(|p| !p.trim().is_empty()).map(str::to_string);
     let path = keep.clone().unwrap_or_else(|| {

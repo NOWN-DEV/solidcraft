@@ -61,6 +61,10 @@ PCB / Package, Render, Animation, Simulation, Manufacture/CAM, Drawings.
 
 ## Dimensioning and error reporting
 
+- MCP `execute` accepts `verbose: false`, sharing the compact reply helper used by
+  `batch`: body changes and created sketch IDs stay, while repeated lists are omitted.
+  Both tools retain full replies by default.
+
 - Sketch Create groups drawing variants under Line, Rectangle, Circle, Arc, Slot,
   Polygon and Spline. Each open part remembers its last interactive choice per family
   across sketch sessions and document-tab switches; closing the part resets these UI choices.
@@ -389,6 +393,10 @@ and reference-object placement remain separate work, as do loft rails and center
   evaluation or meshing; explicit `preview: true` remains a separate warm-mesh option.
   Keys, resource budgets and document/revision guards reject incompatible, hostile or
   stale results. A second modelling kernel still requires its own tested adapter.
+- Warm saves with explicit `cache: true` can also carry a bounded PNG thumbnail from already cached meshes.
+  Home reads it without rebuilding the design when its local picture is missing;
+  mismatched or malformed thumbnails fall back to normal generation. The image is
+  kernel-independent and saving never forces cold meshing to produce it.
 
 - Cold rebuild profiling separates parsing, geometry, placement, display meshing and
   thumbnails. Straight-line closest-point projection and exact curved-surface evaluation
