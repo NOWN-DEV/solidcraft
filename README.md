@@ -68,6 +68,16 @@ are listed by area in [docs/features.md](docs/features.md); status and plans are
 Open work and known bugs are in [GitHub issues](https://github.com/bherbruck/solidcraft/issues),
 and help is welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Built with SolidCraft
+
+<a href="https://github.com/0xlillith/solidcraft-rover"><img src="docs/screenshots/rover-build.gif" alt="SELENE, a scientific rover by 0xlillith, assembling itself as the timeline plays through its 3,323 steps in SolidCraft: tub, wheels, electronics, suspension, sampling arm, solar wings, dish and camera turret" loading="lazy"></a>
+
+*SELENE, a scientific rover built entirely through SolidCraft's MCP server by
+[@0xlillith](https://github.com/0xlillith/solidcraft-rover): 3,323 editable timeline steps that
+rebuild with no errors, replayed here at 2× speed.
+[Full video](https://github.com/bherbruck/solidcraft/raw/refs/heads/main/docs/screenshots/rover-build.mp4)
+· [download the editable model](https://github.com/0xlillith/solidcraft-rover/releases/tag/v1.0.0).*
+
 ## What works
 
 - **Sketches** on origin planes, offset planes or planar faces: lines, rectangles, circles,
@@ -91,7 +101,7 @@ and help is welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
   by parameters. Over-constraining edits are rejected; fully constrained geometry turns black.
   Dragging solves the sketch every frame and rebuilds the model once, when the drag ends.
   Select a line or its two endpoints, type its dimension and press Enter to commit one undo
-  step. Fit keeps sketch geometry clear of the palette and navigation controls.
+  step; with Sketch Dimension it's D, click, type, Enter. Fit keeps sketch geometry clear of the palette and navigation controls.
 - **Profiles** found automatically, including regions split by lines and holes inside outlines.
   Newly captured complete adaptive boundaries retain their outer and hole source identities
   when spline span counts change. Partial or ambiguous boundaries do not qualify.
