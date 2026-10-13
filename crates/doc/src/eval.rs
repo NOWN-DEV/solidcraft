@@ -5,7 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
-use solidcraft_geom::{Mesh, Plane, Region2, Vec2, Vec3};
+use solidcraft_geom::tess::TessPlan;
+use solidcraft_geom::{Mesh, Plane, Region2, Vec2, Vec3, regions_apart};
 use solidcraft_kernel::{self as kernel, Body, BoolOp};
 use solidcraft_sketch::{CurveKind, Profile, SolveReport, find_profiles};
 
@@ -27,6 +28,9 @@ pub struct ModelBody {
     // Timeline snapshots are cloned before meshes are requested. Share the cell itself so
     // meshing any snapshot also warms every unchanged copy of this body.
     mesh: Arc<OnceLock<Arc<Mesh>>>,
+    /// The display plan the mesh is evaluated from (none when the body has no plan: a mesh
+    /// body, or one the planner refuses), shared like the mesh. A GPU viewport draws it.
+    plan: Arc<OnceLock<Option<Arc<TessPlan>>>>,
     /// Identity of this body's content for the evaluation cache: the key of the evaluation
     /// that produced it (kept while later features pass it through unchanged).
     key: u64,
@@ -51,6 +55,7 @@ impl ModelBody {
             body,
             feature,
             mesh: Arc::new(OnceLock::new()),
+            plan: Arc::new(OnceLock::new()),
             key: 0,
             names: Default::default(),
             made: Default::default(),
@@ -68,10 +73,32 @@ impl ModelBody {
     pub fn mesh(&self) -> Arc<Mesh> {
         self.mesh
             .get_or_init(|| {
-                let tol = (self.body.size() * 1e-3).max(1e-3);
-                Arc::new(self.body.display_mesh_angular(tol, kernel::DISPLAY_ANGLE).unwrap_or_default())
+                let mesh = match self.display_plan() {
+                    Some(plan) => self.body.display_mesh_of(&plan),
+                    None => self.body.reference_display_mesh_angular(self.display_tol(), kernel::DISPLAY_ANGLE),
+                };
+                Arc::new(mesh.unwrap_or_default())
             })
             .clone()
+    }
+
+    /// The display plan behind [`ModelBody::mesh`] (same tolerance and angle), made once; `None`
+    /// when the body has no plan and its mesh comes from the reference mesher.
+    pub fn display_plan(&self) -> Option<Arc<TessPlan>> {
+        self.plan
+            .get_or_init(|| match self.body.display_plan_angular(self.display_tol(), kernel::DISPLAY_ANGLE) {
+                Ok(plan) => Some(Arc::new(plan)),
+                Err(e) => {
+                    log::debug!("{}: no display plan ({e})", self.name);
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// The display mesh's chord tolerance: 1/1000 of the body's size.
+    fn display_tol(&self) -> f64 {
+        (self.body.size() * 1e-3).max(1e-3)
     }
 
     /// Already computed display geometry; saving must not trigger cold tessellation.
@@ -2265,6 +2292,9 @@ fn centered_extrude(plane: &Plane, region: &Region2, start: f64, end: f64, sketc
         .collect()
 }
 
+/// How far apart (mm) profiles must stay for their extruded tools to be cut as one.
+const APART_GAP: f64 = 1e-3;
+
 /// The tool bodies a feature adds or removes (extrude, revolve, primitives), in the current state.
 fn feature_tools_with_constructor(
     doc: &Document,
@@ -2359,6 +2389,8 @@ fn feature_tools_with_constructor(
             }
             let mut tools = Vec::new();
             let mut untrimmed = extent.to.is_none() && extent.from.is_none() && !extent.through_all;
+            // The footprint of each tool in the sketch: a tool lies in the prism over it.
+            let mut footprints = Vec::with_capacity(regions.len());
             for r in &regions {
                 if *operation == Operation::Join {
                     let exact = centered_extrude(&ss.plane, r, lo + off, hi + off, Some(&ss))?;
@@ -2371,6 +2403,7 @@ fn feature_tools_with_constructor(
                         // Preserve a whole touching face: extending into a chamfer replaces
                         // the sewable seam with a coincident curved intersection.
                         tools.extend(exact);
+                        footprints.push(r.clone());
                         continue;
                     }
                 }
@@ -2380,6 +2413,20 @@ fn feature_tools_with_constructor(
                 let r = grow_profile_for_coplanar(st, r, *operation, targets, &probe);
                 untrimmed &= l2 == lo + off && h2 == hi + off && &r == original;
                 tools.extend(centered_extrude(&ss.plane, &r, l2, h2, Some(&ss))?);
+                footprints.push(r);
+            }
+            // A cut by profiles apart in the sketch (the letters of a text): each tool lies in the
+            // prism over its footprint, so the tools are apart too (whatever their heights, and
+            // trimmed or not). The body is then cut once by all of them rather than once per
+            // profile, each cut working on a body grown by the one before.
+            // (Sheet metal keeps its own way of cutting, tool by tool, to keep its flat pattern.)
+            let sheet =
+                if targets.is_empty() { !st.sheets.is_empty() } else { targets.iter().any(|t| st.sheets.iter().any(|sheet| &sheet.body == t)) };
+            if *operation == Operation::Cut && !sheet && tools.len() > 1 && regions_apart(&footprints, APART_GAP) {
+                let bodies: Vec<Body> = tools.iter().map(|t| t.body.clone()).collect();
+                if let Ok(Some(one)) = kernel::join_apart(&bodies) {
+                    tools = vec![Traced::step(one, &tools.iter().collect::<Vec<_>>())];
+                }
             }
             if let Some(tb) = curved.and_then(|bi| st.bodies.get(bi)) {
                 let start = if hi > 0.0 { lo + off } else { hi + off };
@@ -3516,7 +3563,9 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
         | FeatureKind::Thicken { .. }
         | FeatureKind::SurfaceTrim { .. }
         | FeatureKind::SurfaceExtend { .. }
-        | FeatureKind::SurfaceExtrude { .. } => surface::eval(doc, vals, f, st),
+        | FeatureKind::SurfaceExtrude { .. }
+        | FeatureKind::Unstitch { .. }
+        | FeatureKind::ReverseNormal { .. } => surface::eval(doc, vals, f, st),
         FeatureKind::Emboss { .. }
         | FeatureKind::Rib { .. }
         | FeatureKind::ReplaceFace { .. }

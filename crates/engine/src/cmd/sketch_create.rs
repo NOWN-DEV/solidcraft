@@ -89,8 +89,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     )),
     CommandSpec::new("sketch.edit_text", "Edit Text", edit_text)
         .enabled(in_sketch)
+        .live(edit_text_live)
         .params(concat!(
-            "link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg, font?: family or file path (empty: the built-in font)",
+            "link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg, font?: family or file path (empty: the built-in font); live?: bool: one frame of an interactive resize or rotation (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
             created_doc!()
         )),
 ];
@@ -116,6 +117,10 @@ fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64, Option
         Some(Value::String(f)) => Some(f.trim().to_string()),
         Some(_) => return Err(bad(cmd, "`font` must be a font family name or a font file path")),
     };
+    // A font file an agent names must lie in its folders (installed families are found by name).
+    if let Some(path) = font.as_deref().and_then(solidcraft_sketch::font_file_path) {
+        solidcraft_io::vfs::check(&path.to_string_lossy()).map_err(|e| bad(cmd, e.to_string()))?;
+    }
     // An unknown font or an unreadable file is an error now, not a lost link later.
     solidcraft_sketch::font_data(font.as_deref()).map_err(|e| bad(cmd, e.to_string()))?;
     Ok(LinkSource::Text { text, at, height, angle, font })
@@ -175,6 +180,25 @@ fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
     let mut doc = (*s.doc).clone();
     let mut sk = doc.sketch(id)?.clone();
+    let out = apply_text_edit(&mut sk, p)?;
+    *doc.sketch_mut(id)? = sk;
+    *s.doc_mut() = doc;
+    Ok(out)
+}
+
+/// One frame of an interactive resize or rotation: the sketch is solved and shown, the
+/// features after it keep their last result until `sketch.drag_end` evaluates the model.
+fn edit_text_live(s: &mut Session, p: &Value) -> Result<(Value, Option<crate::LiveEdit>)> {
+    let cmd = "sketch.edit_text";
+    let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
+    let (out, report) = super::sketch::edit_solved(s, id, false, |sk, _| Ok((apply_text_edit(sk, p)?, super::sketch::Left::Unsolved)))?;
+    Ok((out, report.map(|report| crate::LiveEdit { sketch: id, report })))
+}
+
+/// `sketch.edit_text`'s change to its sketch: the text source's new values and its outlines
+/// regenerated from them.
+fn apply_text_edit(sk: &mut Sketch, p: &Value) -> Result<Value> {
+    let cmd = "sketch.edit_text";
     let l = match (str_(p, "link"), str_(p, "entity")) {
         (Some(l), _) => l.to_string(),
         (None, Some(e)) => sk.curves.iter().find(|c| c.id == e).and_then(|c| c.link.clone()).ok_or_else(|| bad(cmd, format!("`{e}` is not text")))?,
@@ -189,9 +213,7 @@ fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
     let geom = solidcraft_sketch::text_geometry_in(font.as_deref(), text, *at, *height, *angle)?;
     sk.set_link_source(&l, src.clone());
     sk.update_link(&l, &geom)?;
-    let curves = ids_of(&sk, &sk.link_curves(&l));
-    *doc.sketch_mut(id)? = sk;
-    *s.doc_mut() = doc;
+    let curves = ids_of(sk, &sk.link_curves(&l));
     Ok(json!({"link": l, "curves": curves}))
 }
 
