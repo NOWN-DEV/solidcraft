@@ -50,13 +50,17 @@
 //!   (`cylinder_cap`), and sketches can link lines to their own axes (`sketch_axis`). Version 14
 //!   designs need no transformation; the version stamp lets older readers request an update
 //!   instead of encountering an unknown certificate or link kind.
+//! - 16: sheet metal rules can choose a corner relief shape (`corner_relief_shape`: notch,
+//!   round or rectangular). Version 15 designs need no transformation (an absent shape is the
+//!   notch they always had); the version stamp lets older readers request an update instead of
+//!   silently building notches where a design asks for another shape.
 
 use serde_json::Value;
 
 use crate::{DocError, Document, Result};
 
 /// The format this build writes.
-pub const FORMAT: u32 = 15;
+pub const FORMAT: u32 = 16;
 
 pub fn format_string(n: u32) -> String {
     format!("solidcraft/{n}")
@@ -73,7 +77,7 @@ pub fn version_of(s: &str) -> Option<u32> {
 
 /// JSON-level upgrades: entry `i` turns format `i + 1` into `i + 2`.
 type JsonStep = fn(&mut Value) -> Result<()>;
-const JSON_STEPS: [JsonStep; 14] = [
+const JSON_STEPS: [JsonStep; 15] = [
     |_| Ok(()),
     v2_to_v3,
     v3_to_v4,
@@ -87,6 +91,7 @@ const JSON_STEPS: [JsonStep; 14] = [
     |_| Ok(()),
     |_| Ok(()),
     v13_to_v14,
+    |_| Ok(()),
     |_| Ok(()),
 ];
 
