@@ -1029,6 +1029,152 @@ fn the_bend_table_and_the_dxf_follow_what_flat_cuts_leave_of_a_bend() {
     assert!(close(&rows(&mut s), &[(1, 40.0, 100.0, 140.0), (1, 40.0, 160.0, 200.0)]), "{:?}", rows(&mut s));
 }
 
+/// The flat pattern's area: its outline loops less its cut-outs.
+fn flat_area(f: &Value) -> f64 {
+    let loops = |k: &str| -> f64 {
+        let all = f[k].as_array().cloned().unwrap_or_default();
+        all.iter()
+            .map(|l| {
+                let pts: Vec<(f64, f64)> = l
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|q| (q[0].as_f64().unwrap_or(f64::NAN), q[1].as_f64().unwrap_or(f64::NAN)))
+                    .collect();
+                polygon_area(&pts)
+            })
+            .sum()
+    };
+    loops("outline") - loops("cutouts")
+}
+
+#[test]
+fn an_edge_flange_made_after_a_cut_runs_along_the_edge_the_cut_left() {
+    // A 200 x 100 plate, its bottom left 100 x 60 cut away, then a flange picked on what is left of
+    // the bottom edge (x 100 … 200): it used to span the whole original edge, x 0 … 200, its left
+    // half standing beside nothing.
+    let mut s = Session::default();
+    run(&mut s, "sheet.manage_rules", json!({"name": "R", "thickness": "2 mm", "k_factor": "0.5", "bend_radius": "2 mm", "active": true}));
+    base(&mut s, 200.0, 100.0);
+    rectangle_tool(&mut s, "Corner", [-10.0, -10.0], [100.0, 60.0]);
+    run(&mut s, "solid.extrude", json!({"sketch": "Corner", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    assert!((volume(&mut s) - 14_000.0 * 2.0).abs() < 1e-6);
+    run(&mut s, "sheet.flange", json!({"edges": [[150, 0, 2]], "height": 40, "angle": 90, "radius": 1, "position": "outside"}));
+    assert!(no_errors_or_warnings(&s), "{:?}", s.model.results);
+    let f = flat(&mut s);
+    let bends = f["bends"].as_array().cloned().unwrap_or_default();
+    assert_eq!(bends.len(), 1, "{f}");
+    let x = |k: &str| bends[0][k][0].as_f64().unwrap_or(f64::NAN);
+    assert!(
+        (x("start") - 100.0).abs() < 1e-9 && (x("end") - 200.0).abs() < 1e-9 && (bends[0]["length"].as_f64().unwrap_or(0.0) - 100.0).abs() < 1e-9,
+        "{f}"
+    );
+    assert_eq!(f["outline"].as_array().map(Vec::len), Some(1), "{f}");
+    // The flat pattern: the plate less the cut, and the flange (π of bend, 37 of panel) on 100 mm.
+    assert!((flat_area(&f) - (14_000.0 + 100.0 * (PI + 37.0))).abs() < 1e-6, "{}", flat_area(&f));
+    // Folded: the bend keeps its volume (K 0.5); the flange stands on x 100 … 200 only.
+    let want = (14_000.0 + 100.0 * (PI + 37.0)) * 2.0;
+    assert!((volume(&mut s) - want).abs() < 1e-3 * want, "{} vs {want}", volume(&mut s));
+    assert!(contains(&s, [150.0, -2.0, 20.0]) && !contains(&s, [50.0, -2.0, 20.0]));
+    let state = s.model.state();
+    let body = &state.bodies[0].body;
+    assert!(body.validity().is_empty() && body.shell_count() == 1);
+    for command in ["sheet.unfold", "sheet.refold"] {
+        run(&mut s, command, json!({}));
+        assert!((volume(&mut s) - want).abs() < 1e-3 * want, "{command}: {}", volume(&mut s));
+    }
+}
+
+/// A 200 x 100 plate (2 mm, K 0.5) with `cut`, a rectangle between two corners, cut through it.
+fn plate_with_a_cut(s: &mut Session, cut: [[f64; 2]; 2]) {
+    run(s, "sheet.manage_rules", json!({"name": "R", "thickness": "2 mm", "k_factor": "0.5", "bend_radius": "1 mm", "active": true}));
+    base(s, 200.0, 100.0);
+    rectangle_tool(s, "Cut", cut[0], cut[1]);
+    run(s, "solid.extrude", json!({"sketch": "Cut", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+}
+
+#[test]
+fn edge_flanges_on_either_side_of_a_notch_span_the_side_they_were_picked_on() {
+    // A notch 40 wide and 30 deep in the middle of the bottom edge leaves x 0 … 80 and 120 … 200 of
+    // it. A 90° flange 40 high set inside (setback 3, BA π, panel 37) spans the side it was picked
+    // on and takes its setback off that side alone; picked on both sides, each has its own.
+    for (edges, sides) in
+        [(json!([[160, 0, 2]]), [false, true]), (json!([[40, 0, 2]]), [true, false]), (json!([[40, 0, 2], [160, 0, 2]]), [true, true])]
+    {
+        let mut s = Session::default();
+        plate_with_a_cut(&mut s, [[80.0, -10.0], [120.0, 30.0]]);
+        run(&mut s, "sheet.flange", json!({"edges": edges, "height": 40, "angle": 90}));
+        assert!(no_errors_or_warnings(&s), "{edges}: {:?}", s.model.results);
+        let f = flat(&mut s);
+        let want: Vec<(f64, f64)> = [(0.0, 80.0), (120.0, 200.0)].into_iter().zip(sides).filter_map(|(span, on)| on.then_some(span)).collect();
+        let bends: Vec<(f64, f64)> = f["bends"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|b| (b["start"][0].as_f64().unwrap_or(f64::NAN), b["end"][0].as_f64().unwrap_or(f64::NAN)))
+            .collect();
+        assert!(
+            bends.len() == want.len() && bends.iter().zip(&want).all(|(b, w)| (b.0 - w.0).abs() < 1e-9 && (b.1 - w.1).abs() < 1e-9),
+            "{edges}: {f}"
+        );
+        assert_eq!(f["outline"].as_array().map(Vec::len), Some(1), "{edges}: {f}");
+        // The plate less the notch, and for each flange 80 × (π + 37) less the 80 × 3 it set back.
+        let area = 20_000.0 - 40.0 * 30.0 + want.len() as f64 * 80.0 * (PI + 37.0 - 3.0);
+        assert!((flat_area(&f) - area).abs() < 1e-6, "{edges}: {}", flat_area(&f));
+        assert!(rel(volume(&mut s), area * 2.0) < 1e-4, "{edges}: {} vs {}", volume(&mut s), area * 2.0);
+        // A flange stands with its outer face on the edge (y 0 … 2); a side without one keeps the
+        // base up to the edge, which the bend's round outer corner leaves free.
+        for (x, on) in [40.0, 160.0].into_iter().zip(sides) {
+            assert_eq!(contains(&s, [x, 1.0, 20.0]), on, "{edges}: a flange at x {x}");
+            assert_eq!(contains(&s, [x, 0.2, 0.2]), !on, "{edges}: the base's own edge at x {x}");
+        }
+        let state = s.model.state();
+        let body = &state.bodies[0].body;
+        assert!(body.validity().is_empty() && body.shell_count() == 1, "{edges}");
+        for command in ["sheet.unfold", "sheet.refold"] {
+            run(&mut s, command, json!({}));
+            assert!(rel(volume(&mut s), area * 2.0) < 1e-4, "{edges}, {command}: {}", volume(&mut s));
+        }
+    }
+    // An edge that a cut has taken whole is refused.
+    let mut s = Session::default();
+    plate_with_a_cut(&mut s, [[-10.0, -10.0], [210.0, 30.0]]);
+    let e = s.execute("sheet.flange", &json!({"edges": [[100, 0, 2]], "height": 40})).map(|_| ()).unwrap_err().to_string();
+    assert!(e.contains("a cut-out has taken that edge away"), "{e}");
+}
+
+#[test]
+fn an_edge_flange_on_a_flange_runs_along_what_a_flat_cut_left_of_its_far_edge() {
+    // A 40 high wall on the plate's bottom edge (outside: BA π, panel 37), its far edge at
+    // y = -(π + 37) in the flat. Unfolded, a cut takes x 0 … 60 of that edge, up to y = -30. A
+    // 15 high flange picked on the rest of the edge (the wall's inner face is y = -1, its top
+    // z = 40) spans x 60 … 200.
+    let mut s = Session::default();
+    run(&mut s, "sheet.manage_rules", json!({"name": "R", "thickness": "2 mm", "k_factor": "0.5", "bend_radius": "1 mm", "active": true}));
+    base(&mut s, 200.0, 100.0);
+    run(&mut s, "sheet.flange", json!({"edges": [[100, 0, 2]], "height": 40, "angle": 90, "position": "outside"}));
+    run(&mut s, "sheet.unfold", json!({}));
+    rectangle_tool(&mut s, "Corner", [-10.0, -50.0], [60.0, -30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch": "Corner", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    run(&mut s, "sheet.refold", json!({}));
+    run(&mut s, "sheet.flange", json!({"edges": [[130, -1, 40]], "height": 15, "angle": 90, "position": "outside"}));
+    assert!(no_errors_or_warnings(&s), "{:?}", s.model.results);
+    let f = flat(&mut s);
+    let bends = f["bends"].as_array().cloned().unwrap_or_default();
+    let spans: Vec<(f64, f64)> =
+        bends.iter().map(|b| (b["start"][0].as_f64().unwrap_or(f64::NAN), b["end"][0].as_f64().unwrap_or(f64::NAN))).collect();
+    let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+    assert!(spans.len() == 2 && close(spans[0], (0.0, 200.0)) && close(spans[1], (60.0, 200.0)), "{f}");
+    // The plate, the wall less the cut's 60 × (π + 7), and 140 × (π + 12) of the flange on it.
+    let area = 20_000.0 + 200.0 * (PI + 37.0) - 60.0 * (PI + 7.0) + 140.0 * (PI + 12.0);
+    assert!((flat_area(&f) - area).abs() < 1e-6, "{}", flat_area(&f));
+    assert!(rel(volume(&mut s), area * 2.0) < 1e-4, "{} vs {}", volume(&mut s), area * 2.0);
+    // It lies over the plate from the wall (z 41 … 43, y 0 … 12), on x 60 … 200 only.
+    assert!(contains(&s, [130.0, 6.0, 42.0]) && !contains(&s, [30.0, 6.0, 42.0]));
+}
+
 #[test]
 fn bend_table_exports_shop_dimensions_and_tracks_parameter_changes() {
     let mut s = Session::default();
@@ -1184,6 +1330,75 @@ fn inherited_round_hole_survives_flange_and_unfold_in_flipped_frames() {
         assert!((volume(&mut s) - expected).abs() < 0.1);
         run(&mut s, "sheet.refold", json!({}));
         assert!((volume(&mut s) - folded).abs() < 0.1);
+    }
+}
+
+fn faces(s: &mut Session) -> (u64, u64) {
+    let body = run(s, "inspect.measure", json!({}))["bodies"][0].clone();
+    (body["faces"].as_u64().unwrap(), body["face_types"]["cylinder"].as_u64().unwrap_or(0))
+}
+
+#[test]
+fn elliptic_cut_out_stays_exact_in_the_flat_pattern_and_follows_arcs_when_folded() {
+    use solidcraft_geom::Seg2;
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    run(&mut s, "sheet.flange", json!({"edges": [[50, 0, 2.5]], "height": 20}));
+    let (uncut, blank) = (volume(&mut s), s.model.state().sheets[0].flat_regions().unwrap()[0].area());
+    let (plain_faces, plain_cylinders) = faces(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Cut"}));
+    run(&mut s, "sketch.ellipse", json!({"center": [40, 30], "major": [55, 30], "minor_radius": 8}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Cut", "through_all": true, "operation": "cut", "direction": "symmetric"}));
+    // The ellipse takes π·15·8 of the 2.5 mm sheet (a body's volume is measured on its mesh).
+    let cut = PI * 15.0 * 8.0;
+    let folded = volume(&mut s);
+    assert!((uncut - folded - cut * 2.5).abs() < 0.5, "{}", uncut - folded);
+    // The flat pattern holds the ellipse itself, so its area is the blank less π·15·8.
+    let regions = s.model.state().sheets[0].flat_regions().unwrap();
+    let hole = &regions[0].holes[0];
+    assert!(hole.segs.len() == 4 && hole.segs.iter().all(|x| matches!(x, Seg2::Conic { .. })), "{} segments", hole.segs.len());
+    assert!((regions[0].area() - (blank - cut)).abs() < 1e-9, "{}", regions[0].area());
+    // The flat pattern JSON lists it as those four curves, one `polyline` each, with every
+    // point on the ellipse ((x − 40)/15)² + ((y − 30)/8)² = 1.
+    let shapes = flat(&mut s)["cutout_shapes"].as_array().cloned().unwrap_or_default();
+    let curves: Vec<Vec<Value>> = shapes[0]["segments"].as_array().into_iter().flatten().filter_map(|x| x["polyline"].as_array().cloned()).collect();
+    assert!(shapes.len() == 1 && curves.len() == 4 && shapes[0]["segments"].as_array().is_some_and(|a| a.len() == 4), "{} curves", curves.len());
+    let off = |p: &Value| ((p[0].as_f64().unwrap_or(0.0) - 40.0) / 15.0).powi(2) + ((p[1].as_f64().unwrap_or(0.0) - 30.0) / 8.0).powi(2) - 1.0;
+    assert!(curves.iter().all(|c| c.len() > 2 && c.iter().all(|p| off(p).abs() < 1e-9)));
+    // Folded, the cut-out's wall is cylinders over tangent arcs: fewer than half the 264
+    // chords of 0.001 mm (four quarters of √(2·17/0.008) = 66 each).
+    let (cut_faces, cut_cylinders) = faces(&mut s);
+    let wall = cut_faces - plain_faces;
+    assert!(wall < 132 && cut_cylinders - plain_cylinders + 4 >= wall, "{wall} wall faces, {} cylinders", cut_cylinders - plain_cylinders);
+    // Unfolded, it is the four conic faces of the ellipse.
+    run(&mut s, "sheet.unfold", json!({}));
+    assert!((volume(&mut s) - (blank - cut) * 2.5).abs() < 0.5);
+    assert_eq!(faces(&mut s).0, regions[0].outer.segs.len() as u64 + 4 + 2);
+    run(&mut s, "sheet.refold", json!({}));
+    assert!((volume(&mut s) - folded).abs() < 0.1);
+}
+
+#[test]
+fn flipped_base_flange_keeps_its_elliptic_outline() {
+    for flip in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Oval"}));
+        run(&mut s, "sketch.ellipse", json!({"center": [0, 0], "major": [25, 0], "minor_radius": 12}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "sheet.flange", json!({"sketch": "Oval", "flip": flip}));
+        let regions = s.model.state().sheets[0].flat_regions().unwrap();
+        let outline = &regions[0].outer.segs;
+        assert!(
+            outline.len() == 4 && outline.iter().all(|x| matches!(x, solidcraft_geom::Seg2::Conic { .. })),
+            "flip {flip}: {} segments",
+            outline.len()
+        );
+        // π·25·12 of the 2.5 mm sheet: exactly in the flat pattern; within 0.5 mm³ in the body,
+        // which follows the outline by arcs and is measured on its mesh (a 64-sided outline
+        // would be 3.8 mm³ short).
+        assert!((regions[0].area() - PI * 300.0).abs() < 1e-9, "flip {flip}: {}", regions[0].area());
+        assert!((volume(&mut s) - PI * 300.0 * 2.5).abs() < 0.5, "flip {flip}: {}", volume(&mut s));
     }
 }
 
@@ -2125,44 +2340,6 @@ fn dxf_has_circle(s: &mut Session, c: [f64; 2], r: f64) -> bool {
         .any(|g| matches!(g, solidcraft_io::Geom2::Circle(at, radius) if at.dist(centre) < 1e-5 && (radius - r).abs() < 1e-5))
 }
 
-/// #560: a hole square to a sheet is the cut-out the extrude cut of its circle makes.
-#[test]
-fn a_hole_square_to_a_sheet_is_a_cut_out_of_its_flat_pattern() {
-    // Ø6 through a 100 x 60 x 2.5 plate at (30, 20) takes π · 3² · 2.5 mm³.
-    let mut s = Session::default();
-    base(&mut s, 100.0, 60.0);
-    run(&mut s, "solid.hole", json!({"position": [30, 20, 2.5], "diameter": 6, "name": "Bore"}));
-    let mut cut = Session::default();
-    base(&mut cut, 100.0, 60.0);
-    circle_sketch(&mut cut, "Circle", json!("XY"), [30.0, 20.0], 6.0);
-    run(&mut cut, "solid.extrude", json!({"sketch": "Circle", "through_all": true, "direction": "symmetric", "operation": "cut"}));
-    for session in [&mut s, &mut cut] {
-        assert!((volume(session) - (15000.0 - 9.0 * PI * 2.5)).abs() < 0.05, "{}", volume(session));
-        let f = flat(session);
-        assert_eq!(f["cutouts"].as_array().map(Vec::len), Some(1));
-        assert!(has_round_cutout(&f, [30.0, 20.0], 3.0), "{}", f["cutouts"]);
-        assert_eq!(f["pockets"], json!([]));
-        assert!(dxf_has_circle(session, [30.0, 20.0], 3.0));
-    }
-    assert!((volume(&mut s) - volume(&mut cut)).abs() < 1e-6, "the hole and the cut remove the same");
-    // Unfold and refold keep it, and a wider drill rebuilds it through both.
-    for command in ["sheet.unfold", "sheet.refold"] {
-        run(&mut s, command, json!({}));
-        assert!((volume(&mut s) - (15000.0 - 9.0 * PI * 2.5)).abs() < 0.05, "{command}: {}", volume(&mut s));
-    }
-    run(&mut s, "timeline.edit", json!({"feature": "Bore", "set": {"diameter": "8"}}));
-    assert!((volume(&mut s) - (15000.0 - 16.0 * PI * 2.5)).abs() < 0.05, "{}", volume(&mut s));
-    let f = flat(&mut s);
-    assert!(f["cutouts"].as_array().map(Vec::len) == Some(1) && has_round_cutout(&f, [30.0, 20.0], 4.0), "{}", f["cutouts"]);
-    // From the underside with its direction given, as the issue has it: a second cut-out.
-    run(&mut s, "solid.hole", json!({"position": [70, 40, 0], "direction": [0, 0, 1], "diameter": 5}));
-    assert!((volume(&mut s) - (15000.0 - (16.0 + 6.25) * PI * 2.5)).abs() < 0.05, "{}", volume(&mut s));
-    let f = flat(&mut s);
-    assert!(f["cutouts"].as_array().map(Vec::len) == Some(2) && has_round_cutout(&f, [70.0, 40.0], 2.5), "{}", f["cutouts"]);
-    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
-    assert!((volume(&mut reopened) - volume(&mut s)).abs() < 1e-6);
-}
-
 /// A hole on a flange lands in the flat pattern where the bend allowance puts its panel.
 #[test]
 fn a_hole_on_a_flange_panel_unfolds_with_the_flange() {
@@ -2201,106 +2378,6 @@ fn a_hole_on_a_flange_panel_unfolds_with_the_flange() {
     run(&mut flat_first, "sheet.refold", json!({}));
     assert!((v0 - volume(&mut flat_first) - PI * 4.0 * 2.5).abs() < 0.05, "{}", v0 - volume(&mut flat_first));
     assert!(!contains(&flat_first, [30.0, 1.25, 12.0]) && contains(&flat_first, [33.0, 1.25, 12.0]));
-}
-
-/// A counterbore is a round pocket around its hole and a blind hole a round pocket, as extrude
-/// cuts of those circles to those depths are.
-#[test]
-fn counterbored_and_blind_holes_in_a_sheet_are_round_pockets() {
-    let mut s = Session::default();
-    base(&mut s, 100.0, 60.0);
-    // Ø4 through with a Ø8 counterbore 1 deep: π · (2² · 2.5 + (4² − 2²) · 1) = 22π mm³.
-    run(&mut s, "solid.hole", json!({"position": [30, 20, 2.5], "diameter": 4, "type": "counterbore", "cb_diameter": 8, "cb_depth": 1}));
-    assert!((volume(&mut s) - (15000.0 - 22.0 * PI)).abs() < 0.05, "{}", volume(&mut s));
-    assert!(!contains(&s, [33.0, 20.0, 2.0]) && contains(&s, [33.0, 20.0, 1.0]) && !contains(&s, [30.0, 20.0, 1.0]));
-    let f = flat(&mut s);
-    assert!(f["cutouts"].as_array().map(Vec::len) == Some(1) && has_round_cutout(&f, [30.0, 20.0], 2.0), "{}", f["cutouts"]);
-    assert_eq!(f["pockets"].as_array().map(Vec::len), Some(1));
-    assert_eq!(f["pockets"][0]["side"], "top");
-    assert!((f["pockets"][0]["depth_mm"].as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-9, "{}", f["pockets"][0]);
-    // Ø6, 1 deep from the underside: 9π mm³ more, and no cut-out.
-    run(&mut s, "solid.hole", json!({"position": [70, 40, 0], "direction": [0, 0, 1], "diameter": 6, "depth": 1}));
-    assert!((volume(&mut s) - (15000.0 - 31.0 * PI)).abs() < 0.05, "{}", volume(&mut s));
-    let f = flat(&mut s);
-    assert_eq!(f["cutouts"].as_array().map(Vec::len), Some(1));
-    assert_eq!(f["pockets"].as_array().map(Vec::len), Some(2));
-    assert!(
-        f["pockets"]
-            .as_array()
-            .is_some_and(|p| p.iter().any(|p| p["side"] == "bottom" && (p["depth_mm"].as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-9))
-    );
-    for command in ["sheet.unfold", "sheet.refold"] {
-        run(&mut s, command, json!({}));
-        assert!((volume(&mut s) - (15000.0 - 31.0 * PI)).abs() < 0.05, "{command}: {}", volume(&mut s));
-    }
-    // A hole exactly as deep as the sheet goes through it.
-    run(&mut s, "solid.hole", json!({"position": [50, 50, 2.5], "diameter": 6, "depth": 2.5}));
-    assert_eq!(flat(&mut s)["cutouts"].as_array().map(Vec::len), Some(2));
-}
-
-/// What the flat material cannot keep is refused before anything changes, with what to do.
-#[test]
-fn holes_a_sheet_cannot_keep_are_refused_and_say_why() {
-    let mut s = Session::default();
-    plate_with_flange(&mut s);
-    let (v0, features) = (volume(&mut s), s.doc.features.len());
-    let refused = |s: &mut Session, hole: Value| match s.execute("solid.hole", &hole) {
-        Ok(_) => panic!("accepted: {hole}"),
-        Err(e) => e.to_string(),
-    };
-    // Slanted to the base; drilled into the sheet's edge (the face x = 100) and the flange's (z = 20).
-    for hole in [
-        json!({"position": [30, 20, 2.5], "direction": [1, 0, -2], "diameter": 4}),
-        json!({"position": [100, 30, 1.25], "diameter": 1}),
-        json!({"position": [50, 1.25, 20], "diameter": 1}),
-    ] {
-        let e = refused(&mut s, hole.clone());
-        assert!(e.contains("square to the panel"), "{hole}: {e}");
-    }
-    // Into the bend (the base's panel ends at y = 5): that needs the sheet unfolded.
-    let e = refused(&mut s, json!({"position": [50, 6, 2.5], "diameter": 6}));
-    assert!(e.contains("bend") && e.contains("unfold"), "{e}");
-    // A cone: a countersink, and a drill point that ends inside the sheet.
-    for hole in [
-        json!({"position": [30, 20, 2.5], "diameter": 4, "type": "countersink", "cs_diameter": 8}),
-        json!({"position": [30, 20, 2.5], "diameter": 4, "type": "drilled", "depth": 1}),
-    ] {
-        let e = refused(&mut s, hole.clone());
-        assert!(e.contains("countersink or a drill point"), "{hole}: {e}");
-    }
-    assert_eq!(s.doc.features.len(), features);
-    assert!((volume(&mut s) - v0).abs() < 1e-9);
-    assert_eq!(flat(&mut s)["cutouts"], json!([]));
-}
-
-/// Holes at the points of a sketch on a sheet face are its cut-outs; a body the drill meets
-/// beyond the sheet is drilled as before, and a tapped hole keeps its thread.
-#[test]
-fn holes_at_sketch_points_cut_the_sheet_and_drill_the_body_under_it() {
-    let mut s = Session::default();
-    base(&mut s, 100.0, 60.0);
-    // A 30 x 20 x 10 block under the plate, below the first point.
-    run(
-        &mut s,
-        "solid.box",
-        json!({"corner": [10, 10, -10], "length": 30, "width": 20, "height": 10, "operation": "new_body", "body_name": "Block"}),
-    );
-    run(&mut s, "sketch.create", json!({"plane": {"face": [50, 30, 2.5]}, "name": "Spots"}));
-    for at in [[20, 20], [60, 20], [80, 40]] {
-        run(&mut s, "sketch.point", json!({"point": at}));
-    }
-    run(&mut s, "sketch.finish", json!({}));
-    run(&mut s, "solid.hole", json!({"sketch": "Spots", "thread": "M6"}));
-    // An M6 thread's tap drill is Ø5: three holes through the plate, one of them through the block.
-    let of = |s: &mut Session, body: &str| run(s, "inspect.measure", json!({"bodies": [body]}))["total"]["volume_mm3"].as_f64().unwrap_or(f64::NAN);
-    assert!((of(&mut s, "Body1") - (15000.0 - 3.0 * 6.25 * PI * 2.5)).abs() < 0.05, "{}", of(&mut s, "Body1"));
-    assert!((of(&mut s, "Block") - (6000.0 - 6.25 * PI * 10.0)).abs() < 0.05, "{}", of(&mut s, "Block"));
-    let f = flat(&mut s);
-    assert_eq!(f["cutouts"].as_array().map(Vec::len), Some(3));
-    for centre in [[20.0, 20.0], [60.0, 20.0], [80.0, 40.0]] {
-        assert!(has_round_cutout(&f, centre, 2.5), "{centre:?}: {}", f["cutouts"]);
-    }
-    assert_eq!(s.model.state().threads.len(), 3);
 }
 
 /// On a folded sheet a counterbore is the same pocket around the same hole, on the base and on a
@@ -2513,16 +2590,86 @@ fn corner_reliefs_of_the_rule_reach_the_part_the_flat_pattern_and_the_dxf() {
 }
 
 #[test]
+fn a_tear_of_the_rule_reaches_the_part_the_flat_pattern_and_the_dxf() {
+    use std::f64::consts::SQRT_2;
+    // The tray at 90° and 72° (see the doc tests): its bends meet at (s0, s0), s0 = 3·tan(θ/2), and
+    // are BA = 2θ wide in the flat. The flange on y = 0 is closed to x_end(w) = g/√2 + T·sinθ − w·cosθ.
+    // Torn, its bend's end is cut from (s0, s0) straight to (x_end(s0), s0 − BA), where the flange's
+    // end starts: grow = s0 − x_end(s0) = sinθ − 0.5/√2 past the corner, instead of square across the
+    // bend and back along the flange's edge (the notch's step).
+    for deg in [90.0f64, 72.0] {
+        let th = deg.to_radians();
+        let (s0, ba) = (3.0 * (th / 2.0).tan(), th * 2.0);
+        let x_end = |w: f64| 0.5 / SQRT_2 + 2.0 * th.sin() - w * th.cos();
+        let grow = s0 - x_end(s0);
+        assert!((grow - (th.sin() - 0.5 / SQRT_2)).abs() < 1e-12);
+        let points = |f: &Value| -> Vec<(f64, f64)> {
+            let line = f["outline"][0].as_array();
+            line.map(|l| l.iter().map(|p| (p[0].as_f64().unwrap_or(f64::NAN), p[1].as_f64().unwrap_or(f64::NAN))).collect()).unwrap_or_default()
+        };
+        let mut notch = Session::default();
+        alu_tray(&mut notch, deg, json!({}));
+        let (v0, stepped) = (volume(&mut notch), points(&flat(&mut notch)));
+        run(&mut notch, "sheet.unfold", json!({}));
+        let flat0 = volume(&mut notch);
+        let mut s = Session::default();
+        alu_tray(&mut s, deg, json!({"corner_relief_shape": "tear"}));
+        assert!(s.model.results.iter().all(|r| r.error.is_none() && r.warning.is_none()), "{deg}: {:?}", s.model.results);
+        let listed = run(&mut s, "sheet.rules", json!({}));
+        assert_eq!(listed["rules"][0]["rule"]["corner_relief_shape"], "tear");
+        assert_eq!(listed["rules"][0]["values"]["corner_relief_shape"], "tear");
+        // The flat pattern, at the corner at the origin: the flange's end, the cut, the corner of the
+        // bends, and the same on the flange on x = 0. The step is gone: a corner less at each of the
+        // eight bend ends.
+        let f = flat(&mut s);
+        let outline = points(&f);
+        let at = |pts: &[(f64, f64)], x: f64, y: f64| pts.iter().any(|p| (p.0 - x).abs() < 1e-6 && (p.1 - y).abs() < 1e-6);
+        assert_eq!(f["outline"].as_array().map(Vec::len), Some(1), "{deg}: {f}");
+        for (x, y) in [(x_end(38.6), s0 - ba - (38.6 - s0)), (x_end(s0), s0 - ba), (s0, s0)] {
+            assert!(at(&outline, x, y) && at(&outline, y, x), "{deg}: ({x}, {y}) not in {outline:?}");
+        }
+        assert!(at(&stepped, s0, s0 - ba) && !at(&outline, s0, s0 - ba) && !at(&outline, s0 - ba, s0), "{deg}");
+        assert_eq!(outline.len() + 8, stepped.len(), "{deg}");
+        // The bend table: every centre line runs between the middles of its bend's two ends.
+        let lengths: Vec<f64> =
+            f["bends"].as_array().map(|b| b.iter().map(|b| b["length"].as_f64().unwrap_or(f64::NAN)).collect()).unwrap_or_default();
+        for (got, edge) in lengths.iter().zip([120.0, 90.0, 120.0, 90.0]) {
+            assert!(lengths.len() == 4 && (got - (edge - 2.0 * s0 + grow)).abs() < 1e-6, "{deg}: {lengths:?}");
+        }
+        // The folded part gains what the flat pattern gains: the triangle BA·grow/2 at each of the
+        // eight bend ends (K = 0.5 keeps the volume of a bend).
+        let (v, want) = (volume(&mut s), 8.0 * ba * grow / 2.0 * 2.0);
+        assert!((v - v0 - want).abs() < 0.05, "{deg}: {v} - {v0} vs {want}");
+        // The DXF: the outline in straight lines, each cut one of them, and four bend lines.
+        let dxf = run(&mut s, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap_or_default().to_string();
+        assert_eq!(dxf.matches("0\nLINE\n").count(), outline.len() + 4, "{deg}");
+        assert!(dxf.contains(&format!("{:.6}\n20\n{:.6}\n", x_end(s0), s0 - ba)), "{deg}");
+        // Unfold and refold keep it, and a cut made folded still goes through: a Ø20 hole in the base.
+        run(&mut s, "sheet.unfold", json!({}));
+        assert!((volume(&mut s) - flat0 - want).abs() < 1e-6, "{deg}: unfolded {} - {flat0} vs {want}", volume(&mut s));
+        run(&mut s, "sheet.refold", json!({}));
+        assert!((volume(&mut s) - v).abs() < 1e-6 * v, "{deg}");
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Hole"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [60, 45], "diameter": 20}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "Hole", "distance": 10, "operation": "cut", "through_all": true}));
+        assert!((v - volume(&mut s) - PI * 100.0 * 2.0).abs() < 0.5, "{deg}: {v} - {}", volume(&mut s));
+        let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!((volume(&mut reopened) - volume(&mut s)).abs() < 1e-6, "{deg}");
+    }
+}
+
+#[test]
 fn the_corner_relief_shape_is_a_rule_setting_checked_and_undone() {
     let mut s = Session::default();
     alu_tray(&mut s, 72.0, json!({}));
     let shape = |s: &mut Session| run(s, "sheet.rules", json!({}))["rules"][0]["rule"]["corner_relief_shape"].clone();
     let v0 = volume(&mut s);
     assert_eq!(shape(&mut s), "notch");
-    // Only the three names are shapes; a refused one changes nothing.
+    // Only the four names are shapes; a refused one changes nothing.
     for wrong in [json!("star"), json!("square"), json!(""), json!(2)] {
         let e = s.execute("sheet.manage_rules", &json!({"name": "AL2", "corner_relief_shape": wrong})).map(|_| ()).unwrap_err().to_string();
-        assert!(e.contains("`corner_relief_shape` must be notch, round or rectangular"), "{e}");
+        assert!(e.contains("`corner_relief_shape` must be notch, round, rectangular or tear"), "{e}");
     }
     assert!(shape(&mut s) == "notch" && volume(&mut s) == v0);
     // Changing the rule changes the parts made with it; other settings leave the shape alone.
@@ -3271,4 +3418,80 @@ fn fold_fixed_point_must_touch_the_sheet_but_any_face_will_do() {
     assert!(fold["error"].is_null(), "{fold}");
     assert!(fold["warning"].as_str().is_some_and(|w| w.contains("fixed point is not on the sheet")), "{fold}");
     assert!((bbox(&mut f)["max"][0].as_f64().unwrap_or(f64::NAN) - x).abs() < 1e-6, "the right side stays");
+}
+
+/// The middle of the largest triangle of each flat face of the first body: well inside it.
+fn flat_face_points(s: &Session) -> Vec<(usize, solidcraft_geom::Vec3, solidcraft_geom::Vec3)> {
+    let state = s.model.state();
+    let body = &state.bodies[0].body;
+    let mesh = body.tessellate(0.01).unwrap();
+    (0..body.face_count())
+        .filter_map(|index| {
+            let normal = body.planar_face(index)?.normal();
+            let point = mesh
+                .triangles
+                .iter()
+                .zip(&mesh.tri_face)
+                .filter(|(_, f)| **f as usize == index)
+                .filter_map(|(t, _)| mesh.tri(t))
+                .max_by(|[a, b, c], [d, e, f]| (*b - *a).cross(*c - *a).len().total_cmp(&(*e - *d).cross(*f - *d).len()))
+                .map(|[a, b, c]| (a + b + c) * (1.0 / 3.0))?;
+            Some((index, point, normal))
+        })
+        .collect()
+}
+
+/// Every flat face of a sheet takes an attached sketch (#495): its panels, the rims along the
+/// panels' straight edges (named by the base sketch line or the flange's far edge and sides) and
+/// the flat ends of a bend. Each lies on its face, facing out of the sheet, and a rim's sketch
+/// follows the rim when the base grows. A press-pull on a rim pushes it out, and a plain hole into
+/// a panel is kept as a cut-out of the flat pattern (#560).
+#[test]
+fn every_flat_face_of_a_sheet_takes_an_attached_sketch() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "W", "expression": "100 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [100, 60]}));
+    run(&mut s, "sketch.constraint.fix", json!({"entities": ["p1"]}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "W"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sheet.flange", json!({"sketch": "Base"}));
+    run(&mut s, "sheet.flange", json!({"edges": [[50, 0, 2.5]], "height": 20}));
+    let faces = flat_face_points(&s);
+    // The base: its two faces and three rims (the fourth edge bends); the flange: its two faces,
+    // its far rim and two sides; the two ends of the bend.
+    assert_eq!(faces.len(), 12);
+    let mut on_side = None;
+    for (index, point, normal) in faces {
+        let made = run(&mut s, "sketch.create", json!({"plane": {"face": point, "body": "Body1", "index": index}}));
+        run(&mut s, "sketch.finish", json!({}));
+        assert_eq!(made["attachment"], "sheet_face", "face {index} at {point:?}");
+        let id = made["sketch"].as_u64().unwrap();
+        let solidcraft_doc::FaceAttachmentStatus::Sheet { plane: Some(plane) } = s.placed_document().sketch_face_attachment(id, &s.model) else {
+            panic!("face {index} at {point:?}")
+        };
+        assert!(plane.normal().dot(normal) > 1.0 - 1e-9 && (point - plane.origin).dot(normal).abs() < 1e-6, "face {index}: {plane:?}");
+        if (point.x - 100.0).abs() < 1e-6 && point.y > 10.0 {
+            on_side = Some(id);
+        }
+    }
+    // The base's rim along x = W (the sketch's l2) moves with W.
+    let side = on_side.expect("the base rim on x = 100");
+    run(&mut s, "parameters.change", json!({"name": "W", "expression": "120 mm"}));
+    let solidcraft_doc::FaceAttachmentStatus::Sheet { plane: Some(plane) } = s.placed_document().sketch_face_attachment(side, &s.model) else {
+        panic!("the rim sketch after the edit")
+    };
+    assert!((plane.origin.x - 120.0).abs() < 1e-9 && (plane.normal().x - 1.0).abs() < 1e-9, "{plane:?}");
+    // Press-pull the rim 5 mm out: the base grows by 5 x 60 x 2.5 less what the flange covers.
+    let v0 = volume(&mut s);
+    run(&mut s, "solid.press_pull", json!({"face": [120, 30, 1.25], "distance": 5}));
+    assert!(volume(&mut s) > v0 + 5.0 * 50.0 * 2.5, "{} {v0}", volume(&mut s));
+    // A plain hole into the base is a cut-out of the flat pattern.
+    let mut t = Session::default();
+    plate_with_flange(&mut t);
+    let v0 = volume(&mut t);
+    run(&mut t, "solid.hole", json!({"position": [50, 30, 2.5], "direction": [0, 0, -1], "diameter": 6}));
+    assert!((v0 - volume(&mut t) - PI * 9.0 * 2.5).abs() < 0.1, "{}", v0 - volume(&mut t));
+    let f = flat(&mut t);
+    assert_eq!(f["cutouts"].as_array().map(Vec::len), Some(1), "{f}");
 }
