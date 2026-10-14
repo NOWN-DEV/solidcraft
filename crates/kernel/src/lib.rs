@@ -109,6 +109,7 @@ pub use boolean_diagnostics::{BooleanDiagnostics, BooleanFallback, BooleanStrate
 pub use build::{
     PathSeg, box_solid, canonical_revolve_axis, cylinder, extrude, extrude_tapered, extrude_tapered_between, loft, revolve, sphere, sweep, torus,
 };
+pub use clearance::{Clearance, Occupancy};
 pub use delete_face::delete_faces;
 pub use emboss::{cylinder_emboss_anchor, emboss_cylinder, emboss_cylinder_at, has_cylinder_emboss_wall, infer_cylinder_emboss};
 pub use helix::{loft_to_point, sweep_helix, sweep_helix_mesh};
