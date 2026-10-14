@@ -982,6 +982,24 @@ pub enum FeatureKind {
         path_sketch: u64,
         path: Vec<String>,
     },
+    /// A surface body lofted through sections in order, each one open or closed chain of
+    /// sketch curves: walls only, no caps.
+    SurfaceLoft {
+        sections: Vec<SheetSection>,
+    },
+    /// The faces at `faces` copied out at a signed `distance` along their normals as a new
+    /// surface body (0 copies them); `chain` takes each pick's whole smooth chain of faces;
+    /// fitted faces within `tolerance`.
+    SurfaceOffset {
+        faces: Vec<Vec3>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        distance: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chain: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tolerance: Option<String>,
+    },
     /// A planar surface body extended outward by `distance` past the edges through `edges`.
     SurfaceExtend {
         body: String,
@@ -1113,6 +1131,9 @@ pub struct MeshData {
 pub struct SketchPoints {
     pub sketch: u64,
     pub ids: Vec<String>,
+    /// Drill the other way: away from the side the holes would go into by themselves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flip: bool,
 }
 
 /// A component: a node of the design tree that owns sketches, features and bodies. The root
@@ -1134,6 +1155,17 @@ pub struct LoftSection {
     /// A sketch point instead of a profile (the loft closes to it, as a pyramid's apex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub point: Option<String>,
+}
+
+/// A section of a surface loft: one chain from a sketch (one profile's boundary, or curves
+/// meeting end to end).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SheetSection {
+    pub sketch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<ProfileSel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub curves: Vec<String>,
 }
 
 /// Coil cross-sections.
@@ -1292,6 +1324,7 @@ impl FeatureKind {
             K::Sweep { sketch, path_sketch, .. } | K::SurfaceSweep { sketch, path_sketch, .. } => vec![*sketch, *path_sketch],
             K::Pipe { path_sketch, .. } | K::Pattern { pattern: PatternKind::Path { path_sketch, .. }, .. } => vec![*path_sketch],
             K::Loft { sections, .. } => sections.iter().map(|s| s.sketch).collect(),
+            K::SurfaceLoft { sections } => sections.iter().map(|s| s.sketch).collect(),
             K::SheetFold { sketch, .. } | K::SplitFace { sketch, .. } | K::Patch { sketch, .. } => sketch.iter().copied().collect(),
             K::Hole { points, .. } => points.iter().map(|p| p.sketch).collect(),
             K::Sketch { .. }
@@ -1314,6 +1347,7 @@ impl FeatureKind {
             | K::Scale { .. }
             | K::OffsetFace { .. }
             | K::DeleteFace { .. }
+            | K::SurfaceOffset { .. }
             | K::BoundingSolid { .. }
             | K::ReplaceFace { .. }
             | K::Align { .. }
@@ -1393,6 +1427,7 @@ impl FeatureKind {
             FeatureKind::Scale { .. } => "ScaleFeature",
             FeatureKind::OffsetFace { .. } => "OffsetFacesFeature",
             FeatureKind::DeleteFace { .. } => "DeleteFaceFeature",
+            FeatureKind::SurfaceOffset { .. } => "OffsetSurfaceFeature",
             FeatureKind::BoundingSolid { .. } => "BoundingSolidFeature",
             FeatureKind::Pipe { .. } => "PipeFeature",
             FeatureKind::Emboss { .. } => "EmbossFeature",
@@ -1420,6 +1455,7 @@ impl FeatureKind {
             FeatureKind::SurfaceExtrude { .. } => "SurfaceExtrudeFeature",
             FeatureKind::SurfaceRevolve { .. } => "SurfaceRevolveFeature",
             FeatureKind::SurfaceSweep { .. } => "SurfaceSweepFeature",
+            FeatureKind::SurfaceLoft { .. } => "SurfaceLoftFeature",
             FeatureKind::Stitch { .. } => "StitchFeature",
             FeatureKind::Thicken { .. } => "ThickenFeature",
             FeatureKind::SurfaceTrim { .. } => "TrimFeature",
@@ -1464,6 +1500,7 @@ impl FeatureKind {
             FeatureKind::Scale { .. } => "Scale",
             FeatureKind::OffsetFace { .. } => "OffsetFace",
             FeatureKind::DeleteFace { .. } => "DeleteFace",
+            FeatureKind::SurfaceOffset { .. } => "OffsetSurface",
             FeatureKind::BoundingSolid { .. } => "BoundingSolid",
             FeatureKind::Pipe { .. } => "Pipe",
             FeatureKind::Emboss { .. } => "Emboss",
@@ -1491,6 +1528,7 @@ impl FeatureKind {
             FeatureKind::SurfaceExtrude { .. } => "SurfaceExtrude",
             FeatureKind::SurfaceRevolve { .. } => "SurfaceRevolve",
             FeatureKind::SurfaceSweep { .. } => "SurfaceSweep",
+            FeatureKind::SurfaceLoft { .. } => "SurfaceLoft",
             FeatureKind::Stitch { .. } => "Stitch",
             FeatureKind::Thicken { .. } => "Thicken",
             FeatureKind::SurfaceTrim { .. } => "Trim",
@@ -1520,6 +1558,7 @@ impl FeatureKind {
                 vec![(*sk, profiles)]
             }
             FeatureKind::Loft { sections, .. } => sections.iter_mut().filter(|s| s.point.is_none()).map(|s| (s.sketch, &mut s.profiles)).collect(),
+            FeatureKind::SurfaceLoft { sections } => sections.iter_mut().filter_map(|s| Some((s.sketch, s.profiles.as_mut()?))).collect(),
             _ => Vec::new(),
         }
     }
@@ -1541,6 +1580,7 @@ impl FeatureKind {
             FeatureKind::Loft { sections, .. } => {
                 sections.iter().filter(|section| section.point.is_none()).map(|section| (section.sketch, &section.profiles)).collect()
             }
+            FeatureKind::SurfaceLoft { sections } => sections.iter().filter_map(|s| Some((s.sketch, s.profiles.as_ref()?))).collect(),
             _ => Vec::new(),
         }
     }
@@ -1551,6 +1591,7 @@ impl FeatureKind {
             | FeatureKind::Draft { faces, .. }
             | FeatureKind::OffsetFace { faces, .. }
             | FeatureKind::DeleteFace { faces, .. }
+            | FeatureKind::SurfaceOffset { faces, .. }
             | FeatureKind::SplitFace { faces, .. }
             | FeatureKind::ReplaceFace { faces, .. } => faces.iter_mut().collect(),
             FeatureKind::Hole { position, points: None, to, .. } => std::iter::once(position).chain(to.iter_mut()).collect(),
@@ -1648,7 +1689,7 @@ impl FeatureKind {
             },
             FeatureKind::Mirror { plane, .. } => plane_exprs(plane, &mut v),
             FeatureKind::Shell { thickness, .. } => v.push(thickness),
-            FeatureKind::Loft { .. } | FeatureKind::Sweep { .. } | FeatureKind::SurfaceSweep { .. } => {}
+            FeatureKind::Loft { .. } | FeatureKind::Sweep { .. } | FeatureKind::SurfaceSweep { .. } | FeatureKind::SurfaceLoft { .. } => {}
             FeatureKind::Draft { angle, neutral, .. } => {
                 v.push(angle);
                 plane_exprs(neutral, &mut v);
@@ -1726,6 +1767,12 @@ impl FeatureKind {
             }
             FeatureKind::ReplaceFace { target, .. } => plane_exprs(target, &mut v),
             FeatureKind::Align { .. } | FeatureKind::Remove { .. } | FeatureKind::BoundaryFill { .. } | FeatureKind::DeleteFace { .. } => {}
+            FeatureKind::SurfaceOffset { distance, tolerance, .. } => {
+                v.push(distance);
+                if let Some(t) = tolerance {
+                    v.push(t);
+                }
+            }
             FeatureKind::Stitch { tolerance, .. } => v.push(tolerance),
             FeatureKind::MeshConvert { tolerance, .. } => v.push(tolerance),
             FeatureKind::Thicken { thickness, .. } => v.push(thickness),
@@ -2628,45 +2675,9 @@ impl Document {
 }
 
 /// Density of the default material (g/cm³), as Fusion's default.
-pub const DEFAULT_DENSITY: f64 = 1.29;
-
-/// Physical materials: name and density (g/cm³).
-pub const MATERIALS: [(&str, f64); 14] = [
-    ("Default", DEFAULT_DENSITY),
-    ("Steel", 7.85),
-    ("Stainless Steel", 8.0),
-    ("Aluminum", 2.70),
-    ("Brass", 8.50),
-    ("Copper", 8.96),
-    ("Titanium", 4.43),
-    ("Cast Iron", 7.20),
-    ("ABS Plastic", 1.06),
-    ("PLA", 1.24),
-    ("Nylon", 1.14),
-    ("Polycarbonate", 1.20),
-    ("Oak", 0.75),
-    ("Glass", 2.50),
-];
-
-/// How a physical material looks (sRGB); the default material has no colour of its own.
-pub fn material_color(name: &str) -> Option<[u8; 3]> {
-    Some(match name {
-        "Steel" => [158, 164, 172],
-        "Stainless Steel" => [186, 191, 198],
-        "Aluminum" => [204, 208, 214],
-        "Brass" => [208, 172, 88],
-        "Copper" => [204, 122, 80],
-        "Titanium" => [150, 148, 158],
-        "Cast Iron" => [104, 104, 110],
-        "ABS Plastic" => [222, 222, 216],
-        "PLA" => [110, 160, 222],
-        "Nylon" => [236, 230, 214],
-        "Polycarbonate" => [196, 216, 232],
-        "Oak" => [190, 146, 92],
-        "Glass" => [170, 208, 218],
-        _ => return None,
-    })
-}
+#[path = "../../../assets/materials/library.rs"]
+mod materials;
+pub use materials::{DEFAULT_DENSITY, MATERIALS, material_color};
 
 /// A physical material defined in a design (`material.create`): its name, its density and,
 /// optionally, the look it gives bodies without an appearance of their own.
