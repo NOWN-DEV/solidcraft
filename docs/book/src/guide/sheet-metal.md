@@ -136,6 +136,19 @@ file writes one in pieces. Not converted yet: curved faces (rolled sheet, a fill
 bend), faces with holes or curved edges in a body with bend edges (cut them after converting)
 and bends that close a ring.
 
+A plate may carry recesses in one of its faces, such as an engraved label or a counterbore: a
+recess with a flat floor and walls square to the plate, at most half the plate's thickness
+deep. Each becomes a pocket of the sheet (see the pockets below), so the converted part keeps
+it: the sheet is as thick as the plate, the flat pattern is the whole plate with the recess
+listed under `pockets` (its outline, side and depth), and the DXF draws its outline on the
+pocket layer of its depth, apart from the cut contours, for a laser to mark rather than cut.
+The face the recesses are in can be the one picked or the other. A recess deeper than half the
+thickness, recesses in both faces, and a plate whose recesses are larger than the face around
+them (a thinner plate with raised parts) are refused with the reason. A recess lies in an
+opening of the face it is cut into, so the faces of a bent part's legs are none: a bent part is
+refused as no plate, and converts with its bend edges. A bend across a pocket is refused as for
+any pocket, so fold or flange clear of an engraving.
+
 ```json
 {"command":"solid.box","params":{"length":100,"width":60,"height":30,"body_name":"Tray"}}
 {"command":"solid.shell","params":{"faces":[[50,30,30]],"thickness":2}}

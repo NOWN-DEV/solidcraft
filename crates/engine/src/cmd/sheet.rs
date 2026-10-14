@@ -38,7 +38,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SHEET METAL", "CREATE")
         .icon("convert_sheet")
         .params(
-            "body; face: [x,y,z] on its large flat face (a plate of even thickness), or that face's name from model.faces; rule?; \
+            "body; face: [x,y,z] on its large flat face (a plate of even thickness; recesses in one face up to half the thickness deep, \
+             such as an engraved label, become pockets of the sheet), or that face's name from model.faces; rule?; \
              bends?: [[x,y,z] on sharp edges] (a solid or a shelled body: `face` is the fixed face and the flat faces reached from it \
              across these edges become the sheet; a shell keeps its thickness, a solid takes the rule's inward; \
              edges between two of those faces that are no bends are cut open with the rule's gap)",
@@ -60,7 +61,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         ),
     CommandSpec::new("sheet.export_dxf", "Export Flat Pattern as DXF", export_dxf)
         .noundo()
-        .params("body?, path?, curves?: exact|arcs (default exact: an ellipse as ELLIPSE, splines, text outlines and other Béziers as SPLINE; arcs: tangent arcs and lines within 0.001 mm, for machines that read only those) → DXF (AutoCAD 2000, mm): OUTLINE, BEND_UP and BEND_DOWN (centre lines) layers"),
+        .params("body?, path?, curves?: exact|arcs (default exact: an ellipse as ELLIPSE, splines, text outlines and other Béziers as SPLINE; arcs: tangent arcs and lines within 0.001 mm, for machines that read only those) → DXF (AutoCAD 2000, mm): OUTLINE, BEND_UP and BEND_DOWN (centre lines) layers, and pockets on POCKET_<BOTTOM|TOP|INTERNAL>_Z<from>_TO_<to>_MM"),
     CommandSpec::new("sheet.export_bend_table", "Export Bend Table", export_bend_table)
         .noundo()
         .params("body?, format?: csv|json (default csv), path? → bend table in mm and degrees, including rule and flat centre-line coordinates; a bend that cut-outs split has a row for each piece"),

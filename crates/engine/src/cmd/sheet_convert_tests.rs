@@ -1,5 +1,5 @@
-//! Convert to Sheet Metal: solid and shelled bodies with bend edges, and plates read from STEP
-//! files whose walls come in pieces.
+//! Convert to Sheet Metal: solid and shelled bodies with bend edges, plates read from STEP files
+//! whose walls come in pieces, and plates with recesses.
 
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
 
@@ -802,4 +802,223 @@ fn a_long_thin_strip_keeps_its_small_round_holes() {
         assert!(radii.len() == 4 && radii.iter().zip([0.5, 1.0, 2.0, 5.0]).all(|(a, b)| (a - b).abs() < 1e-9), "{l}: {radii:?}");
         assert_eq!(dxf_entities(&mut s), (4, 0, 4), "{l}");
     }
+}
+
+/// A 60 x 40 x 1 plate on XY.
+fn plate(s: &mut Session) {
+    run(s, "solid.box", json!({"length": 60, "width": 40, "height": 1, "body_name": "Plate"}));
+}
+
+/// The plate with what `draw` sketches on its top cut `depth` deep into it (the profiles at
+/// `profiles`, all when none).
+fn engraved_plate(s: &mut Session, depth: f64, draw: impl Fn(&mut Session), profiles: &[[f64; 2]]) {
+    plate(s);
+    run(s, "sketch.create", json!({"plane": "XY", "offset": 1, "name": "Label"}));
+    draw(s);
+    run(s, "sketch.finish", json!({}));
+    let mut cut = json!({"sketch": "Label", "distance": depth, "direction": "negative", "operation": "cut"});
+    if !profiles.is_empty() {
+        cut["profiles"] = profiles.iter().map(|p| json!({"point": p})).collect();
+    }
+    run(s, "solid.extrude", cut);
+}
+
+fn label_rectangle(s: &mut Session) {
+    run(s, "sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [30, 20]}));
+}
+
+fn contains(s: &Session, p: [f64; 3]) -> bool {
+    s.model.state().bodies.first().is_some_and(|b| b.body.contains(solidcraft_geom::Vec3::new(p[0], p[1], p[2])))
+}
+
+/// The LINE entities a DXF draws on `layer` (group codes and values alternate, a line each).
+fn lines_on(dxf: &str, layer: &str) -> usize {
+    let lines: Vec<&str> = dxf.lines().map(str::trim).collect();
+    let mut in_line = false;
+    let mut count = 0;
+    for pair in lines.chunks(2) {
+        match pair {
+            ["0", kind] => in_line = *kind == "LINE",
+            ["8", name] if in_line && *name == layer => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
+/// A plate with an engraving converts: the engraving is a pocket of the sheet, so the sheet keeps
+/// the plate's shape, and its outline is the flat pattern's pocket, on the DXF's pocket layer.
+/// Picked on the engraved face, the pocket starts from the sheet's z = 0 (the face picked);
+/// picked on the other face, it ends at z = T.
+#[test]
+fn a_plate_with_an_engraving_converts_with_the_engraving_as_a_pocket() {
+    for (pick, layer) in [([45.0, 30.0, 1.0], "POCKET_BOTTOM_Z0.000000_TO_0.100000_MM"), ([45.0, 30.0, 0.0], "POCKET_TOP_Z0.900000_TO_1.000000_MM")] {
+        let mut s = Session::default();
+        engraved_plate(&mut s, 0.1, label_rectangle, &[]);
+        run(&mut s, "sheet.convert", json!({"body": "Plate", "face": pick}));
+        assert!(s.model.results.iter().all(|r| r.error.is_none() && r.warning.is_none()), "{pick:?}: {:?}", s.model.results);
+        // By hand: 60·40·1 less the engraving's 20·10·0.1; the faces' 2·60·40 + 2·(60 + 40)·1 and
+        // the engraving's walls, 2·(20 + 10)·0.1.
+        let m = run(&mut s, "inspect.measure", json!({}));
+        assert!((m["total"]["volume_mm3"].as_f64().unwrap_or(f64::NAN) - 2380.0).abs() < 1e-6, "{pick:?}: {m}");
+        assert!((m["total"]["area_mm2"].as_f64().unwrap_or(f64::NAN) - 5006.0).abs() < 1e-6, "{pick:?}: {m}");
+        // It stays in the face it was cut into (the converted plate is as thick, wherever it lies).
+        let (lo, hi) = bbox(&mut s);
+        assert!((hi[2] - lo[2] - 1.0).abs() < 1e-9, "{pick:?}: {lo:?} {hi:?}");
+        assert!(!contains(&s, [20.0, 15.0, hi[2] - 0.05]) && contains(&s, [20.0, 15.0, hi[2] - 0.15]), "{pick:?}");
+        assert!(contains(&s, [45.0, 30.0, hi[2] - 0.05]), "{pick:?}");
+        // The flat pattern: the whole plate, no cut-out, and the engraving as a pocket 0.1 deep.
+        let f = flat(&mut s);
+        assert!(same_size(flat_size(&mut s), (60.0, 40.0), 1e-9), "{f}");
+        assert_eq!(f["cutouts"], json!([]), "{f}");
+        let pockets = f["pockets"].as_array().cloned().unwrap_or_default();
+        assert_eq!(pockets.len(), 1, "{f}");
+        assert!((pockets[0]["depth_mm"].as_f64().unwrap_or(f64::NAN) - 0.1).abs() < 1e-9, "{f}");
+        let corners: Vec<(f64, f64)> =
+            pockets[0]["outline"].as_array().unwrap().iter().map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap())).collect();
+        let span = |k: fn(&(f64, f64)) -> f64| corners.iter().map(k).fold(f64::MIN, f64::max) - corners.iter().map(k).fold(f64::MAX, f64::min);
+        assert!(same_size((span(|p| p.0), span(|p| p.1)), (20.0, 10.0), 1e-9), "{f}");
+        // The DXF: the plate's outline and the engraving's, four lines each, on their layers.
+        let dxf = run(&mut s, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap().to_string();
+        assert_eq!((lines_on(&dxf, "OUTLINE"), lines_on(&dxf, layer)), (4, 4), "{pick:?}: {dxf}");
+        // Nothing is stored for it: reopened, the design builds the same sheet.
+        let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!((volume(&mut reopened) - 2380.0).abs() < 1e-6);
+        assert_eq!(flat(&mut reopened), f);
+    }
+}
+
+/// A plate large enough that its tessellation tolerance (1/1000 of its size, 0.72 mm here) is
+/// more than its engraving's depth keeps the engraving too.
+#[test]
+fn a_large_plate_keeps_an_engraving_shallower_than_its_tessellation_tolerance() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 600, "width": 400, "height": 1, "body_name": "Plate"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 1, "name": "Label"}));
+    label_rectangle(&mut s);
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Label", "distance": 0.1, "direction": "negative", "operation": "cut"}));
+    for pick in [[450.0, 300.0, 0.0], [450.0, 300.0, 1.0]] {
+        let mut s = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        run(&mut s, "sheet.convert", json!({"body": "Plate", "face": pick}));
+        // 600·400·1 less the engraving's 20·10·0.1.
+        assert!((volume(&mut s) - 239_980.0).abs() < 1e-3, "{pick:?}: {}", volume(&mut s));
+        assert_eq!(flat(&mut s)["pockets"].as_array().map(Vec::len), Some(1), "{pick:?}");
+    }
+}
+
+/// An engraved ring (an "O": a 5 mm circle round a 3 mm island) is one pocket with a hole; the
+/// island stays at full thickness.
+#[test]
+fn an_engraved_ring_converts_as_a_pocket_round_its_island() {
+    let mut s = Session::default();
+    engraved_plate(
+        &mut s,
+        0.1,
+        |s| {
+            run(s, "sketch.circle.center", json!({"center": [20, 20], "radius": 5}));
+            run(s, "sketch.circle.center", json!({"center": [20, 20], "radius": 3}));
+        },
+        &[[24.0, 20.0]],
+    );
+    // The extrude took the ring between the circles, not the island.
+    assert!((volume(&mut s) - (2400.0 - 0.1 * PI * (25.0 - 9.0))).abs() < 1e-3, "{}", volume(&mut s));
+    run(&mut s, "sheet.convert", json!({"body": "Plate", "face": [45, 30, 1]}));
+    // The ring's circles are followed within 0.01 mm (1/100 of the thickness): its area within
+    // 2/3 of that times the circumferences.
+    let want = 2400.0 - 0.1 * PI * (25.0 - 9.0);
+    assert!((volume(&mut s) - want).abs() < 0.1 * 0.01 * 2.0 / 3.0 * 2.0 * PI * 8.0, "{} vs {want}", volume(&mut s));
+    let (_, hi) = bbox(&mut s);
+    assert!(!contains(&s, [24.0, 20.0, hi[2] - 0.05]) && contains(&s, [20.0, 20.0, hi[2] - 0.05]));
+    let f = flat(&mut s);
+    assert_eq!(f["pockets"].as_array().map(Vec::len), Some(1), "{f}");
+    assert_eq!(f["pockets"][0]["cutouts"].as_array().map(Vec::len), Some(1), "{f}");
+}
+
+/// What a plate's recesses can't be is refused with the reason, and leaves the design as it was:
+/// a recess deeper than half the plate, recesses in both faces, a plate raised in places (its
+/// recesses larger than the face they are in); a plate with a boss is no plate, as before. A bend
+/// across a kept engraving is refused.
+#[test]
+fn recesses_a_plate_cannot_keep_are_refused_with_the_reason() {
+    let err = |s: &mut Session, face: [f64; 3]| {
+        s.execute("sheet.convert", &json!({"body": "Plate", "face": face})).err().map(|e| e.to_string()).unwrap_or_default()
+    };
+    let mut s = Session::default();
+    engraved_plate(&mut s, 0.6, label_rectangle, &[]);
+    let e = err(&mut s, [45.0, 30.0, 1.0]);
+    assert!(e.contains("0.600 mm deep, more than half the plate's 1.000 mm"), "{e}");
+    let mut s = Session::default();
+    engraved_plate(&mut s, 0.1, label_rectangle, &[]);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Under"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [40, 20], "p1": [50, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Under", "distance": 0.1, "operation": "cut"}));
+    let e = err(&mut s, [45.0, 10.0, 1.0]);
+    assert!(e.contains("recesses in both faces"), "{e}");
+    // A recess 0.3 mm deep leaving a 2 mm rim: rather a plate 0.3 mm thinner with a raised rim.
+    let mut s = Session::default();
+    engraved_plate(
+        &mut s,
+        0.3,
+        |s| {
+            run(s, "sketch.rectangle.two_point", json!({"p0": [2, 2], "p1": [58, 38]}));
+        },
+        &[],
+    );
+    let e = err(&mut s, [1.0, 1.0, 1.0]);
+    assert!(e.contains("larger than the face they are in"), "{e}");
+    // A 0.3 mm boss on the plate: the plate's top round it lies in no opening of the boss's top.
+    let mut s = Session::default();
+    plate(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 1, "name": "Boss"}));
+    label_rectangle(&mut s);
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Boss", "distance": 0.3, "operation": "join"}));
+    let e = err(&mut s, [20.0, 15.0, 1.3]);
+    assert!(e.contains("not a plate of even thickness"), "{e}");
+    assert!(s.model.state().sheets.is_empty());
+    // A fold across a kept engraving; one clear of it bends.
+    let mut s = Session::default();
+    engraved_plate(&mut s, 0.1, label_rectangle, &[]);
+    run(&mut s, "sheet.convert", json!({"body": "Plate", "face": [45, 30, 1]}));
+    let (_, hi) = bbox(&mut s);
+    let fold = |x: f64| json!({"points": [[x, 0, hi[2]], [x, 40, hi[2]]], "angle": 90});
+    let e = s.execute("sheet.fold", &fold(20.0)).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("crosses a bend zone"), "{e}");
+    run(&mut s, "sheet.fold", fold(45.0));
+}
+
+/// A bent part converted without bend edges is no plate, as before, whichever face is picked:
+/// the faces of its legs inside its extent are no recesses. An L of two 2 mm plates at 90° (its
+/// legs' faces lie beside its other faces, in no opening of them), a trapezoid section with
+/// returns (faces of its legs on both sides of its base) and a tapered tray (its floor lies in
+/// the opening of its rim, but filled it is no plate: its walls lean out).
+#[test]
+fn a_bent_part_without_bend_edges_is_still_no_plate() {
+    let err = |s: &mut Session, body: &str, face: [f64; 3]| {
+        s.execute("sheet.convert", &json!({"body": body, "face": face})).err().map(|e| e.to_string()).unwrap_or_default()
+    };
+    let no_plate = "not supported yet: converting bodies that are not a plate of even thickness without bend edges";
+    let mut s = Session::default();
+    section(&mut s, &[(0.0, 30.0), (0.0, 0.0), (50.0, 0.0)], 2.0, 40.0);
+    for pick in [[25.0, 0.0, 20.0], [25.0, 2.0, 20.0], [1.0, 30.0, 20.0], [0.0, 15.0, 20.0], [2.0, 15.0, 20.0], [50.0, 1.0, 20.0]] {
+        let e = err(&mut s, "Section", pick);
+        assert!(e.contains(no_plate), "{pick:?}: {e}");
+    }
+    let mut s = Session::default();
+    trapezoid_section(&mut s, 2.0);
+    for pick in [[0.0, 0.0, 150.0], [0.0, 2.0, 150.0]] {
+        let e = err(&mut s, "Section", pick);
+        assert!(e.contains(no_plate), "{pick:?}: {e}");
+    }
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Floor"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [200, 120]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Floor", "distance": 40, "taper": "18 deg", "body_name": "Tray"}));
+    run(&mut s, "solid.shell", json!({"faces": [[100, 60, 40]], "thickness": 2}));
+    let e = err(&mut s, "Tray", [100.0, 60.0, 0.0]);
+    assert!(e.contains(no_plate), "{e}");
+    assert!(s.model.state().sheets.is_empty());
 }
