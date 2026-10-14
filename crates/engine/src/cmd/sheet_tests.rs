@@ -2191,6 +2191,28 @@ fn fold_one_of_two_collinear_tabs() {
     assert!(rel(volume(&mut s), flat) < 1e-3, "a fold keeps the material");
 }
 
+/// #685: a `fixed` point exactly on the sheet's top face is "on the sheet" (0.8.0 refused it, while a point 0.4 mm
+/// above the sheet was accepted). A frame blank 507.4 .. 508.2 with two flange tabs, folded on one of them.
+#[test]
+fn fold_accepts_a_fixed_point_on_the_top_face() {
+    for fixed_z in [508.2, 507.8, 507.4] {
+        let mut s = Session::default();
+        run(&mut s, "sheet.manage_rules", json!({"name": "SGCC 0.8", "thickness": "0.8", "k_factor": "0.44", "bend_radius": "0.8", "active": true}));
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 507.4], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": "Blank"}));
+        run(
+            &mut s,
+            "sketch.line",
+            json!({"points": [[1.7, 10.75], [30, 10.75], [30, 0.64], [440, 0.64], [440, 10.75], [465.5, 10.75], [465.5, 229.25],
+                              [440, 229.25], [440, 239.36], [30, 239.36], [30, 229.25], [1.7, 229.25]], "closed": true}),
+        );
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "sheet.flange", json!({"base": {"sketch": "Blank"}, "rule": "SGCC 0.8"}));
+        let flat = volume(&mut s);
+        run(&mut s, "sheet.fold", json!({"points": [[30, 230.255, 508.2], [440, 230.255, 508.2]], "fixed": [420, 120, fixed_z], "flip": true}));
+        assert!(rel(volume(&mut s), flat) < 1e-3, "fixed z {fixed_z}: a fold keeps the material");
+    }
+}
+
 /// One fold line across both tabs bends both (#264).
 #[test]
 fn fold_across_two_collinear_tabs() {
@@ -2201,6 +2223,45 @@ fn fold_across_two_collinear_tabs() {
     assert!(rel(volume(&mut s), flat) < 1e-3);
     let bb = &run(&mut s, "inspect.measure", json!({}))["bodies"][0]["bbox"];
     assert!(bb["max"][2].as_f64().unwrap() > 7.0, "both tabs stand up: {bb}");
+}
+
+/// After one of two collinear tabs is folded, the other one folds in its own feature too (#638, follow-up to #264).
+#[test]
+fn fold_second_collinear_tab_after_the_first() {
+    let mut s = Session::default();
+    two_tab_blank(&mut s);
+    let flat = volume(&mut s);
+    run(&mut s, "sheet.fold", json!({"points": [[107, 5, 0.8], [107, 12, 0.8]], "fixed": [50, 20, 0.8]}));
+    run(&mut s, "sheet.fold", json!({"points": [[107, 28, 0.8], [107, 35, 0.8]], "fixed": [50, 20, 0.8]}));
+    assert!(rel(volume(&mut s), flat) < 1e-3, "folds keep the material");
+    let bb = &run(&mut s, "inspect.measure", json!({}))["bodies"][0]["bbox"];
+    assert!(bb["max"][2].as_f64().unwrap() > 7.0, "the tabs stand up: {bb}");
+    // The tabs stand at the bend, x 106.1 .. 107.9 (centerline at x 107).
+    assert!(bb["max"][0].as_f64().unwrap() < 110.0, "neither tab still lies flat out to x 115: {bb}");
+}
+
+/// An L blank (100 x 50 bottom leg, 40 x 50 upright leg on the right) with a tab x 45..60, y 60..90 on the inside
+/// edge x 60. The fold line x 59, extended, runs into the bottom leg.
+fn l_blank_with_inside_tab(s: &mut Session) {
+    outline_blank(s, json!([[0, 0], [100, 0], [100, 100], [60, 100], [60, 90], [45, 90], [45, 60], [60, 60], [60, 50], [0, 50]]));
+}
+
+/// The tab on the inside edge folds wherever on the L sheet `fixed` lies: also when it is on the leg the extended
+/// fold line runs into (#639: "folding tabs that join again beyond the bend").
+#[test]
+fn fold_tab_on_inside_edge_of_l_blank_with_fixed_on_the_far_leg() {
+    let mut near = Session::default();
+    l_blank_with_inside_tab(&mut near);
+    run(&mut near, "sheet.fold", json!({"points": [[59, 60, 0.8], [59, 90, 0.8]], "fixed": [80, 20, 0.8]}));
+    let mut far = Session::default();
+    l_blank_with_inside_tab(&mut far);
+    let flat = volume(&mut far);
+    run(&mut far, "sheet.fold", json!({"points": [[59, 60, 0.8], [59, 90, 0.8]], "fixed": [40, 30, 0.8]}));
+    assert!(rel(volume(&mut far), flat) < 1e-3, "a fold keeps the material");
+    let a = &run(&mut near, "inspect.measure", json!({}))["bodies"][0]["bbox"];
+    let b = &run(&mut far, "inspect.measure", json!({}))["bodies"][0]["bbox"];
+    assert!(b["max"][2].as_f64().unwrap() > 7.0, "the tab stands up: {b}");
+    assert_eq!(a, b, "both fixed points are on the same L sheet, so the fold must give the same part");
 }
 
 /// Edge flanges on both tab ends in one feature (two separate features already work) (#264).
@@ -3555,4 +3616,37 @@ fn every_flat_face_of_a_sheet_takes_an_attached_sketch() {
     assert!((v0 - volume(&mut t) - PI * 9.0 * 2.5).abs() < 0.1, "{}", v0 - volume(&mut t));
     let f = flat(&mut t);
     assert_eq!(f["cutouts"].as_array().map(Vec::len), Some(1), "{f}");
+}
+
+/// #732: a perforated panel. A 400 x 470 x 0.8 sheet with Ø1 holes on a 1.5 mm 60° staggered grid (DIN 24041
+/// Rv 1.0-1.5), cut in two sketches of 500 holes; 0.8.0 refuses the second cut ("sheet metal flat geometry exceeds
+/// the bounded processing budget"). A real mesh panel needs ~94 000 such holes; 1000 is the first step.
+#[test]
+fn perforated_sheet_takes_a_thousand_round_holes() {
+    let mut s = Session::default();
+    outline_blank(&mut s, json!([[0, 0], [400, 0], [400, 470], [0, 470]]));
+    let flat = volume(&mut s);
+    let (p, dy) = (1.5_f64, 1.5_f64 * 3f64.sqrt() / 2.0);
+    let mut holes = Vec::new();
+    'grid: for r in 0..(450.0 / dy) as usize {
+        for k in 0..(380.0 / p) as usize {
+            let x = 10.0 + k as f64 * p + if r % 2 == 1 { p / 2.0 } else { 0.0 };
+            holes.push([x, 10.0 + r as f64 * dy]);
+            if holes.len() == 1000 {
+                break 'grid;
+            }
+        }
+    }
+    for (g, chunk) in holes.chunks(500).enumerate() {
+        let name = format!("Perforation {g}");
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 2], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": name}));
+        for c in chunk {
+            run(&mut s, "sketch.circle.center", json!({"center": c, "radius": 0.5}));
+        }
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": name, "distance": "4", "direction": "negative", "operation": "cut"}));
+    }
+    let removed = flat - volume(&mut s);
+    let expected = 1000.0 * std::f64::consts::PI * 0.5 * 0.5 * 0.8;
+    assert!((removed - expected).abs() / expected < 0.05, "removed {removed:.1} mm³, 1000 holes are {expected:.1} mm³");
 }
