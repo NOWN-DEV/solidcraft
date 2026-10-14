@@ -44,7 +44,8 @@ pub static COMMANDS: &[CommandSpec] = &[
              across these edges become the sheet; a shell keeps its thickness, a solid takes the rule's inward; \
              edges between two of those faces that are no bends are cut open with the rule's gap; \
              a point in the middle of a chamfer between two faces, or on a bend modelled with its radius (a cylinder between \
-             two flat faces tangent to it, either skin), makes it one bend of the rule's radius at their virtual sharp)",
+             two flat faces tangent to it, either skin), makes it one bend of the rule's radius at their virtual sharp; \
+             the faces' holes become cut-outs and their engravings, up to half the thickness deep, pockets)",
         ),
     CommandSpec::new("sheet.manage_rules", "Sheet Metal Rules", rules).at("SHEET METAL", "MODIFY").icon("sheet_rules").params(
         "name (new or existing); thickness?, k_factor?, bend_radius?, relief_width?, relief_depth?, corner_relief?, hem_gap?, gap? (expressions; `Thickness` is the rule's; \

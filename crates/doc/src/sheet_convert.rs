@@ -29,11 +29,15 @@
 //!
 //! A face's outline is read exactly, as a plate's is: where it runs along a round wall standing
 //! square on the face (a rounded corner, a tooth) it is an arc of the wall's circle, and its
-//! holes and slots are cut-outs of the sheet where they lie in its panel.
+//! holes and slots are cut-outs of the sheet where they lie in its panel. Its pockets (an
+//! engraved label: an inner loop whose walls end on flat floors, at most half the sheet deep)
+//! are pockets of the sheet from that skin, round their islands; on a shell the faces of the
+//! other skin are read for theirs.
 //!
-//! Not supported yet: curved faces other than bends (rolled sheet), holes that reach into a
-//! bend, pockets (inner loops whose walls end inside the sheet), round edges that end at a bend
-//! or a cut edge, loops of bends, two faces that meet along more than one edge.
+//! Not supported yet: curved faces other than bends (rolled sheet), holes and pockets that reach
+//! into a bend, pockets deeper than half the sheet or with a step or a hole in their floor, round
+//! edges that end at a bend or a cut edge, loops of bends, two faces that meet along more than
+//! one edge.
 
 use std::collections::BTreeMap;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -41,7 +45,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use solidcraft_geom::{Loop2, Mesh, Plane, Region2, Seg2, Vec2, Vec3};
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
-use super::{RuleValues, SheetBody, SheetFlange, base_flange, point_in, polys_cross, signed_area, snap};
+use super::{FlatWork, RuleValues, SheetBody, SheetFlange, base_flange, point_in, polys_cross, signed_area, snap};
 use crate::{DocError, ModelBody, Result, apply_point, mat_inverse};
 
 const MAX_BENDS: usize = 1000;
@@ -278,12 +282,24 @@ fn outline(b: &Body, mesh: &Mesh, f: usize, tol: f64) -> Result<Face> {
 /// and how far behind it lies.
 fn behind(b: &Body, mesh: &Mesh, f: usize) -> Option<(usize, f64)> {
     let Some(FaceSurface::Plane { normal: n, point: o }) = face_surface(b, f) else { return None };
-    // From the middle of the face's largest triangle.
+    // The face most of it looks through to, from points in its largest triangles: a few of them
+    // may look at the floor of a label engraved in the other skin.
     let area = |t: &[Vec3; 3]| (t[1] - t[0]).cross(t[2] - t[0]).len();
-    let tri = mesh.triangles.iter().zip(&mesh.tri_face).filter(|(_, g)| **g as usize == f).filter_map(|(t, _)| mesh.tri(t));
-    let [p, q, r] = tri.max_by(|x, y| area(x).total_cmp(&area(y)))?;
-    let (_, hit) = mesh.raycast((p + q + r) * (1.0 / 3.0), n * -1.0)?;
-    let g = *mesh.tri_face.get(hit)? as usize;
+    let mut tris: Vec<[Vec3; 3]> =
+        mesh.triangles.iter().zip(&mesh.tri_face).filter(|(_, g)| **g as usize == f).filter_map(|(t, _)| mesh.tri(t)).collect();
+    tris.sort_by(|x, y| area(y).total_cmp(&area(x)));
+    let mut seen: Vec<(usize, f64)> = Vec::new();
+    for tri in tris.iter().take(8) {
+        let middle = (tri[0] + tri[1] + tri[2]) * (1.0 / 3.0);
+        for from in std::iter::once(middle).chain(tri.iter().map(|v| (middle + *v) * 0.5)) {
+            let Some(g) = mesh.raycast(from, n * -1.0).and_then(|(_, hit)| mesh.tri_face.get(hit)).map(|g| *g as usize) else { continue };
+            match seen.iter_mut().find(|(h, _)| *h == g) {
+                Some(entry) => entry.1 += area(tri),
+                None => seen.push((g, area(tri))),
+            }
+        }
+    }
+    let g = seen.iter().max_by(|x, y| x.1.total_cmp(&y.1))?.0;
     let Some(FaceSurface::Plane { normal, point }) = face_surface(b, g) else { return None };
     (normal.dot(n) < -1.0 + 1e-9).then_some((g, (o - point).dot(n)))
 }
@@ -608,6 +624,14 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
     let wall = |f: usize, d: f64| behind(b, &mesh, f).filter(|(_, e)| (e - d).abs() <= 1e-6 * d.max(1.0)).map(|(g, _)| g);
     let backs: Vec<Option<(usize, usize)>> = picks.iter().map(|(_, (x, y))| thin.and_then(|d| Some((wall(*x, d)?, wall(*y, d)?)))).collect();
     let shell = thin.filter(|_| backs.iter().all(Option::is_some));
+    // On a shell, the face behind each face at a bend (its other skin, read for its pockets).
+    let skin_behind: BTreeMap<usize, usize> = picks
+        .iter()
+        .zip(&backs)
+        .filter(|_| shell.is_some())
+        .filter_map(|((_, (x, y)), back)| back.map(|(bx, by)| [(*x, bx), (bx, *x), (*y, by), (by, *y)]))
+        .flatten()
+        .collect();
     let t = shell.map_or(rv.thickness, |d| (d * 1e9).round() / 1e9);
     let r = rv.bend_radius;
     let joined = |x: usize, y: usize| {
@@ -673,15 +697,25 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
         .and_then(|(a, x)| Plane::new(a, x, x.cross(base.face.n)))
         .ok_or_else(|| DocError::Invalid("the fixed face has no plane".into()))?;
     let mut sh = base_flange(&mb.name, rule, &RuleValues { thickness: t, ..*rv }, frame, Region2::default());
-    // How far behind a face of the sheet the body's face `g` reaches (a hole's wall, through it).
+    // How far behind a face of the sheet the body's face `g` starts and ends: a hole's wall
+    // reaches through the sheet, a pocket's ends on its floor, an island's starts at the face.
     let mut points: BTreeMap<usize, Vec<Vec3>> = BTreeMap::new();
     for (tri, g) in mesh.triangles.iter().zip(&mesh.tri_face) {
         points.entry(*g as usize).or_default().extend(tri.iter().filter_map(|k| mesh.positions.get(*k as usize)));
     }
-    let depth = |g: usize, face: &Face| {
+    let span = |g: usize, face: &Face| {
         let o = face.pts.first().copied().unwrap_or_default();
-        points.get(&g).map_or(0.0, |ps| ps.iter().map(|p| (o - *p).dot(face.n)).fold(0.0, f64::max))
+        let ds = points.get(&g).into_iter().flatten().map(|p| (o - *p).dot(face.n));
+        ds.fold((f64::INFINITY, 0.0), |(lo, hi): (f64, f64), d| (lo.min(d.max(0.0)), hi.max(d)))
     };
+    // The span of a loop's walls: the least any starts at, and the least and most any ends at.
+    let walls_span = |walls: &[usize], face: &Face| {
+        walls
+            .iter()
+            .map(|g| span(*g, face))
+            .fold((f64::INFINITY, f64::INFINITY, 0.0), |(s, lo, hi): (f64, f64, f64), (a, b)| (s.min(a), lo.min(b), hi.max(b)))
+    };
+    let mut work = FlatWork::new();
     // Lay the panels out, parents first: each is its face, seen through the inverse of its
     // fold, with its edges moved in by a bend's setback or a rip's cut.
     let mut queue: Vec<(usize, Option<usize>)> = vec![(f0, None)];
@@ -733,27 +767,79 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
             }
         }
         // The face's holes: cut-outs of the sheet where they lie, inside its panel. A hole's walls
-        // reach through the sheet; a pocket's end inside it, on its floor.
+        // reach through the sheet; a pocket's (an engraved label) end inside it, on floors facing
+        // out as the face does: a pocket of the sheet from that skin, round its islands. On a
+        // shell the face behind, the other skin, is read for its pockets too.
         let region = match fl {
             None => sh.base.clone(),
             Some(i) => sh.flanges.get(i).map(|f| sh.panel(f)).unwrap_or_default(),
         };
-        let bound = if panel.face.holes.is_empty() { Vec::new() } else { region.outer.ccw().polyline(1e-3) };
-        for (h, walls) in &panel.face.holes {
-            let p = panel.face.plane.to_world(h.centroid());
-            let reach = walls.iter().map(|g| depth(*g, &panel.face)).fold(f64::INFINITY, f64::min);
-            if reach < t - tol {
-                return err(format!(
-                    "not supported yet: the pocket at {} in a face of the sheet ends {reach:.3} deep, inside the sheet's {t:.3} (cut it after converting)",
-                    at(p)
-                ));
+        let back = skin_behind.get(&pf).and_then(|g| outline(b, &mesh, *g, tol).ok());
+        let skins: Vec<(&Face, bool)> = std::iter::once((&panel.face, true)).chain(back.as_ref().map(|f| (f, false))).collect();
+        let bound = if skins.iter().all(|(f, _)| f.holes.is_empty()) { Vec::new() } else { region.outer.ccw().polyline(1e-3) };
+        for (face, front) in skins {
+            for (h, walls) in &face.holes {
+                let p = face.plane.to_world(h.centroid());
+                let (_, reach, deepest) = walls_span(walls, face);
+                let through = reach >= t - tol;
+                if through && !front {
+                    continue;
+                }
+                let cut = sh.region_to_flat(fl, &face.plane, &Region2 { outer: h.clone(), holes: Vec::new() })?;
+                let ring = cut.outer.polyline(1e-3);
+                if !ring.iter().all(|q| point_in(&bound, *q)) || polys_cross(&bound, &ring) {
+                    let kind = if through { "hole" } else { "pocket" };
+                    return err(format!("not supported yet: the {kind} at {} reaches into a bend (cut it after converting)", at(p)));
+                }
+                if through {
+                    sh.holes.push(cut);
+                    continue;
+                }
+                let pocket =
+                    |why: &str| err(format!("not supported yet: the pocket at {} in a face of the sheet {why} (cut it after converting)", at(p)));
+                let eps = t * 1e-3;
+                if reach > t / 2.0 + eps {
+                    return pocket(&format!("ends {reach:.3} deep, more than half the sheet's {t:.3}"));
+                }
+                if deepest - reach > eps {
+                    return pocket("has walls of more than one depth");
+                }
+                // Its floors: the faces at its depth beside its walls, facing out as the face does.
+                let mut floors: Vec<usize> = mesh
+                    .edge_faces
+                    .iter()
+                    .filter(|fs| fs.iter().any(|g| walls.contains(&(*g as usize))))
+                    .flatten()
+                    .map(|g| *g as usize)
+                    .filter(|g| {
+                        !walls.contains(g)
+                            && matches!(face_surface(b, *g), Some(FaceSurface::Plane { normal, .. }) if normal.dot(face.n) > 1.0 - 1e-9)
+                    })
+                    .filter(|g| {
+                        let (lo, hi) = span(*g, face);
+                        (lo - reach).abs() <= eps && (hi - reach).abs() <= eps
+                    })
+                    .collect();
+                floors.sort_unstable();
+                floors.dedup();
+                if floors.is_empty() {
+                    return pocket("has no flat floor");
+                }
+                // The islands left standing in it (a letter's counter): walls from a floor up to the face.
+                let mut islands = Vec::new();
+                for g in floors {
+                    let floor = outline(b, &mesh, g, tol)?;
+                    for (k, kw) in &floor.holes {
+                        let (start, lo, hi) = walls_span(kw, face);
+                        if start > eps || (lo - reach).abs() > eps || (hi - reach).abs() > eps {
+                            return pocket("has a hole or a step in its floor");
+                        }
+                        islands.push(sh.region_to_flat(fl, &floor.plane, &Region2 { outer: k.clone(), holes: Vec::new() })?.outer.reversed());
+                    }
+                }
+                let (z0, z1) = if front { (0.0, reach) } else { (t - reach, t) };
+                sh.record_pocket(Region2 { outer: cut.outer, holes: islands }, z0, z1, &mut work)?;
             }
-            let cut = sh.region_to_flat(fl, &panel.face.plane, &Region2 { outer: h.clone(), holes: Vec::new() })?;
-            let ring = cut.outer.polyline(1e-3);
-            if !ring.iter().all(|q| point_in(&bound, *q)) || polys_cross(&bound, &ring) {
-                return err(format!("not supported yet: the hole at {} reaches into a bend (cut it after converting)", at(p)));
-            }
-            sh.holes.push(cut);
         }
         // Its children: flanges on the trimmed edges they bend at.
         let m = trimmed.len();

@@ -1355,9 +1355,10 @@ fn rounded_corners_and_a_notch_on_a_leg_stay_arcs_in_the_flat() {
     assert_eq!((arcs, holes), (5, 0));
 }
 
-/// A hole that reaches into a bend has no one place in the flat, and a pocket is no hole through
-/// the sheet: both are refused, by their places. (The web's flat panel starts R + T = 4 from the
-/// sharp; the hole reaches from 2 to 8. The pocket is 1 deep in the 2 thick web.)
+/// A hole that reaches into a bend has no one place in the flat, and a pocket deeper than half
+/// the sheet is no engraving: both are refused, by their places. (The web's flat panel starts
+/// R + T = 4 from the sharp; the hole reaches from 2 to 8. The pocket is 1.5 deep in the 2 thick
+/// web.)
 #[test]
 fn a_hole_reaching_into_a_bend_and_a_pocket_are_refused_by_their_places() {
     let convert = |cut: &[(&str, Value)]| {
@@ -1377,7 +1378,117 @@ fn a_hole_reaching_into_a_bend_and_a_pocket_are_refused_by_their_places() {
         ("sketch.create", json!({"plane": "XZ", "name": "Pocket"})),
         ("sketch.rectangle.two_point", json!({"p0": [40, -15], "p1": [60, -25]})),
         ("sketch.finish", json!({})),
-        ("solid.extrude", json!({"sketch": "Pocket", "distance": 1, "operation": "cut"})),
+        ("solid.extrude", json!({"sketch": "Pocket", "distance": 1.5, "operation": "cut"})),
     ]);
-    assert!(e.contains("the pocket at (50.000, 0.000, 20.000) in a face of the sheet ends 1.000 deep, inside the sheet's 2.000"), "{e}");
+    assert!(e.contains("the pocket at (50.000, 0.000, 20.000) in a face of the sheet ends 1.500 deep, more than half the sheet's 2.000"), "{e}");
+}
+
+/// The bounding box (low corner, high corner) of a flat pattern pocket's outline.
+fn pocket_box(p: &Value) -> ([f64; 2], [f64; 2]) {
+    let pts: Vec<[f64; 2]> = p["outline"].as_array().into_iter().flatten().filter_map(|q| Some([q[0].as_f64()?, q[1].as_f64()?])).collect();
+    let lo = [pts.iter().map(|q| q[0]).fold(f64::MAX, f64::min), pts.iter().map(|q| q[1]).fold(f64::MAX, f64::min)];
+    let hi = [pts.iter().map(|q| q[0]).fold(f64::MIN, f64::max), pts.iter().map(|q| q[1]).fold(f64::MIN, f64::max)];
+    (lo, hi)
+}
+
+/// A bent part as another system models it, its bends with their radius, with what its faces
+/// carry: a channel 80 wide with legs 30 high (outside, to the sharp corners), 2 thick, 60 long,
+/// bent R 2 inside and R 4 outside, with a 6 mm hole 18 up its right leg, a label 20 x 10
+/// engraved 0.5 deep into the outside of its web and one 10 x 20 into the inside of its left leg.
+/// Converted from the outside of the web by its outer cylinders under a rule of the model's
+/// radius, the sheet is the model again: the hole is a cut-out where the bend allowance puts it,
+/// and each label is a pocket on its own skin of the sheet.
+#[test]
+fn a_channel_with_its_bends_modelled_keeps_its_hole_and_engravings_on_either_skin() {
+    let (t, k, r) = (2.0, 0.4, 2.0);
+    let mut s = Session::default();
+    rule(&mut s, "Test", t, k, r, 0.5);
+    let corners = bent_section(&mut s, &[(0.0, 30.0), (0.0, 0.0), (80.0, 0.0), (80.0, 30.0)], t, r, 60.0);
+    run(&mut s, "solid.hole", json!({"position": [80, 18, 20], "diameter": 6, "depth": 3}));
+    // The web's label from its outside (y = 0) in, the leg's from its inside (x = 2) out.
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "WebLabel"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, -35], "p1": [50, -45]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "WebLabel", "distance": 0.5, "operation": "cut"}));
+    run(&mut s, "sketch.create", json!({"plane": "YZ", "offset": 2, "name": "LegLabel"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [12, 10], "p1": [22, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "LegLabel", "distance": 0.5, "direction": "negative", "operation": "cut"}));
+    // Two flat legs, the web and two quarter rounds on the neutral radius R + T/2, less the hole
+    // and the labels.
+    let cut = 9.0 * PI * t + 2.0 * 200.0 * 0.5;
+    let solid = volume(&mut s);
+    let model = t * 60.0 * (2.0 * (30.0 - (r + t)) + (80.0 - 2.0 * (r + t)) + PI * (r + t / 2.0)) - cut;
+    assert!((solid - model).abs() < 2e-3 * model, "{solid} vs {model}");
+    run(&mut s, "sheet.convert", json!({"body": "Section", "face": [65, 0, 10], "bends": [corners[0].0, corners[1].0]}));
+    let rows = bend_rows(&mut s);
+    assert!(rows.len() == 2 && rows.iter().all(|row| row.0 == 90 && row.1 == "up" && (row.2 - 60.0).abs() < 1e-6), "{rows:?}");
+    // 30 + 80 + 30 less two deductions; the sheet is the solid again.
+    let bd = deduction(FRAC_PI_2, r, t, k);
+    let across = 140.0 - 2.0 * bd;
+    assert!(same_size(flat_size(&mut s), (across, 60.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    let v = volume(&mut s);
+    assert!((v - solid).abs() < 1e-3 * solid, "{v} vs {solid}");
+    // The labels stay in their skins: the web's in its outside, the leg's in its inside.
+    assert!(!contains(&s, [40.0, 0.25, 40.0]) && contains(&s, [40.0, 0.75, 40.0]));
+    assert!(!contains(&s, [1.75, 17.0, 20.0]) && contains(&s, [1.25, 17.0, 20.0]));
+    // The flat: the hole, and a pocket per label, 0.5 deep from the web's skin (z 0) and from the
+    // other one (z T). Along the outside from the web label's middle (40 in, 40 along) to the
+    // hole's: 40 to the sharp and 18 up the leg, less a deduction, and 20 back along; to the leg
+    // label's middle, 40 and 17 the other way.
+    let circles = flat_circles(&mut s);
+    assert!(circles.len() == 1 && (circles[0].0 - 3.0).abs() < 1e-9, "{circles:?}");
+    let f = flat(&mut s);
+    let pockets = f["pockets"].as_array().cloned().unwrap_or_default();
+    assert_eq!(pockets.len(), 2, "{f}");
+    let from = |p: &Value, z0: f64, z1: f64| {
+        (p["z0_mm"].as_f64().unwrap_or(f64::NAN) - z0).abs() < 1e-9 && (p["z1_mm"].as_f64().unwrap_or(f64::NAN) - z1).abs() < 1e-9
+    };
+    let web = pockets.iter().find(|p| from(p, 0.0, 0.5)).expect("the web's label, from z 0");
+    let leg = pockets.iter().find(|p| from(p, 1.5, 2.0)).expect("the leg's label, from z T");
+    let middle = |p: &Value| {
+        let (lo, hi) = pocket_box(p);
+        ([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], (hi[0] - lo[0], hi[1] - lo[1]))
+    };
+    let ((w, w_size), (l, l_size), h) = (middle(web), middle(leg), circles[0].1);
+    assert!(same_size(w_size, (20.0, 10.0), 1e-6) && same_size(l_size, (10.0, 20.0), 1e-6), "{w_size:?} {l_size:?}");
+    let (to_hole, to_leg) = ([h[0] - w[0], h[1] - w[1]], [l[0] - w[0], l[1] - w[1]]);
+    assert!(same_size((to_hole[0].abs(), to_hole[1].abs()), (58.0 - bd, 20.0), 1e-6), "{to_hole:?}");
+    assert!(same_size((to_leg[0].abs(), to_leg[1].abs()), (57.0 - bd, 20.0), 1e-6), "{to_leg:?}");
+    assert!(to_hole[0] * to_leg[0] + to_hole[1] * to_leg[1] < 0.0, "{to_hole:?} {to_leg:?}");
+    // The DXF: the hole a CIRCLE, each label on the pocket layer of its depth.
+    assert_eq!(dxf_entities(&mut s).2, 1);
+    let dxf = run(&mut s, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap_or_default().to_string();
+    assert_eq!((lines_on(&dxf, "POCKET_BOTTOM_Z0.000000_TO_0.500000_MM"), lines_on(&dxf, "POCKET_TOP_Z1.500000_TO_2.000000_MM")), (4, 4));
+    // Unfolded and folded again it keeps them.
+    run(&mut s, "sheet.unfold", json!({}));
+    let want = t * across * 60.0 - cut;
+    assert!((volume(&mut s) - want).abs() < 1e-4 * want, "{} vs {want}", volume(&mut s));
+    run(&mut s, "sheet.refold", json!({}));
+    assert!((volume(&mut s) - v).abs() < 1e-6 * v);
+}
+
+/// Chamfer bends beside holes: [`chamfered_channel`] with a 6 mm hole in its web 20 from the
+/// left sharp corner and one 18 up its right leg, the chamfers picked in their middles. The holes
+/// land from the virtual sharps, where the faces were taken out to.
+#[test]
+fn holes_beside_chamfer_bends_land_from_the_virtual_sharps() {
+    let (t, k, r) = (2.0, 0.5, 3.0);
+    let mut s = Session::default();
+    rule(&mut s, "Test", t, k, r, 0.5);
+    chamfered_channel(&mut s);
+    run(&mut s, "solid.hole", json!({"position": [20, 0, 30], "diameter": 6}));
+    run(&mut s, "solid.hole", json!({"position": [40, 18, 70], "diameter": 6, "depth": 3}));
+    run(&mut s, "sheet.convert", json!({"body": "Channel", "face": [20, 0, 80], "bends": [[2, 2, 50], [38, 2, 50]]}));
+    let bd = deduction(FRAC_PI_2, r, t, k);
+    let across = 100.0 - 2.0 * bd;
+    assert!(same_size(flat_size(&mut s), (across, 100.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    // From the web's hole: 20 to the right sharp, 18 up the leg, less a deduction; 40 along.
+    let circles = flat_circles(&mut s);
+    assert!(circles.len() == 2 && circles.iter().all(|(radius, _)| (radius - 3.0).abs() < 1e-9), "{circles:?}");
+    let d = [circles[1].1[0] - circles[0].1[0], circles[1].1[1] - circles[0].1[1]];
+    assert!(same_size((d[0].abs(), d[1].abs()), (38.0 - bd, 40.0), 1e-6), "{d:?}");
+    // Three flat strips and two quarter rounds on the neutral radius, less the holes.
+    let expect = t * 100.0 * (2.0 * (30.0 - (r + t)) + (40.0 - 2.0 * (r + t)) + PI * (r + t / 2.0)) - 2.0 * t * 9.0 * PI;
+    assert!((volume(&mut s) - expect).abs() < 2e-3 * expect, "{} vs {expect}", volume(&mut s));
 }

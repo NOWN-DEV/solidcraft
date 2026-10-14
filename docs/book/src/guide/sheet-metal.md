@@ -140,9 +140,11 @@ and it follows the solid when a parameter changes (the edges and the fixed face 
 their names). Without bend edges Convert expects a plate, as before. Either way round walls
 (holes, slot ends, rounded corners, notches) stay circles and arcs in the flat pattern and the
 DXF, also where a STEP file writes one in pieces, and the holes and slots of every face of the
-sheet are its cut-outs, where the bends put them. Not converted yet: curved faces other than bends
-(rolled sheet), with bend edges a hole that reaches into a bend or a pocket that doesn't go
-through (cut them after converting), and bends that close a ring.
+sheet are its cut-outs, where the bends put them. An engraving in a face of the sheet (a recess
+with a flat floor, at most half the thickness deep) becomes a pocket of it, as a plate's does
+(below), on either skin of a shell. Not converted yet: curved faces other than bends (rolled
+sheet), with bend edges a hole or an engraving that reaches into a bend or a pocket deeper than
+half the thickness (cut them after converting), and bends that close a ring.
 
 A plate may carry recesses in one of its faces, such as an engraved label or a counterbore: a
 recess with a flat floor and walls square to the plate, at most half the plate's thickness
