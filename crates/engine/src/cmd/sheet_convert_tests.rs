@@ -1,5 +1,5 @@
-//! Convert to Sheet Metal: solid and shelled bodies with bend edges, plates read from STEP files
-//! whose walls come in pieces, and plates with recesses.
+//! Convert to Sheet Metal: solid and shelled bodies with bend edges (with holes and round edges in
+//! their faces), plates read from STEP files whose walls come in pieces, and plates with recesses.
 
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
 
@@ -1021,4 +1021,138 @@ fn a_bent_part_without_bend_edges_is_still_no_plate() {
     let e = err(&mut s, "Tray", [100.0, 60.0, 0.0]);
     assert!(e.contains(no_plate), "{e}");
     assert!(s.model.state().sheets.is_empty());
+}
+
+/// The flat pattern's cut-outs that are no whole circle (slots), each by the middle of its arcs'
+/// centres.
+fn flat_slots(s: &mut Session) -> Vec<[f64; 2]> {
+    let shapes = flat(s)["cutout_shapes"].as_array().cloned().unwrap_or_default();
+    let centre = |segs: &Vec<Value>| {
+        let c: Vec<[f64; 2]> = segs.iter().filter_map(|g| Some([g["arc"]["center"][0].as_f64()?, g["arc"]["center"][1].as_f64()?])).collect();
+        let n = c.len().max(1) as f64;
+        [c.iter().map(|p| p[0]).sum::<f64>() / n, c.iter().map(|p| p[1]).sum::<f64>() / n]
+    };
+    shapes.iter().filter_map(|x| x["segments"].as_array()).map(centre).collect()
+}
+
+/// A U channel 40 long (along z) and `t` thick: a web 100 wide on y = 0 and two legs 30 high,
+/// outside lengths to the sharp corners. Returns a point on each outside corner (the bends).
+fn channel(s: &mut Session, t: f64) -> Vec<[f64; 3]> {
+    section(s, &[(0.0, 30.0), (0.0, 0.0), (100.0, 0.0), (100.0, 30.0)], t, 40.0)
+}
+
+/// The channel folded with two 90° bends, less `cut` mm² of its faces: the web and the legs
+/// between their setbacks R + T, and two quarter rounds on the neutral radius R + T/2.
+fn channel_volume(t: f64, r: f64, cut: f64) -> f64 {
+    t * (40.0 * ((100.0 - 2.0 * (r + t)) + 2.0 * (30.0 - (r + t)) + PI * (r + t / 2.0)) - cut)
+}
+
+/// Holes and a slot in the faces of a channel converted by its bend edges are cut-outs of the
+/// flat pattern, where the bend allowance puts them: in the fixed face (the web) and in the bent
+/// ones (the legs). With bend edges, such faces were refused ("faces with curved edges").
+#[test]
+fn holes_and_a_slot_in_a_channels_faces_land_where_the_bends_put_them() {
+    let (t, k, r) = (2.0, 0.4, 2.0);
+    let mut s = Session::default();
+    rule(&mut s, "Test", t, k, r, 0.5);
+    let bends = channel(&mut s, t);
+    // Two 6 mm holes in the web, 30 from either outside corner; one in the right leg and a slot
+    // 6 wide and 20 long in the left one, each centred 18 up the leg's outside.
+    run(&mut s, "solid.hole", json!({"position": [30, 0, 20], "diameter": 6}));
+    run(&mut s, "solid.hole", json!({"position": [70, 0, 20], "diameter": 6}));
+    run(&mut s, "solid.hole", json!({"position": [100, 18, 20], "diameter": 6, "depth": 3}));
+    run(&mut s, "sketch.create", json!({"plane": "YZ", "name": "Slot"}));
+    run(&mut s, "sketch.slot.overall", json!({"p0": [18, 10], "p1": [18, 30], "width": 6}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Slot", "distance": 3, "operation": "cut"}));
+    run(&mut s, "sheet.convert", json!({"body": "Section", "face": [50, 0, 5], "bends": bends}));
+    let rows = bend_rows(&mut s);
+    assert!(rows.len() == 2 && rows.iter().all(|row| row.0 == 90 && row.1 == "up" && (row.2 - 40.0).abs() < 1e-9), "{rows:?}");
+    // T 2, R 2, K 0.4: BA = π/2 (R + K T) = 1.4 π, BD = 2 (R + T) - BA = 8 - 1.4 π = 3.6018; the
+    // flat is the outside lengths less a BD per bend.
+    let bd = deduction(FRAC_PI_2, r, t, k);
+    assert!((bd - (8.0 - 1.4 * PI)).abs() < 1e-12);
+    let across = 160.0 - 2.0 * bd;
+    assert!(same_size(flat_size(&mut s), (across, 40.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    // On one line across the flat: the right leg's hole, the web's two, 40 apart, and the slot.
+    // From a leg's to the web's nearer one: 18 + 30 along the outside to the sharp, less the BD.
+    let (circles, slots) = (flat_circles(&mut s), flat_slots(&mut s));
+    assert!(circles.len() == 3 && circles.iter().all(|(radius, _)| (radius - 3.0).abs() < 1e-9) && slots.len() == 1, "{circles:?} {slots:?}");
+    let mut centres: Vec<[f64; 2]> = circles.iter().map(|c| c.1).chain(slots).collect();
+    centres.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let gaps: Vec<f64> = centres.windows(2).map(|w| w[1][0] - w[0][0]).collect();
+    assert!(centres.iter().all(|c| (c[1] - centres[0][1]).abs() < 1e-6), "{centres:?}");
+    assert!(gaps.len() == 3 && gaps.iter().zip([48.0 - bd, 40.0, 48.0 - bd]).all(|(g, want)| (g - want).abs() < 1e-6), "{gaps:?}");
+    // Folded, flat and folded again, less three holes of radius 3 and the slot (14 x 6 and its
+    // round ends).
+    let cut = 3.0 * PI * 9.0 + 14.0 * 6.0 + PI * 9.0;
+    let v = volume(&mut s);
+    let want = channel_volume(t, r, cut);
+    assert!((v - want).abs() < 1e-4 * want, "{v} vs {want}");
+    run(&mut s, "sheet.unfold", json!({}));
+    let want = t * (across * 40.0 - cut);
+    assert!((volume(&mut s) - want).abs() < 1e-4 * want, "{} vs {want}", volume(&mut s));
+    run(&mut s, "sheet.refold", json!({}));
+    assert!((volume(&mut s) - v).abs() < 1e-6 * v);
+    // The DXF: a CIRCLE per hole, and the slot's round ends as ARCs.
+    let (_, arcs, holes) = dxf_entities(&mut s);
+    assert_eq!((arcs, holes), (2, 3));
+}
+
+/// Round edges of a bent face stay arcs: the legs' free corners rounded by 5, and a notch of
+/// radius 4 in one leg's free edge. They were refused too.
+#[test]
+fn rounded_corners_and_a_notch_on_a_leg_stay_arcs_in_the_flat() {
+    let (t, k, r) = (2.0, 0.4, 2.0);
+    let mut s = Session::default();
+    rule(&mut s, "Test", t, k, r, 0.5);
+    let bends = channel(&mut s, t);
+    run(&mut s, "solid.fillet", json!({"edges": [[1, 30, 0], [1, 30, 40], [99, 30, 0], [99, 30, 40]], "radius": 5}));
+    run(&mut s, "sketch.create", json!({"plane": "YZ", "name": "Notch"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [30, 20], "radius": 4}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Notch", "distance": 3, "operation": "cut"}));
+    run(&mut s, "sheet.convert", json!({"body": "Section", "face": [50, 0, 5], "bends": bends}));
+    let across = 160.0 - 2.0 * deduction(FRAC_PI_2, r, t, k);
+    assert!(same_size(flat_size(&mut s), (across, 40.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    // Each corner takes (1 - π/4) 5², the notch half a disc of radius 4.
+    let cut = 4.0 * (1.0 - PI / 4.0) * 25.0 + PI * 16.0 / 2.0;
+    let v = volume(&mut s);
+    let want = channel_volume(t, r, cut);
+    assert!((v - want).abs() < 1e-4 * want, "{v} vs {want}");
+    run(&mut s, "sheet.unfold", json!({}));
+    let want = t * (across * 40.0 - cut);
+    assert!((volume(&mut s) - want).abs() < 1e-4 * want, "{} vs {want}", volume(&mut s));
+    run(&mut s, "sheet.refold", json!({}));
+    assert!((volume(&mut s) - v).abs() < 1e-6 * v);
+    // The DXF: a quarter ARC at each corner and a half one at the notch, no cut-outs.
+    let (_, arcs, holes) = dxf_entities(&mut s);
+    assert_eq!((arcs, holes), (5, 0));
+}
+
+/// A hole that reaches into a bend has no one place in the flat, and a pocket is no hole through
+/// the sheet: both are refused, by their places. (The web's flat panel starts R + T = 4 from the
+/// sharp; the hole reaches from 2 to 8. The pocket is 1 deep in the 2 thick web.)
+#[test]
+fn a_hole_reaching_into_a_bend_and_a_pocket_are_refused_by_their_places() {
+    let convert = |cut: &[(&str, Value)]| {
+        let mut s = Session::default();
+        rule(&mut s, "Test", 2.0, 0.4, 2.0, 0.5);
+        let bends = channel(&mut s, 2.0);
+        for (id, p) in cut {
+            run(&mut s, id, p.clone());
+        }
+        let e = s.execute("sheet.convert", &json!({"body": "Section", "face": [50, 0, 5], "bends": bends})).err();
+        assert!(s.model.state().sheets.is_empty());
+        e.map(|e| e.to_string()).unwrap_or_default()
+    };
+    let e = convert(&[("solid.hole", json!({"position": [5, 0, 20], "diameter": 6}))]);
+    assert!(e.contains("the hole at (5.000, 0.000, 20.000) reaches into a bend"), "{e}");
+    let e = convert(&[
+        ("sketch.create", json!({"plane": "XZ", "name": "Pocket"})),
+        ("sketch.rectangle.two_point", json!({"p0": [40, -15], "p1": [60, -25]})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"sketch": "Pocket", "distance": 1, "operation": "cut"})),
+    ]);
+    assert!(e.contains("the pocket at (50.000, 0.000, 20.000) in a face of the sheet ends 1.000 deep, inside the sheet's 2.000"), "{e}");
 }

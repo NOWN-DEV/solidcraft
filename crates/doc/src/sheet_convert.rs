@@ -16,15 +16,21 @@
 //! the inverse of its fold. Unfold, the flat pattern, the bend table and cuts then work as on a
 //! sheet made from flanges.
 //!
-//! Not supported yet: curved faces (rolled sheet, a filleted edge as a bend), faces with curved
-//! edges or holes, loops of bends, two faces that meet along more than one edge.
+//! A face's outline is read exactly, as a plate's is: where it runs along a round wall standing
+//! square on the face (a rounded corner, a tooth) it is an arc of the wall's circle, and its
+//! holes and slots are cut-outs of the sheet where they lie in its panel.
+//!
+//! Not supported yet: curved faces (rolled sheet, a filleted edge as a bend), holes that reach
+//! into a bend, pockets (inner loops whose walls end inside the sheet), round edges that end at a
+//! bend or a cut edge, loops of bends, two faces that meet along more than one edge.
 
 use std::collections::BTreeMap;
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use solidcraft_geom::{Loop2, Mesh, Plane, Region2, Vec2, Vec3};
+use solidcraft_geom::{Loop2, Mesh, Plane, Region2, Seg2, Vec2, Vec3};
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
-use super::{RuleValues, SheetBody, SheetFlange, base_flange, polys_cross, signed_area, snap};
+use super::{RuleValues, SheetBody, SheetFlange, base_flange, point_in, polys_cross, signed_area, snap};
 use crate::{DocError, ModelBody, Result, apply_point, mat_inverse};
 
 const MAX_BENDS: usize = 1000;
@@ -38,11 +44,16 @@ fn at(p: Vec3) -> String {
 }
 
 /// A planar face of the body: its outward normal and its outline, counter-clockwise about the
-/// normal. Edge `i` runs from corner `i` to the next one, along face `across[i]`.
+/// normal. Edge `i` runs from corner `i` to the next one, along face `across[i]`: straight, or an
+/// arc where that face is a round wall (`round[i]`: the circle's centre and the arc's middle).
+/// `holes`: its inner loops, in `plane`, each with the faces of its walls.
 struct Face {
     n: Vec3,
     pts: Vec<Vec3>,
     across: Vec<Option<usize>>,
+    round: Vec<Option<(Vec3, Vec3)>>,
+    plane: Plane,
+    holes: Vec<(Loop2, Vec<usize>)>,
 }
 
 /// A face of the sheet: the panel it hangs off (none for the fixed face), and the bend between
@@ -68,38 +79,168 @@ fn turn<T>(per_edge: &mut [T]) {
     }
 }
 
-/// Face `f` of the body as a panel outline. Only a planar face bounded by one loop of straight
-/// edges can be one.
-fn outline(b: &Body, mesh: &Mesh, f: usize, tol: f64) -> Result<Face> {
-    let Some(FaceSurface::Plane { normal: n, .. }) = face_surface(b, f) else {
-        return err("not supported yet: curved faces in a converted sheet (only planar faces convert)");
-    };
-    // Its edges, each with the face on its other side.
-    let mut edges = Vec::new();
-    for (line, faces) in mesh.edges.iter().zip(&mesh.edge_faces) {
-        if !faces.iter().any(|g| *g as usize == f) {
+/// The circle (centre in `plane` coordinates, radius) of face `f` when it is a round wall
+/// standing square on the plane: a cylinder about the plane's normal `n`.
+pub(crate) fn round_wall(body: &Body, plane: &Plane, n: Vec3, f: u32) -> Option<(Vec2, f64)> {
+    match face_surface(body, f as usize)? {
+        FaceSurface::Cylinder { origin, axis, radius } if axis.cross(n).len() < 1e-6 => Some((plane.to_local(origin), radius)),
+        _ => None,
+    }
+}
+
+/// A loop of points on a face, each with the B-rep face across the loop from it to the next
+/// point (the wall it runs along there), as segments: each run along one round wall (`wall`
+/// gives a face's circle) is an arc of that circle, the rest stays straight. Coaxial cylinders of
+/// one radius are one wall, however many faces it comes in (many systems write a round hole's
+/// wall as two half-cylinders), so such a hole is one circle. `eps`: how far off its circle a
+/// point may be.
+pub(crate) fn outline_loop(pts: &[(Vec2, Option<u32>)], wall: &mut impl FnMut(u32) -> Option<(Vec2, f64)>, eps: f64) -> Loop2 {
+    Loop2 { segs: outline_segs(pts, wall, eps).into_iter().map(|(seg, _)| seg).collect() }
+}
+
+/// [`outline_loop`], each segment with its wall (an arc's: that of its first point).
+fn outline_segs(pts: &[(Vec2, Option<u32>)], wall: &mut impl FnMut(u32) -> Option<(Vec2, f64)>, eps: f64) -> Vec<(Seg2, Option<u32>)> {
+    let m = pts.len();
+    let point = |i: usize| pts.get(i % m).map(|x| x.0).unwrap_or_default();
+    let face = |i: usize| pts.get(i % m).and_then(|x| x.1);
+    // The circle each segment runs along: its wall's, when both its ends lie on it.
+    let circles: Vec<Option<(Vec2, f64)>> = (0..m)
+        .map(|i| {
+            let (c, r) = wall(pts.get(i)?.1?)?;
+            ((point(i).dist(c) - r).abs() <= eps && (point(i + 1).dist(c) - r).abs() <= eps).then_some((c, r))
+        })
+        .collect();
+    let circle = |i: usize| circles.get(i % m).copied().flatten();
+    let same = |i: usize, (c, r): (Vec2, f64)| circle(i).is_some_and(|(d, s)| d.dist(c) <= eps && (s - r).abs() <= eps);
+    // Start where no arc runs on across the start (anywhere when the whole loop is one circle).
+    let start = (0..m).find(|i| circle(*i + m - 1).is_none_or(|c| !same(*i, c))).unwrap_or(0);
+    let mut segs = Vec::new();
+    let mut i = 0;
+    while i < m {
+        let k = start + i;
+        let Some((c, r)) = circle(k) else {
+            segs.push((Seg2::Line { a: point(k), b: point(k + 1) }, face(k)));
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < m && same(start + j, (c, r)) {
+            j += 1;
+        }
+        let sweep: f64 = (i..j)
+            .map(|s| {
+                let d = (point(start + s + 1) - c).angle() - (point(start + s) - c).angle();
+                (d + PI).rem_euclid(TAU) - PI
+            })
+            .sum();
+        // Arcs of up to half a turn each.
+        let pieces = ((sweep.abs() / PI - 1e-9).ceil() as usize).clamp(1, 4);
+        let (a0, step) = ((point(k) - c).angle(), sweep / pieces as f64);
+        segs.extend((0..pieces).map(|p| (Seg2::Arc { center: c, radius: r, start: a0 + step * p as f64, sweep: step }, face(k))));
+        i = j;
+    }
+    segs
+}
+
+/// `segs` (a closed loop) with lines that run on in one line joined: a slot's side in two faces
+/// is one line.
+fn joined_lines(segs: impl IntoIterator<Item = Seg2>, tol: f64) -> Vec<Seg2> {
+    let on = |p: Vec2, a: Vec2, b: Vec2| p.extend(0.0).dist_to_segment(a.extend(0.0), b.extend(0.0)) <= tol;
+    let mut out: Vec<Seg2> = Vec::new();
+    for seg in segs {
+        if let (Some(Seg2::Line { a, b }), Seg2::Line { b: c, .. }) = (out.last_mut(), seg)
+            && on(*b, *a, c)
+        {
+            *b = c;
             continue;
         }
-        let (Some(&p), Some(&q)) = (line.first(), line.last()) else { continue };
-        if p.dist(q) <= tol || line.iter().any(|x| x.dist_to_segment(p, q) > tol) {
-            return err("not supported yet: faces with curved edges in a converted sheet");
+        out.push(seg);
+    }
+    // Across the loop's start.
+    if let (true, Some(Seg2::Line { a, b }), Some(Seg2::Line { b: c, .. })) = (out.len() > 2, out.last().copied(), out.first().copied())
+        && on(b, a, c)
+    {
+        out.pop();
+        if let Some(Seg2::Line { a: first, .. }) = out.first_mut() {
+            *first = a;
         }
-        edges.push((p, q, faces.iter().map(|g| *g as usize).find(|g| *g != f)));
     }
-    // Chained head to tail from the first one, they close one loop.
-    let Some((start, mut end, across)) = edges.pop() else { return err("a face of the body has no edges") };
-    let (mut pts, mut tags) = (vec![start], vec![across]);
-    while end.dist(start) > tol {
-        let Some(k) = edges.iter().position(|e| e.0.dist(end) <= tol || e.1.dist(end) <= tol) else {
-            return err("the outline of a face of the body does not close");
-        };
-        let (p, q, across) = edges.swap_remove(k);
-        pts.push(end);
-        tags.push(across);
-        end = if p.dist(end) <= tol { q } else { p };
+    out
+}
+
+/// Face `f` of the body as a panel outline. Only a planar face can be one. Its loops are read
+/// exactly, as a plate's are (an arc where one runs along a round wall standing square on the
+/// face): the outer one is the outline, the others are its holes.
+fn outline(b: &Body, mesh: &Mesh, f: usize, tol: f64) -> Result<Face> {
+    let Some(FaceSurface::Plane { normal: n, point }) = face_surface(b, f) else {
+        return err("not supported yet: curved faces in a converted sheet (only planar faces convert)");
+    };
+    let plane = Plane::from_normal(point, n).ok_or_else(|| DocError::Invalid("a face of the body has no plane".into()))?;
+    // Its edges, each with the face on its other side.
+    let mut edges: Vec<(&[Vec3], Option<usize>)> = mesh
+        .edges
+        .iter()
+        .zip(&mesh.edge_faces)
+        .filter(|(line, faces)| line.len() >= 2 && faces.iter().any(|g| *g as usize == f))
+        .map(|(line, faces)| (line.as_slice(), faces.iter().map(|g| *g as usize).find(|g| *g != f)))
+        .collect();
+    // Chained head to tail, they close the outline and its holes: each point with the face the
+    // loop runs along from it to the next point.
+    let mut loops: Vec<Vec<(Vec3, Option<usize>)>> = Vec::new();
+    while let Some((line, across)) = edges.pop() {
+        let (Some(&start), Some(&last)) = (line.first(), line.last()) else { continue };
+        let mut lp: Vec<(Vec3, Option<usize>)> = line.iter().take(line.len().saturating_sub(1)).map(|p| (*p, across)).collect();
+        let mut end = last;
+        while end.dist(start) > tol {
+            let meets = |p: Option<&Vec3>| p.is_some_and(|p| p.dist(end) <= tol);
+            let Some(k) = edges.iter().position(|(l, _)| meets(l.first()) || meets(l.last())) else {
+                return err("the outline of a face of the body does not close");
+            };
+            let (l, g) = edges.swap_remove(k);
+            let run: Vec<Vec3> = if meets(l.first()) { l.to_vec() } else { l.iter().rev().copied().collect() };
+            lp.extend(run.iter().take(run.len().saturating_sub(1)).map(|p| (*p, g)));
+            end = run.last().copied().unwrap_or(start);
+        }
+        loops.push(lp);
     }
-    if !edges.is_empty() {
-        return err("not supported yet: faces with holes in a converted sheet (cut them after converting)");
+    let mut walls = std::collections::HashMap::new();
+    let mut wall = |g: u32| *walls.entry(g).or_insert_with(|| round_wall(b, &plane, n, g));
+    // Each loop with the faces of its walls.
+    let mut shaped: Vec<(Vec<(Seg2, Option<u32>)>, Vec<usize>)> = loops
+        .iter()
+        .map(|lp| {
+            let pts: Vec<(Vec2, Option<u32>)> = lp.iter().map(|(p, g)| (plane.to_local(*p), g.and_then(|g| u32::try_from(g).ok()))).collect();
+            let mut walls: Vec<usize> = lp.iter().filter_map(|(_, g)| *g).collect();
+            walls.sort_unstable();
+            walls.dedup();
+            (outline_segs(&pts, &mut wall, tol * 10.0), walls)
+        })
+        .collect();
+    let area = |segs: &[(Seg2, Option<u32>)]| segs.iter().map(|(seg, _)| seg.area_term()).sum::<f64>().abs();
+    shaped.sort_by(|x, y| area(&y.0).total_cmp(&area(&x.0)));
+    let mut it = shaped.into_iter();
+    let Some((outer, _)) = it.next() else { return err("a face of the body has no edges") };
+    let holes = it.map(|(segs, walls)| (Loop2 { segs: joined_lines(segs.into_iter().map(|(seg, _)| seg), tol) }, walls)).collect();
+    // The outline's corners, where its segments start (an arc's in quarter turns at most, so that
+    // the corners alone still make an outline), each with the face along it.
+    let world = |v: Vec2| plane.to_world(v);
+    let (mut pts, mut tags, mut round) = (Vec::new(), Vec::new(), Vec::new());
+    for (seg, g) in outer {
+        let g = g.map(|g| g as usize);
+        if let Seg2::Arc { center, radius, start, sweep } = seg {
+            let k = ((sweep.abs() / FRAC_PI_2 - 1e-9).ceil() as usize).clamp(1, 8);
+            let step = sweep / k as f64;
+            for p in 0..k {
+                let a = start + step * p as f64;
+                pts.push(world(center + Vec2::from_angle(a) * radius));
+                tags.push(g);
+                round.push(Some((world(center), world(center + Vec2::from_angle(a + step / 2.0) * radius))));
+            }
+        } else {
+            pts.push(world(seg.start()));
+            tags.push(g);
+            round.push(None);
+        }
     }
     // A straight run along one neighbour is one edge, however the body's edges divide it (a
     // shell's outer corners are divided at the height of its floor).
@@ -107,15 +248,19 @@ fn outline(b: &Body, mesh: &Mesh, f: usize, tol: f64) -> Result<Face> {
     let corner = |i: usize| -> bool {
         let before = (i + m - 1) % m;
         let (Some(&a), Some(&p), Some(&b)) = (pts.get(before), pts.get(i), pts.get((i + 1) % m)) else { return true };
-        tags.get(before) != tags.get(i) || p.dist_to_segment(a, b) > tol
+        let arc = |k: usize| round.get(k).is_some_and(Option::is_some);
+        tags.get(before) != tags.get(i) || arc(before) || arc(i) || p.dist_to_segment(a, b) > tol
     };
-    let keep: Vec<bool> = (0..m).map(corner).collect();
-    let (mut pts, mut tags): (Vec<Vec3>, Vec<Option<usize>>) = pts.into_iter().zip(tags).zip(keep).filter(|(_, kept)| *kept).map(|(x, _)| x).unzip();
+    let keep: Vec<usize> = (0..m).filter(|i| corner(*i)).collect();
+    let mut pts: Vec<Vec3> = keep.iter().filter_map(|i| pts.get(*i).copied()).collect();
+    let mut tags: Vec<Option<usize>> = keep.iter().filter_map(|i| tags.get(*i).copied()).collect();
+    let mut round: Vec<Option<(Vec3, Vec3)>> = keep.iter().filter_map(|i| round.get(*i).copied()).collect();
     if area_about(&pts, n) < 0.0 {
         pts.reverse();
         turn(&mut tags);
+        turn(&mut round);
     }
-    Ok(Face { n, pts, across: tags })
+    Ok(Face { n, pts, across: tags, round, plane, holes })
 }
 
 /// The face straight through the material behind planar face `f`, when it is parallel to it,
@@ -208,6 +353,42 @@ fn set_panel(sh: &mut SheetBody, i: usize, outline: &[Vec2]) {
         }
         _ => f.shape = Some(uv.iter().map(|(u, v)| f.p + f.d * *u + f.n * (ba + *v)).collect()),
     }
+}
+
+/// A panel's trimmed outline as drawn: an edge that was a round edge of the face is an arc again
+/// (`round`, per edge of the untrimmed outline `pts`: the circle's centre and the arc's middle),
+/// pieces of one circle in a row one arc of up to half a turn. None when the face has no round
+/// edges. A round edge keeps both its ends: one that a bend's setback or a cut edge would move is
+/// not supported yet.
+fn drawn(trimmed: &[Vec2], from: &[Option<usize>], pts: &[Vec2], round: &[Option<(Vec2, Vec2)>]) -> Result<Option<Loop2>> {
+    if round.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let (m, n) = (trimmed.len(), pts.len());
+    let mut segs: Vec<Seg2> = Vec::with_capacity(m);
+    for j in 0..m {
+        let (Some(&a), Some(&b)) = (trimmed.get(j), trimmed.get((j + 1) % m)) else { continue };
+        let arc = from.get(j).copied().flatten().and_then(|i| Some((i, round.get(i).copied().flatten()?)));
+        let Some((i, (c, mid))) = arc else {
+            segs.push(Seg2::Line { a: snap(a), b: snap(b) });
+            continue;
+        };
+        let (Some(&p), Some(&q)) = (pts.get(i), pts.get((i + 1) % n)) else { continue };
+        if a.dist(p) > 1e-6 || b.dist(q) > 1e-6 {
+            return err("not supported yet: a round edge of a face that ends at a bend or a cut edge of the sheet");
+        }
+        let (start, r) = ((p - c).angle(), c.dist(p));
+        let half = ((mid - c).angle() - start + PI).rem_euclid(TAU) - PI;
+        match segs.last_mut() {
+            Some(Seg2::Arc { center, radius, sweep, .. })
+                if center.dist(c) <= 1e-9 && (*radius - r).abs() <= 1e-9 && *sweep * half > 0.0 && (*sweep + 2.0 * half).abs() <= PI + 1e-9 =>
+            {
+                *sweep += 2.0 * half;
+            }
+            _ => segs.push(Seg2::Arc { center: c, radius: r, start, sweep: 2.0 * half }),
+        }
+    }
+    Ok(Some(Loop2 { segs }))
 }
 
 /// Names of the edges of `body` at the bend points, to find them again after the body changes.
@@ -313,12 +494,22 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
     // The flat frame: on the fixed face, x along its longest edge, z into the material.
     let Some(base) = panels.get(&f0) else { return err("fixed face") };
     let corners = base.face.pts.iter().zip(base.face.pts.iter().cycle().skip(1));
-    let longest = corners.max_by(|x, y| x.0.dist(*x.1).total_cmp(&y.0.dist(*y.1)));
+    let straight = corners.zip(&base.face.round).filter(|(_, r)| r.is_none()).map(|(c, _)| c);
+    let longest = straight.max_by(|x, y| x.0.dist(*x.1).total_cmp(&y.0.dist(*y.1)));
     let frame = longest
         .and_then(|(a, b)| Some((*a, (*b - *a).normalized()?)))
         .and_then(|(a, x)| Plane::new(a, x, x.cross(base.face.n)))
         .ok_or_else(|| DocError::Invalid("the fixed face has no plane".into()))?;
     let mut sh = base_flange(&mb.name, rule, &RuleValues { thickness: t, ..*rv }, frame, Region2::default());
+    // How far behind a face of the sheet the body's face `g` reaches (a hole's wall, through it).
+    let mut points: BTreeMap<usize, Vec<Vec3>> = BTreeMap::new();
+    for (tri, g) in mesh.triangles.iter().zip(&mesh.tri_face) {
+        points.entry(*g as usize).or_default().extend(tri.iter().filter_map(|k| mesh.positions.get(*k as usize)));
+    }
+    let depth = |g: usize, face: &Face| {
+        let o = face.pts.first().copied().unwrap_or_default();
+        points.get(&g).map_or(0.0, |ps| ps.iter().map(|p| (o - *p).dot(face.n)).fold(0.0, f64::max))
+    };
     // Lay the panels out, parents first: each is its face, seen through the inverse of its
     // fold, with its edges moved in by a bend's setback or a rip's cut.
     let mut queue: Vec<(usize, Option<usize>)> = vec![(f0, None)];
@@ -344,16 +535,53 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
             });
         }
         let mut across = panel.face.across.clone();
+        let flat = |p: Vec3| {
+            let q = apply_point(&inv, p);
+            Vec2::new(q.x, q.y)
+        };
+        let mut round: Vec<Option<(Vec2, Vec2)>> = panel.face.round.iter().map(|r| r.map(|(c, m)| (flat(c), flat(m)))).collect();
         if signed_area(&pts) < 0.0 {
             pts.reverse();
             turn(&mut by);
             turn(&mut across);
+            turn(&mut round);
         }
         let first = panel.face.pts.first().copied().unwrap_or_default();
-        let (trimmed, from) = inset(&pts, &by).map_err(|e| DocError::Invalid(format!("{e} (the face at {})", at(first))))?;
+        let face_at = |e: DocError| DocError::Invalid(format!("{e} (the face at {})", at(first)));
+        let (trimmed, from) = inset(&pts, &by).map_err(face_at)?;
+        let exact = drawn(&trimmed, &from, &pts, &round).map_err(face_at)?;
         match fl {
-            None => sh.base.outer = Loop2::polygon(&trimmed.iter().map(|q| snap(*q)).collect::<Vec<_>>()),
-            Some(i) => set_panel(&mut sh, i, &trimmed),
+            None => sh.base.outer = exact.unwrap_or_else(|| Loop2::polygon(&trimmed.iter().map(|q| snap(*q)).collect::<Vec<_>>())),
+            Some(i) => {
+                set_panel(&mut sh, i, &trimmed);
+                if let (Some(lp), Some(f)) = (exact, sh.flanges.get_mut(i)) {
+                    f.shape = Some(trimmed.clone());
+                    f.exact = Some(lp);
+                }
+            }
+        }
+        // The face's holes: cut-outs of the sheet where they lie, inside its panel. A hole's walls
+        // reach through the sheet; a pocket's end inside it, on its floor.
+        let region = match fl {
+            None => sh.base.clone(),
+            Some(i) => sh.flanges.get(i).map(|f| sh.panel(f)).unwrap_or_default(),
+        };
+        let bound = if panel.face.holes.is_empty() { Vec::new() } else { region.outer.ccw().polyline(1e-3) };
+        for (h, walls) in &panel.face.holes {
+            let p = panel.face.plane.to_world(h.centroid());
+            let reach = walls.iter().map(|g| depth(*g, &panel.face)).fold(f64::INFINITY, f64::min);
+            if reach < t - tol {
+                return err(format!(
+                    "not supported yet: the pocket at {} in a face of the sheet ends {reach:.3} deep, inside the sheet's {t:.3} (cut it after converting)",
+                    at(p)
+                ));
+            }
+            let cut = sh.region_to_flat(fl, &panel.face.plane, &Region2 { outer: h.clone(), holes: Vec::new() })?;
+            let ring = cut.outer.polyline(1e-3);
+            if !ring.iter().all(|q| point_in(&bound, *q)) || polys_cross(&bound, &ring) {
+                return err(format!("not supported yet: the hole at {} reaches into a bend (cut it after converting)", at(p)));
+            }
+            sh.holes.push(cut);
         }
         // Its children: flanges on the trimmed edges they bend at.
         let m = trimmed.len();
@@ -379,6 +607,7 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
                 ext: (0.0, 0.0),
                 slope: (0.0, 0.0),
                 shape: None,
+                exact: None,
                 tag: String::new(),
                 tear: (false, false),
             });

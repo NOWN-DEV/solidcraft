@@ -130,11 +130,12 @@ edge between two faces of the sheet that is no bend is cut open, each side half 
 **gap** from the plane halfway between the two, like the corners of a tray. The result is an
 ordinary sheet body: edge flanges, cuts, Unfold, the flat pattern and its exports work on it,
 and it follows the solid when a parameter changes (the edges and the fixed face are found by
-their names). Without bend edges Convert expects a plate, as before; its round walls (holes, slot
-ends, rounded corners) stay circles and arcs in the flat pattern and the DXF, also where a STEP
-file writes one in pieces. Not converted yet: curved faces (rolled sheet, a filleted edge as a
-bend), faces with holes or curved edges in a body with bend edges (cut them after converting)
-and bends that close a ring.
+their names). Without bend edges Convert expects a plate, as before. Either way round walls
+(holes, slot ends, rounded corners, notches) stay circles and arcs in the flat pattern and the
+DXF, also where a STEP file writes one in pieces, and the holes and slots of every face of the
+sheet are its cut-outs, where the bends put them. Not converted yet: curved faces (rolled sheet,
+a filleted edge as a bend), with bend edges a hole that reaches into a bend or a pocket that
+doesn't go through (cut them after converting), and bends that close a ring.
 
 A plate may carry recesses in one of its faces, such as an engraved label or a counterbore: a
 recess with a flat floor and walls square to the plate, at most half the plate's thickness

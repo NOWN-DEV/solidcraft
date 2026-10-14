@@ -649,9 +649,9 @@ pub(super) fn sheet_eval(
             // Recesses in one face (an engraved label) become pockets; the outline is the other face's.
             let recesses = plate_recesses(&mb.body, &mesh, &plane, *face, n, (lo, hi), tol)?;
             let mut walls = std::collections::HashMap::new();
-            let mut wall = |f: u32| *walls.entry(f).or_insert_with(|| round_wall(&mb.body, &plane, n, f));
+            let mut wall = |f: u32| *walls.entry(f).or_insert_with(|| sheet::round_wall(&mb.body, &plane, n, f));
             let mut loops: Vec<Loop2> =
-                face_outline(&mesh, &plane, *face, n, recesses.level, tol).iter().map(|l| outline_loop(l, &mut wall, tol * 1e-2)).collect();
+                face_outline(&mesh, &plane, *face, n, recesses.level, tol).iter().map(|l| sheet::outline_loop(l, &mut wall, tol * 1e-2)).collect();
             loops.sort_by(|a, b| b.signed_area().abs().total_cmp(&a.signed_area().abs()));
             let mut it = loops.into_iter();
             let outer = it.next().ok_or_else(|| DocError::Invalid("no outline on that face".into()))?.ccw();
@@ -1225,62 +1225,6 @@ fn chain_loops(
         }
     }
     loops
-}
-
-/// The circle (centre in `plane` coordinates, radius) of face `f` when it is a round wall
-/// standing square on the plane: a cylinder about the plane's normal `n`.
-fn round_wall(body: &Body, plane: &Plane, n: Vec3, f: u32) -> Option<(Vec2, f64)> {
-    match kernel::face_surface(body, f as usize)? {
-        kernel::FaceSurface::Cylinder { origin, axis, radius } if axis.cross(n).len() < 1e-6 => Some((plane.to_local(origin), radius)),
-        _ => None,
-    }
-}
-
-/// A loop of [`face_outline`] as segments: each run along one round wall (`wall` gives a face's
-/// circle) is an arc of that circle, the rest stays straight. Coaxial cylinders of one radius are
-/// one wall, however many faces it comes in (many systems write a round hole's wall as two
-/// half-cylinders), so such a hole is one circle. `eps`: how far off its circle a point may be.
-fn outline_loop(pts: &[(Vec2, Option<u32>)], wall: &mut impl FnMut(u32) -> Option<(Vec2, f64)>, eps: f64) -> Loop2 {
-    use std::f64::consts::{PI, TAU};
-    let m = pts.len();
-    let point = |i: usize| pts.get(i % m).map(|x| x.0).unwrap_or_default();
-    // The circle each segment runs along: its wall's, when both its ends lie on it.
-    let circles: Vec<Option<(Vec2, f64)>> = (0..m)
-        .map(|i| {
-            let (c, r) = wall(pts.get(i)?.1?)?;
-            ((point(i).dist(c) - r).abs() <= eps && (point(i + 1).dist(c) - r).abs() <= eps).then_some((c, r))
-        })
-        .collect();
-    let circle = |i: usize| circles.get(i % m).copied().flatten();
-    let same = |i: usize, (c, r): (Vec2, f64)| circle(i).is_some_and(|(d, s)| d.dist(c) <= eps && (s - r).abs() <= eps);
-    // Start where no arc runs on across the start (anywhere when the whole loop is one circle).
-    let start = (0..m).find(|i| circle(*i + m - 1).is_none_or(|c| !same(*i, c))).unwrap_or(0);
-    let mut segs = Vec::new();
-    let mut i = 0;
-    while i < m {
-        let k = start + i;
-        let Some((c, r)) = circle(k) else {
-            segs.push(Seg2::Line { a: point(k), b: point(k + 1) });
-            i += 1;
-            continue;
-        };
-        let mut j = i + 1;
-        while j < m && same(start + j, (c, r)) {
-            j += 1;
-        }
-        let sweep: f64 = (i..j)
-            .map(|s| {
-                let d = (point(start + s + 1) - c).angle() - (point(start + s) - c).angle();
-                (d + PI).rem_euclid(TAU) - PI
-            })
-            .sum();
-        // Arcs of up to half a turn each.
-        let pieces = ((sweep.abs() / PI - 1e-9).ceil() as usize).clamp(1, 4);
-        let (a0, step) = ((point(k) - c).angle(), sweep / pieces as f64);
-        segs.extend((0..pieces).map(|p| Seg2::Arc { center: c, radius: r, start: a0 + step * p as f64, sweep: step }));
-        i = j;
-    }
-    Loop2 { segs }
 }
 
 /// What the recesses of a plate (an engraved label, a counterbore) take out of it, for Convert
