@@ -130,15 +130,19 @@ edge between two faces of the sheet that is no bend is cut open, each side half 
 **gap** from the plane halfway between the two, like the corners of a tray. A bend drawn as a
 chamfer (a flat strip between two faces, the chord of the bend's arc, as models without bend
 radii draw one) is picked in the middle of the strip: the two faces then meet at their virtual
-sharp in one bend of the rule's radius, and the strip is no face of the sheet. The result is an
+sharp in one bend of the rule's radius, and the strip is no face of the sheet. A bend modelled
+with its radius (a cylinder between two flat faces tangent to it, as sheet metal parts from
+other systems come, or a filleted edge) is picked anywhere on its cylinder, on either skin, and
+converts the same way: the sheet is bent there with the rule's radius and K-factor, not the
+modelled radius, so the flat pattern is the one the rule makes. The result is an
 ordinary sheet body: edge flanges, cuts, Unfold, the flat pattern and its exports work on it,
 and it follows the solid when a parameter changes (the edges and the fixed face are found by
 their names). Without bend edges Convert expects a plate, as before. Either way round walls
 (holes, slot ends, rounded corners, notches) stay circles and arcs in the flat pattern and the
 DXF, also where a STEP file writes one in pieces, and the holes and slots of every face of the
-sheet are its cut-outs, where the bends put them. Not converted yet: curved faces (rolled sheet,
-a filleted edge as a bend), with bend edges a hole that reaches into a bend or a pocket that
-doesn't go through (cut them after converting), and bends that close a ring.
+sheet are its cut-outs, where the bends put them. Not converted yet: curved faces other than bends
+(rolled sheet), with bend edges a hole that reaches into a bend or a pocket that doesn't go
+through (cut them after converting), and bends that close a ring.
 
 A plate may carry recesses in one of its faces, such as an engraved label or a counterbore: a
 recess with a flat floor and walls square to the plate, at most half the plate's thickness

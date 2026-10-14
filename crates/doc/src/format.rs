@@ -183,6 +183,9 @@
 //!   chamfer (a flat strip between two faces), which then is one bend at the two faces' virtual
 //!   sharp; 0.11.0 bent the chamfer's nearest edge instead or found no edge there. Bend points
 //!   on edges convert as before.
+//!   A bend point can also lie on a bend modelled with its radius (a cylinder between two flat
+//!   faces tangent to it), which then is one bend at the two faces' virtual sharp with the
+//!   rule's radius; 0.11.0 found no edge there or refused the curved face.
 
 use serde_json::Value;
 

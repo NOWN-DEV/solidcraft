@@ -453,6 +453,164 @@ fn a_chamfer_picked_in_its_middle_is_one_bend_at_the_virtual_sharp() {
     assert!(msg.contains("not both"), "{msg}");
 }
 
+/// A strip `t` thick along the polyline `outer` (its material to the left of the way the line
+/// runs, as [`section`]), extruded `len` along z as the body `Section`, its corners bent as a
+/// sheet metal model draws them: an arc of radius `ri` on the inside of each bend and one of
+/// `ri + t` on the outside, about one axis. Returns, per corner, a point in the middle of its
+/// outer arc and one in the middle of its inner arc.
+fn bent_section(s: &mut Session, outer: &[(f64, f64)], t: f64, ri: f64, len: f64) -> Vec<([f64; 3], [f64; 3])> {
+    let n = outer.len();
+    let dir = |i: usize| {
+        let (a, b) = (outer[i], outer[i + 1]);
+        let l = (b.0 - a.0).hypot(b.1 - a.1);
+        ((b.0 - a.0) / l, (b.1 - a.1) / l)
+    };
+    let left = |d: (f64, f64)| (-d.1, d.0);
+    let at = |p: (f64, f64), d: (f64, f64), k: f64| (p.0 + d.0 * k, p.1 + d.1 * k);
+    // Per corner: where its arc starts and ends on the line's skin and on the other skin, the
+    // middles of those two arcs, and the middles of its outer and its inner arc.
+    let mut corners = Vec::new();
+    for (i, &c) in outer.iter().enumerate().take(n - 1).skip(1) {
+        let (d0, d1) = (dir(i - 1), dir(i));
+        let (cross, dot) = (d0.0 * d1.1 - d0.1 * d1.0, d0.0 * d1.0 + d0.1 * d1.1);
+        let theta = cross.abs().atan2(dot);
+        // Turning toward the material, this skin is the bend's outside.
+        let (rp, ro) = if cross > 0.0 { (ri + t, ri) } else { (ri, ri + t) };
+        let a = at(c, d0, -rp * (theta / 2.0).tan());
+        let b = at(c, d1, rp * (theta / 2.0).tan());
+        let centre = at(a, left(d0), if cross > 0.0 { rp } else { -rp });
+        let (ai, bi) = (at(a, left(d0), t), at(b, left(d1), t));
+        let l = (c.0 - centre.0).hypot(c.1 - centre.1);
+        let mid = |r: f64| (centre.0 + (c.0 - centre.0) / l * r, centre.1 + (c.1 - centre.1) / l * r);
+        corners.push((a, b, ai, bi, mid(rp), mid(ro), (mid(ri + t), mid(ri))));
+    }
+    let xy = |p: (f64, f64)| [p.0, p.1];
+    run(s, "sketch.create", json!({"plane": "XY", "name": "Section"}));
+    let mut from = outer[0];
+    for &(a, b, _, _, m, ..) in &corners {
+        run(s, "sketch.line", json!({"points": [xy(from), xy(a)]}));
+        run(s, "sketch.arc.three_point", json!({"start": xy(a), "end": xy(b), "through": xy(m)}));
+        from = b;
+    }
+    let (last, first) = (at(outer[n - 1], left(dir(n - 2)), t), at(outer[0], left(dir(0)), t));
+    run(s, "sketch.line", json!({"points": [xy(from), xy(outer[n - 1]), xy(last)]}));
+    from = last;
+    for &(_, _, ai, bi, _, m, _) in corners.iter().rev() {
+        run(s, "sketch.line", json!({"points": [xy(from), xy(bi)]}));
+        run(s, "sketch.arc.three_point", json!({"start": xy(bi), "end": xy(ai), "through": xy(m)}));
+        from = ai;
+    }
+    run(s, "sketch.line", json!({"points": [xy(from), xy(first), xy(outer[0])]}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "solid.extrude", json!({"sketch": "Section", "distance": len, "body_name": "Section"}));
+    let z = len / 2.0;
+    corners.iter().map(|&(.., (m, mi))| ([m.0, m.1, z], [mi.0, mi.1, z])).collect()
+}
+
+#[test]
+fn a_bend_modelled_with_its_radius_is_one_bend_of_the_rules_radius() {
+    // An L: a base 60 and a leg 40 to the sharp corner outside, 2 thick and 100 long, its
+    // corner bent R 2 inside and R 4 outside. The rule bends R 3: its radius, not the model's.
+    let (t, k, r) = (2.0, 0.5, 3.0);
+    let l = |s: &mut Session| {
+        rule(s, "Test", t, k, r, 0.5);
+        bent_section(s, &[(0.0, 40.0), (0.0, 0.0), (60.0, 0.0)], t, 2.0, 100.0)[0]
+    };
+    let mut s = Session::default();
+    let (outer, inner) = l(&mut s);
+    run(&mut s, "sheet.convert", json!({"body": "Section", "face": [30, 0, 50], "bends": [outer]}));
+    let rows = bend_rows(&mut s);
+    assert!(rows.len() == 1 && rows[0].0 == 90 && rows[0].1 == "up" && (rows[0].2 - 100.0).abs() < 1e-6, "{rows:?}");
+    let allowance = flat(&mut s)["bends"][0]["allowance"].as_f64().unwrap_or(0.0);
+    assert!((allowance - FRAC_PI_2 * (r + k * t)).abs() < 1e-9, "{allowance}");
+    // The outside lengths to the virtual sharp less one 90° deduction:
+    // 60 + 40 - (2 (R + T) - π/2 (R + K T)) = 100 - (10 - 2π) = 96.2832.
+    let across = 100.0 - deduction(FRAC_PI_2, r, t, k);
+    assert!((across - 96.283185).abs() < 1e-6);
+    assert!(same_size(flat_size(&mut s), (across, 100.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    // The envelope of the sharp corner stays; the round is the rule's, R + T outside.
+    let (lo, hi) = bbox(&mut s);
+    assert!(
+        lo.iter().all(|v| v.abs() < 1e-6) && (hi[0] - 60.0).abs() < 1e-6 && (hi[1] - 40.0).abs() < 1e-6 && (hi[2] - 100.0).abs() < 1e-6,
+        "{lo:?} {hi:?}"
+    );
+    // Two flat strips and a quarter round on the neutral radius R + T/2.
+    let expect = t * 100.0 * ((60.0 - (r + t)) + (40.0 - (r + t)) + FRAC_PI_2 * (r + t / 2.0));
+    assert!((volume(&mut s) - expect).abs() < 2e-3 * expect, "{} vs {expect}", volume(&mut s));
+    // The design keeps the cylinder's point and reopens to the same sheet.
+    let saved = s.doc.to_json();
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&saved).unwrap());
+    assert!(same_size(flat_size(&mut reopened), (across, 100.0), 1e-6), "{:?}", flat_size(&mut reopened));
+
+    // The inner cylinder is the same bend; and from the inside of the base, the sheet's other
+    // skin is the fixed one, the bend turning down from it, picked on either cylinder: the
+    // inside lengths to the inner sharp, 58 + 38, less 2 R plus the allowance, the same blank.
+    assert!((58.0 + 38.0 - 2.0 * r + allowance - across).abs() < 1e-9);
+    for (face, bend, direction) in [([30.0, 0.0, 50.0], inner, "up"), ([30.0, 2.0, 50.0], outer, "down"), ([30.0, 2.0, 50.0], inner, "down")] {
+        let mut b = Session::default();
+        l(&mut b);
+        run(&mut b, "sheet.convert", json!({"body": "Section", "face": face, "bends": [bend]}));
+        assert!(bend_rows(&mut b).iter().all(|row| row.0 == 90 && row.1 == direction), "{face:?} {bend:?}: {:?}", bend_rows(&mut b));
+        assert!(same_size(flat_size(&mut b), (across, 100.0), 1e-6), "{face:?} {bend:?}: {:?}", flat_size(&mut b));
+        assert!((volume(&mut b) - expect).abs() < 2e-3 * expect, "{face:?} {bend:?}: {} vs {expect}", volume(&mut b));
+    }
+}
+
+#[test]
+fn a_channel_with_its_bends_modelled_folds_back_into_itself_under_its_own_radius() {
+    // A channel 40 wide with walls 30 high to the sharp corners outside, 2 thick and 100 long,
+    // bent R 2 inside, R 4 outside. Under a rule of that radius the sheet is the model.
+    let (t, k, r) = (2.0, 0.44, 2.0);
+    let channel = |s: &mut Session| {
+        rule(s, "Test", t, k, r, 0.5);
+        bent_section(s, &[(0.0, 30.0), (0.0, 0.0), (40.0, 0.0), (40.0, 30.0)], t, r, 100.0)
+    };
+    let mut s = Session::default();
+    let corners = channel(&mut s);
+    let solid = volume(&mut s);
+    // Two flat walls, the base and two quarter rounds on the neutral radius R + T/2.
+    let expect = t * 100.0 * (2.0 * (30.0 - (r + t)) + (40.0 - 2.0 * (r + t)) + PI * (r + t / 2.0));
+    assert!((solid - expect).abs() < 2e-3 * expect, "{solid} vs {expect}");
+    // One bend picked on its outer cylinder, the other on its inner one.
+    run(&mut s, "sheet.convert", json!({"body": "Section", "face": [20, 0, 50], "bends": [corners[0].0, corners[1].1]}));
+    let rows = bend_rows(&mut s);
+    assert!(rows.len() == 2 && rows.iter().all(|row| row.0 == 90 && row.1 == "up" && (row.2 - 100.0).abs() < 1e-6), "{rows:?}");
+    // 30 + 40 + 30 less two deductions, 2 (R + T) - π/2 (R + K T) each.
+    let across = 100.0 - 2.0 * deduction(FRAC_PI_2, r, t, k);
+    assert!(same_size(flat_size(&mut s), (across, 100.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+    // The same solid as before: its volume and its box.
+    assert!((volume(&mut s) - solid).abs() < 1e-3 * solid, "{} vs {solid}", volume(&mut s));
+    let (lo, hi) = bbox(&mut s);
+    assert!(
+        lo.iter().all(|v| v.abs() < 1e-6) && (hi[0] - 40.0).abs() < 1e-6 && (hi[1] - 30.0).abs() < 1e-6 && (hi[2] - 100.0).abs() < 1e-6,
+        "{lo:?} {hi:?}"
+    );
+    // Unfold and refold keep it.
+    run(&mut s, "sheet.unfold", json!({}));
+    let (lo, hi) = bbox(&mut s);
+    let flat_box = [(hi[0] - lo[0], hi[1] - lo[1]), (hi[0] - lo[0], hi[2] - lo[2]), (hi[1] - lo[1], hi[2] - lo[2])];
+    assert!(flat_box.iter().any(|b| same_size(*b, (across, 100.0), 1e-6)), "{lo:?} {hi:?}");
+    run(&mut s, "sheet.refold", json!({}));
+    assert!((volume(&mut s) - solid).abs() < 1e-3 * solid);
+}
+
+#[test]
+fn a_filleted_edge_of_a_solid_block_is_a_bend() {
+    // A block's bottom edge rounded R 5: the faces either side meet at the old sharp edge,
+    // the rule's thickness taken inward, an L with a 100 base and a 30 wall outside.
+    let (t, k, r) = (2.0, 0.44, 2.0);
+    let mut s = Session::default();
+    rule(&mut s, "Test", t, k, r, 0.5);
+    run(&mut s, "solid.box", json!({"length": 100, "width": 60, "height": 30, "body_name": "Block"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[100, 30, 0]], "radius": 5}));
+    let h = 5.0 * (1.0 - 0.5f64.sqrt());
+    run(&mut s, "sheet.convert", json!({"body": "Block", "face": [50, 30, 0], "bends": [[100.0 - h, 30.0, h]]}));
+    let rows = bend_rows(&mut s);
+    assert!(rows.len() == 1 && rows[0].0 == 90 && rows[0].1 == "up" && (rows[0].2 - 60.0).abs() < 1e-6, "{rows:?}");
+    let across = 130.0 - deduction(FRAC_PI_2, r, t, k);
+    assert!(same_size(flat_size(&mut s), (across, 60.0), 1e-6), "{:?} vs {across}", flat_size(&mut s));
+}
+
 #[test]
 fn edge_flanges_and_cuts_work_on_a_converted_sheet() {
     let mut s = Session::default();

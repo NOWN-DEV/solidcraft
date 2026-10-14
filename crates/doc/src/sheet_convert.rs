@@ -16,6 +16,12 @@
 //! the faces on either side are taken out to where their planes meet, and that line is the
 //! bend's virtual sharp, bent with the rule's radius at the angle between the two faces.
 //!
+//! A bend modelled with its radius, a cylinder between two planar faces tangent to it along its
+//! length, is picked anywhere on its cylinder, on either skin, and taken the same way: the two
+//! faces out to their virtual sharp, bent there with the rule's radius and K-factor. The
+//! modelled radius gives way to the rule's, as a sharp edge's does: the flat is measured from
+//! the virtual sharps, which don't depend on it.
+//!
 //! The result is the model every sheet metal feature builds ([`SheetBody`]): the fixed face is
 //! the base panel and every other panel a flange on its parent's edge, its outline taken through
 //! the inverse of its fold. Unfold, the flat pattern, the bend table and cuts then work as on a
@@ -25,9 +31,9 @@
 //! square on the face (a rounded corner, a tooth) it is an arc of the wall's circle, and its
 //! holes and slots are cut-outs of the sheet where they lie in its panel.
 //!
-//! Not supported yet: curved faces (rolled sheet, a filleted edge as a bend), holes that reach
-//! into a bend, pockets (inner loops whose walls end inside the sheet), round edges that end at a
-//! bend or a cut edge, loops of bends, two faces that meet along more than one edge.
+//! Not supported yet: curved faces other than bends (rolled sheet), holes that reach into a
+//! bend, pockets (inner loops whose walls end inside the sheet), round edges that end at a bend
+//! or a cut edge, loops of bends, two faces that meet along more than one edge.
 
 use std::collections::BTreeMap;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -282,8 +288,8 @@ fn behind(b: &Body, mesh: &Mesh, f: usize) -> Option<(usize, f64)> {
     (normal.dot(n) < -1.0 + 1e-9).then_some((g, (o - point).dot(n)))
 }
 
-/// A chamfer picked as a bend: the planar face `strip` between the planar faces `a` and `b`,
-/// which meet in that bend at the line where their planes cross.
+/// A chamfer or a bend's cylinder picked as a bend: the face `strip` between the planar faces
+/// `a` and `b`, which meet in that bend at the line where their planes cross.
 #[derive(Clone, Copy)]
 struct Chamfer {
     strip: usize,
@@ -291,13 +297,20 @@ struct Chamfer {
     b: usize,
 }
 
-/// The chamfer a bend point picks: a point on the middle half of a planar face that runs
-/// between two planar faces along two parallel edges, the two faces' planes crossing in a line
-/// parallel to them and the strip facing between the two (as the chord of a bend's arc does).
-/// A point on any other face, or near a chamfer's edge, picks an edge as before.
-fn chamfer_at(mb: &ModelBody, mesh: &Mesh, p: Vec3, tol: f64) -> Option<Chamfer> {
+/// The chamfer or bend cylinder a bend point picks. A bend cylinder ([`bend_cylinder`]) is
+/// picked by a point anywhere on it (within `near`, the cylinder being drawn in chords). A
+/// chamfer by a point on the middle half of a planar face that runs between two planar faces
+/// along two parallel edges, the two faces' planes crossing in a line parallel to them and the
+/// strip facing between the two (as the chord of a bend's arc does). A point on any other face,
+/// or near a chamfer's edge, picks an edge as before.
+fn chamfer_at(mb: &ModelBody, mesh: &Mesh, p: Vec3, tol: f64, near: f64) -> Option<Chamfer> {
     let b = &mb.body;
     let (d, f) = crate::appearance::nearest_face(mb, p)?;
+    if d <= near
+        && let Some(c) = bend_cylinder(b, mesh, f, tol)
+    {
+        return Some(c);
+    }
     if d > tol {
         return None;
     }
@@ -328,6 +341,44 @@ fn chamfer_at(mb: &ModelBody, mesh: &Mesh, p: Vec3, tol: f64) -> Option<Chamfer>
     let off = |o: Vec3| (p - o - d * (p - o).dot(d)).len();
     let width = off(pa) + off(pb);
     (off(pa) >= width / 4.0 && off(pb) >= width / 4.0).then_some(Chamfer { strip: f, a, b: bb })
+}
+
+/// Face `f` as a bend modelled with its radius: a cylinder with a planar face tangent to it
+/// along a straight edge parallel to its axis on either side, the two planes crossing in a line
+/// (a bend between 0 and 180°). Other faces along it (the walls of a notch) don't count.
+fn bend_cylinder(b: &Body, mesh: &Mesh, f: usize, tol: f64) -> Option<Chamfer> {
+    let Some(FaceSurface::Cylinder { origin, axis, .. }) = face_surface(b, f) else { return None };
+    let mut sides: Vec<(usize, Vec3)> = Vec::new();
+    for (line, faces) in mesh.edges.iter().zip(&mesh.edge_faces) {
+        let g = match *faces.as_slice() {
+            [x, y] if x as usize == f => y as usize,
+            [x, y] if y as usize == f => x as usize,
+            _ => continue,
+        };
+        let (Some(&p), Some(&q)) = (line.first(), line.last()) else { continue };
+        let along = (q - p).normalized().is_some_and(|d| d.cross(axis).len() <= 1e-6);
+        if g == f || !along || line.iter().any(|x| x.dist_to_segment(p, q) > tol) || sides.iter().any(|(h, _)| *h == g) {
+            continue;
+        }
+        // Tangent: the plane's normal is the cylinder's there, square to the axis.
+        let Some(FaceSurface::Plane { normal: n, .. }) = face_surface(b, g) else { continue };
+        let radial = (p - origin) - axis * (p - origin).dot(axis);
+        if radial.normalized().is_some_and(|out| n.dot(out).abs() >= 1.0 - 1e-6) {
+            sides.push((g, n));
+        }
+    }
+    let &[(a, na), (bb, nb)] = sides.as_slice() else { return None };
+    na.cross(nb).normalized().map(|_| Chamfer { strip: f, a, b: bb })
+}
+
+/// The cylinder of bend `c` on a shell's other skin: the bend cylinder between the faces
+/// straight behind `c`'s two sides, so that a bend picked on either skin is that bend on both.
+fn other_skin(b: &Body, mesh: &Mesh, c: &Chamfer, tol: f64) -> Option<Chamfer> {
+    let (x, y) = (behind(b, mesh, c.a)?.0, behind(b, mesh, c.b)?.0);
+    let beside_x = mesh.edge_faces.iter().filter(|faces| faces.contains(&(x as u32))).flatten().map(|g| *g as usize);
+    beside_x
+        .filter(|g| *g != x && *g != c.strip)
+        .find_map(|g| bend_cylinder(b, mesh, g, tol).filter(|o| (o.a, o.b) == (x, y) || (o.a, o.b) == (y, x)))
 }
 
 /// Face `g`'s outline with each picked chamfer along it taken out: the edge along the chamfer
@@ -493,18 +544,20 @@ fn drawn(trimmed: &[Vec2], from: &[Option<usize>], pts: &[Vec2], round: &[Option
 
 /// Names of the edges of `body` at the bend points, to find them again after the body changes.
 /// A point on no edge gets none: the conversion then says so, instead of bending the edge that
-/// happens to be nearest. A point on a chamfer gets none either: it stays that chamfer's point.
+/// happens to be nearest. A point on a chamfer or a bend cylinder gets none either: it stays that
+/// chamfer's or cylinder's point.
 pub fn bend_edge_names(st: &crate::ModelState, body: &str, pts: &[Vec3]) -> Vec<String> {
     let Some(b) = st.body(body) else { return Vec::new() };
     let (mesh, near, tol) = (b.mesh(), (b.body.size() * 2e-3).max(1e-3), (b.body.size() * 1e-6).max(1e-6));
-    let on =
-        |p: &Vec3| chamfer_at(b, &mesh, *p, tol).is_none() && mesh.edges.iter().any(|e| e.windows(2).any(|w| p.dist_to_segment(w[0], w[1]) <= near));
+    let on = |p: &Vec3| {
+        chamfer_at(b, &mesh, *p, tol, near).is_none() && mesh.edges.iter().any(|e| e.windows(2).any(|w| p.dist_to_segment(w[0], w[1]) <= near))
+    };
     pts.iter().zip(crate::naming::edge_names_at(b, pts)).map(|(p, name)| if on(p) { name } else { String::new() }).collect()
 }
 
 /// Convert body `mb` to a sheet under the rule `rule` with values `rv`: `face` is a point on the
-/// fixed face and `bends` are points on the sharp edges that become bends, or in the middle of
-/// chamfers that do (the body's coordinates, mm). See the module docs.
+/// fixed face and `bends` are points on the sharp edges that become bends, in the middle of
+/// chamfers or on bend cylinders that do (the body's coordinates, mm). See the module docs.
 pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, bends: &[Vec3]) -> Result<SheetBody> {
     if bends.is_empty() || bends.len() > MAX_BENDS {
         return err(format!("pick 1…{MAX_BENDS} bend edges"));
@@ -522,13 +575,18 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
     let Some((_, f0)) = crate::appearance::nearest_face(mb, face).filter(|(d, _)| *d <= near) else {
         return err(format!("no face of the body at the fixed face point {}", at(face)));
     };
-    // The two faces along each bend edge, or on either side of each chamfer.
+    // The two faces along each bend edge, or on either side of each chamfer or bend cylinder
+    // (with a bend cylinder its other skin's too).
     let mut picks = Vec::with_capacity(bends.len());
     let mut chamfers: Vec<Chamfer> = Vec::new();
     for p in bends {
-        if let Some(c) = chamfer_at(mb, &mesh, *p, tol) {
+        if let Some(c) = chamfer_at(mb, &mesh, *p, tol, near) {
             picks.push((*p, (c.a, c.b)));
-            chamfers.push(c);
+            for c in std::iter::once(c).chain(other_skin(b, &mesh, &c, tol)) {
+                if !chamfers.iter().any(|x| x.strip == c.strip) {
+                    chamfers.push(c);
+                }
+            }
             continue;
         }
         let dist = |e: &Vec<Vec3>| e.windows(2).map(|w| p.dist_to_segment(w[0], w[1])).fold(f64::INFINITY, f64::min);
@@ -552,7 +610,10 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
     let shell = thin.filter(|_| backs.iter().all(Option::is_some));
     let t = shell.map_or(rv.thickness, |d| (d * 1e9).round() / 1e9);
     let r = rv.bend_radius;
-    let joined = |x: usize, y: usize| mesh.edge_faces.iter().any(|faces| faces.contains(&(x as u32)) && faces.contains(&(y as u32)));
+    let joined = |x: usize, y: usize| {
+        mesh.edge_faces.iter().any(|faces| faces.contains(&(x as u32)) && faces.contains(&(y as u32)))
+            || chamfers.iter().any(|c| (c.a, c.b) == (x, y) || (c.a, c.b) == (y, x))
+    };
     let mut todo: Vec<(Vec3, Vec<(usize, usize)>)> = Vec::with_capacity(picks.len());
     for (&(p, pair), back) in picks.iter().zip(&backs) {
         let other = back.filter(|(x, y)| shell.is_some() && joined(*x, *y));
