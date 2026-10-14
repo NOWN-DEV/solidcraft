@@ -6,7 +6,7 @@
 //! solidcraft-cli script <design.solidcraft> [--out script.json]     the design's history as a command script
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] loading timings as JSON lines
 //! solidcraft-cli bench-agent [--scale F] [--save F] [--script-out F] a ~1,300-body design built command by command, timed
-//! solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|top|…]
+//! solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|top|…|NAME | --camera JSON] [--no-grid] [--no-axes]
 //! solidcraft-cli exec <command> [json-params]                 run one command on an empty design
 //! solidcraft-cli commands                                     the command registry as JSON
 //! solidcraft-cli recipe <recipe.json>                         translate an oracle recipe to a script
@@ -34,7 +34,8 @@ use serde_json::{Value, json};
 mod app_icon;
 
 use solidcraft_engine::Session;
-use solidcraft_engine::render::{StandardView, render_png};
+use solidcraft_engine::render::render_png;
+use solidcraft_engine::view::Guides;
 
 const USAGE: &str = "usage:
   solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--json-out FILE] [--allow-errors]
@@ -47,7 +48,10 @@ const USAGE: &str = "usage:
       (the design's history as a command script that eval and run replay)
   solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]
   solidcraft-cli bench-agent [--scale F] [--save design.solidcraft] [--script-out script.json]
-  solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|back|top|bottom|left|right]
+  solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view NAME | --camera JSON] [--no-grid] [--no-axes]
+      (--view: iso, front, back, top, bottom, left, right, or the name of a view saved in the design with view.save;
+       --camera: {target: [x,y,z], yaw, pitch, distance, fov?} in mm and radians, as the MCP screenshot takes it (docs/mcp.md);
+       --no-grid and --no-axes leave the ground grid (on Z 0) and the origin's axes out of the picture)
   solidcraft-cli render <script|design> --out image.png [--setup NAME] [--width W] [--height H] [--transparent] [--overwrite] [--timeout SECONDS]
   solidcraft-cli exec <command> [json-params]
   solidcraft-cli commands
@@ -308,12 +312,25 @@ fn cmd_snapshot(args: &[String]) -> Result<(), String> {
     let out = flag(args, "--out").ok_or("snapshot needs --out FILE.png")?;
     let w = flag(args, "--width").and_then(|x| x.parse().ok()).unwrap_or(1280usize);
     let h = flag(args, "--height").and_then(|x| x.parse().ok()).unwrap_or(800usize);
-    let s = load(path)?;
-    let mut cam = solidcraft_engine::view::home_camera(&s);
-    if let Some(v) = flag(args, "--view") {
-        cam.set_view(StandardView::parse(v).ok_or_else(|| format!("unknown view `{v}`"))?);
+    let mut s = load(path)?;
+    // The camera choices of the MCP `screenshot`, through the same command (`view.apply`): a
+    // standard view, a view saved in the design, or an explicit camera. A script that applies a
+    // view itself sets the camera too; without any, the iso view framing the model.
+    match (flag(args, "--view"), flag(args, "--camera")) {
+        (Some(_), Some(_)) => return Err("snapshot: give --view or --camera, not both".into()),
+        (Some(v), None) => {
+            let hint = "standard views: iso, front, back, top, bottom, left, right";
+            s.execute("view.apply", &json!({"view": v})).map_err(|e| format!("--view {v}: {e} ({hint}; or a view saved with view.save)"))?;
+        }
+        (None, Some(c)) => {
+            let camera: Value = serde_json::from_str(c).map_err(|e| format!("--camera: not JSON: {e}"))?;
+            s.execute("view.apply", &json!({"camera": camera})).map_err(|e| format!("--camera: {e}"))?;
+        }
+        (None, None) => {}
     }
-    let scene = solidcraft_engine::view::scene(&s, &cam);
+    let cam = s.camera.unwrap_or_else(|| solidcraft_engine::view::home_camera(&s));
+    let guides = Guides { grid: !args.iter().any(|a| a == "--no-grid"), axes: !args.iter().any(|a| a == "--no-axes") };
+    let scene = solidcraft_engine::view::scene_with_guides(&s, &cam, s.section, guides);
     let png = render_png(&scene, &cam, w, h).ok_or("render failed")?;
     std::fs::write(out, &png).map_err(|e| format!("{out}: {e}"))?;
     println!("{}", pretty(&json!({"path": out, "width": w, "height": h, "bytes": png.len()})));
