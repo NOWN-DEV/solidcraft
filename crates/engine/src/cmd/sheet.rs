@@ -20,6 +20,9 @@ pub static COMMANDS: &[CommandSpec] = &[
          position?: inside|outside|middle, flip?, body?; type?: base|edge|contour (default from the inputs); name?, body_name? (the new body). \
          Thickness, K-factor and bend radius come from the rule (sheet.manage_rules); passing them here is refused",
     ),
+    CommandSpec::new("sheet.perforate", "Perforate", perforate).at("SHEET METAL", "CREATE").icon("hem").params(
+        "diameter, pitch: expr; margin?: expr (clear of edges, cut-outs and bends; default: the diameter); pattern?: staggered (60°, default) | square; body? - a perforation field over the whole flat sheet: holes in the flat pattern (perforations), the DXF (layer PERFORATION) and the measured volume, not cut into the B-rep (#732)",
+    ),
     CommandSpec::new("sheet.hem", "Hem", hem)
         .at("SHEET METAL", "CREATE")
         .icon("hem")
@@ -184,6 +187,23 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
         }
         other => Err(bad(cmd, format!("unknown flange type `{other}` (base, edge or contour)"))),
     }
+}
+
+fn perforate(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sheet.perforate";
+    let diameter = req_expr(cmd, p, "diameter")?;
+    check_expr(s, &diameter, Kind::Length, cmd, "diameter")?;
+    let pitch = req_expr(cmd, p, "pitch")?;
+    check_expr(s, &pitch, Kind::Length, cmd, "pitch")?;
+    let margin = expr(p, "margin");
+    if let Some(m) = &margin {
+        check_expr(s, m, Kind::Length, cmd, "margin")?;
+    }
+    let pattern = str_(p, "pattern").map(str::to_string);
+    if pattern.as_deref().is_some_and(|t| t != "staggered" && t != "square") {
+        return Err(bad(cmd, "`pattern` is \"staggered\" (60°, default) or \"square\""));
+    }
+    add_feature(s, p, FeatureKind::SheetPerforate { diameter, pitch, margin, pattern, body: str_(p, "body").map(str::to_string) })
 }
 
 fn hem(s: &mut Session, p: &Value) -> Result<Value> {
@@ -436,9 +456,34 @@ fn flat_json(sh: &SheetBody) -> Result<Value> {
             "side": side, "depth_mm": p.z1-p.z0, "z0_mm": p.z0, "z1_mm": p.z1})
         })
         .collect();
-    Ok(
-        json!({"body": sh.body, "rule": sh.rule, "thickness": sh.t, "k_factor": sh.k, "flat_size_mm": [w, h, sh.t], "outline": outline, "cutouts": holes, "cutout_shapes": hole_shapes, "pockets": pockets, "bends": bends, "unfolded": sh.flat}),
-    )
+    // Holes drilled along a panel into its rim: drilled after cutting, not in the outline.
+    let bores: Vec<Value> = sh
+        .bores
+        .iter()
+        .map(|b| json!({"start": [b.base.x, b.base.y, b.base.z], "axis": [b.axis.x, b.axis.y, b.axis.z], "diameter": b.radius * 2.0, "length": b.height.abs()}))
+        .collect();
+    let mut perforations = Vec::new();
+    for p in &sh.perforations {
+        let n = sh.perforation_holes(p)?.len();
+        perforations.push(json!({"feature": p.feature, "diameter": p.diameter, "pitch": p.pitch, "margin": p.margin,
+            "pattern": if p.square { "square" } else { "staggered" }, "count": n,
+            "open_area_mm2": n as f64 * std::f64::consts::PI * (p.diameter / 2.0).powi(2)}));
+    }
+    let bend_zones: Vec<Value> = sh
+        .bend_zones()
+        .iter()
+        .map(|z| {
+            let pts = z.outer.polyline(1e-3);
+            let f = |g: fn(&Vec2) -> f64, m: fn(f64, f64) -> f64, s: f64| pts.iter().map(g).fold(s, m);
+            json!([f(|p| p.x, f64::min, f64::MAX), f(|p| p.x, f64::max, f64::MIN), f(|p| p.y, f64::min, f64::MAX), f(|p| p.y, f64::max, f64::MIN)])
+        })
+        .collect();
+    let mut out = json!({"body": sh.body, "rule": sh.rule, "thickness": sh.t, "k_factor": sh.k, "flat_size_mm": [w, h, sh.t], "outline": outline, "cutouts": holes, "cutout_shapes": hole_shapes, "pockets": pockets, "bends": bends, "unfolded": sh.flat,
+        "perforations": perforations, "bend_zones": bend_zones});
+    if !bores.is_empty() {
+        out["bores"] = Value::Array(bores);
+    }
+    Ok(out)
 }
 
 fn flat_pattern(s: &mut Session, p: &Value) -> Result<Value> {
@@ -475,6 +520,17 @@ pub fn flat_dxf(sh: &SheetBody, curves: DxfCurves) -> Result<String> {
     let mut layers = std::collections::BTreeSet::from(["OUTLINE".to_string(), "BEND_UP".to_string(), "BEND_DOWN".to_string()]);
     for p in &pockets {
         layers.insert(pocket_layer(p));
+    }
+    let perforation: Vec<(Vec2, f64)> = sh
+        .perforations
+        .iter()
+        .map(|p| sh.perforation_holes(p).map(|h| h.into_iter().map(|c| (c, p.diameter / 2.0)).collect::<Vec<_>>()))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    if !perforation.is_empty() {
+        layers.insert("PERFORATION".to_string());
     }
     let layers: Vec<DxfLayer> = layers
         .into_iter()
@@ -517,6 +573,9 @@ pub fn flat_dxf(sh: &SheetBody, curves: DxfCurves) -> Result<String> {
     }
     for b in sh.bends() {
         entities.push(DxfEntity { layer: if b.up { "BEND_UP" } else { "BEND_DOWN" }.into(), shape: DxfShape::Line(b.start, b.end) });
+    }
+    for (c, r) in perforation {
+        entities.push(DxfEntity { layer: "PERFORATION".into(), shape: DxfShape::Circle { c, r } });
     }
     Ok(solidcraft_io::write_dxf_drawing(&layers, &entities))
 }

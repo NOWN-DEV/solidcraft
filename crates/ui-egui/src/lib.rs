@@ -19,6 +19,7 @@ pub mod delete;
 pub mod dialogs;
 pub mod dialogs_appearance;
 pub mod dialogs_assembly;
+pub mod dialogs_library;
 pub mod dialogs_motion;
 pub mod dialogs_move;
 pub mod dialogs_parts;
@@ -35,6 +36,8 @@ pub mod frame;
 pub mod gizmo;
 pub mod gpu;
 pub mod help;
+#[cfg(test)]
+mod hole_direction_ui_tests;
 #[cfg(test)]
 mod hole_placement_ui_tests;
 pub mod home;
@@ -111,6 +114,8 @@ mod sketch_drag_ui_tests;
 #[cfg(test)]
 mod sketch_edit_tests;
 mod sketch_families;
+#[cfg(test)]
+mod sketch_guidance_ui_tests;
 pub mod sketch_modify_ui;
 #[cfg(test)]
 mod sketch_modify_ui_tests;
@@ -121,12 +126,15 @@ mod sketch_text_move;
 pub mod sketch_tools;
 pub mod stand_up;
 pub mod theme;
+#[cfg(test)]
+mod thin_extrude_tests;
 pub mod timeline;
 pub mod timeline_left;
 pub mod titlebar;
 pub mod toolbar;
 pub mod toolbar_custom;
 pub mod tools;
+pub mod update;
 pub mod viewport;
 mod viewport_layout;
 pub mod workspace;
@@ -208,6 +216,10 @@ pub struct Services {
     pub show_in_folder: Option<Box<dyn Fn(&str)>>,
     /// Where the host reads the anti-aliasing preference at start (a small JSON file).
     pub graphics_path: Option<String>,
+    /// HTTPS GET for the update check (`update`); None: never check (browser, tests).
+    pub http_get: Option<update::HttpGet>,
+    /// HTTPS download to a file, with progress, for one-click updates (`update::install`).
+    pub http_download: Option<update::install::HttpDownload>,
 }
 
 pub struct SolveApp {
@@ -244,6 +256,8 @@ pub struct SolveApp {
     pub issue_report: issue_report::ReportState,
     /// The Crash Reports window.
     pub crashes: crash_ui::CrashUi,
+    /// The update check and its window (`update`).
+    pub updater: update::Updater,
     /// Toolbar buttons the user pinned, removed or reordered.
     pub toolbar_custom: toolbar_custom::ToolbarCustom,
     pub sketch_choices: sketch_families::Choices,
@@ -296,6 +310,9 @@ pub struct SolveApp {
     pub file_load: file_load::FileLoad,
     /// The other open designs (tabs).
     pub docs: documents::Documents,
+    /// The language the installed font fallback chain is ordered for (`fonts::fallback_order`);
+    /// changing `preferences.language` re-installs the fonts on the next frame.
+    applied_fonts_language: String,
 }
 
 impl SolveApp {
@@ -321,6 +338,7 @@ impl SolveApp {
             help: help::HelpState::default(),
             issue_report: issue_report::ReportState::default(),
             crashes: crash_ui::CrashUi::default(),
+            updater: update::Updater::default(),
             toolbar_custom: toolbar_custom::ToolbarCustom::default(),
             sketch_choices: sketch_families::Choices::default(),
             preferences: prefs::Prefs::default(),
@@ -354,6 +372,7 @@ impl SolveApp {
             home: home::HomeState::default(),
             file_load: file_load::FileLoad::default(),
             docs: documents::Documents::default(),
+            applied_fonts_language: "en".into(),
         }
     }
 
@@ -1021,6 +1040,7 @@ impl SolveApp {
             toolbar::shortcuts(self, ctx);
         }
         recovery_ui::tick(self);
+        update::tick(self, ctx);
         if self.issue_report.draft.is_none() {
             for f in ctx.input(|i| i.raw.dropped_files.clone()) {
                 let p = f.path().to_string_lossy().to_string();
@@ -1062,6 +1082,10 @@ impl SolveApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         expression_complete::begin_frame(ui.ctx());
         let t0 = now_ms();
+        if self.preferences.language != self.applied_fonts_language {
+            self.applied_fonts_language.clone_from(&self.preferences.language);
+            crate::fonts::setup_fonts_for(ui.ctx(), &self.preferences.language);
+        }
         let _language = crate::i18n::scope(&self.preferences.language);
         let mut report_input = None;
         issue_report::CadInput::block(self, ui, &mut report_input);
@@ -1080,6 +1104,7 @@ impl SolveApp {
         issue_report::CadInput::block(self, ui, report_input);
         file_load::show(self, ui.ctx());
         documents::prompt(self, ui.ctx());
+        update::show(self, ui.ctx());
         if self.home.open {
             home::show(self, ui);
             if self.home.open {

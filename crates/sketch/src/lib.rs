@@ -33,6 +33,7 @@ mod profiles;
 mod shape;
 mod solver;
 mod text;
+mod thin;
 mod union_find;
 mod wire;
 
@@ -45,7 +46,9 @@ pub use dims::{DimFrame, DimLayout, chain_centres, default_text, dim_frame, dim_
 pub use fonts::{DEFAULT_FONT_FAMILY, FontData, families_in, find_style_in, font_data, font_data_styled, font_file_path, installed_families};
 pub use freeform_offset::{FreeformOffset, OFFSET_TOLERANCE};
 pub use link::{Link, LinkGeom, LinkKind, LinkSource, MAX_LINK_ENTITIES, SKETCH_AXIS_HALF, sketch_axis_geom};
-pub use model::{Constraint, ConstraintKind, Curve, CurveKind, MAX_CONSTRAINTS, MAX_CURVES, MAX_POINTS, SPoint, Sketch, SketchError, SketchView};
+pub use model::{
+    Constraint, ConstraintKind, Curve, CurveKind, MAX_CONSTRAINTS, MAX_COORD, MAX_CURVES, MAX_POINTS, SPoint, Sketch, SketchError, SketchView,
+};
 pub use offset::OffsetChain;
 pub use offset_topology::{OffsetCreated, OffsetRole, OffsetRoleFlags, OffsetRoleKind, OffsetTopology};
 pub use periodic::periodic_beziers;
@@ -59,6 +62,7 @@ pub use solver::{
     solve_after_edit, solve_after_value_edit, solve_holding, solve_with,
 };
 pub use text::{MAX_TEXT_CHARS, TextAlign, TextStyle, text_geometry, text_geometry_in, text_geometry_styled};
+pub use thin::{MAX_THIN_SEGMENTS, thin_wall_regions};
 pub use wire::{MAX_FIT_POINTS, MAX_WIRE_POINTS, Wire, WireSpace, fit_polyline};
 
 #[cfg(test)]
@@ -71,6 +75,8 @@ mod continuation_tests;
 mod font_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod thin_tests;
 
 #[cfg(test)]
 mod virtual_corner_tests;

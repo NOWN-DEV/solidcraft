@@ -179,9 +179,13 @@ pub struct AccessMap {
     pub scale: f32,
 }
 
+/// Vertices (or line instances) on the GPU, in as many buffers as the device's buffer size
+/// limit needs: a large import's triangles can exceed one buffer (#883).
 struct Batch {
-    buffer: wgpu::Buffer,
-    count: u32,
+    /// Each buffer and its vertex (instance) count.
+    parts: Vec<(wgpu::Buffer, u32)>,
+    /// Bytes per buffer (all but the last are full).
+    chunk: usize,
 }
 
 /// A chunk of planned bodies on the GPU: their evaluated mesh and a colour per vertex.
@@ -289,8 +293,8 @@ impl Batches {
                 let faces = mesh.vertex_face.get(part.vertices.start as usize..part.vertices.end as usize).unwrap_or_default();
                 bytes.extend(faces.iter().flat_map(|f| b.face_colors.get(*f as usize).copied().unwrap_or(last)));
             }
-            if let Some(colors) = upload(device, "sc_planned_colors", &bytes, 4) {
-                out.push(PlannedDraw { mesh, colors: colors.buffer });
+            if let Some((colors, _)) = upload(device, "sc_planned_colors", &bytes, 4).and_then(|c| c.parts.into_iter().next()) {
+                out.push(PlannedDraw { mesh, colors });
             }
         }
         out
@@ -638,7 +642,7 @@ impl Resources {
             access_bgl,
             access_bind,
             access_version: 0,
-            tri_hl: pipeline("sc_tris_hl", "vs_tri", "fs_tri", tri_layout(), depth(wgpu::CompareFunction::LessEqual, false), alpha),
+            tri_hl: pipeline("sc_tris_hl", "vs_tri", "fs_tri", tri_layout(), highlight_depth(t.depth), alpha),
             trans: pipeline("sc_trans", "vs_tri", "fs_tri", tri_layout(), depth(wgpu::CompareFunction::LessEqual, false), alpha),
             glass_far: glass("sc_glass_far", wgpu::Face::Front),
             glass_near: glass("sc_glass_near", wgpu::Face::Back),
@@ -658,18 +662,50 @@ impl Resources {
     }
 }
 
+/// Depth state of faces lit over the model (hover, selection): tested, not written, and pulled a
+/// little toward the eye. They lie on the model's own faces, but the GPU evaluates a body's plan
+/// in f32 while the highlight's copy of the same triangles is evaluated on the CPU, so the two
+/// depths differ by rounding and an unbiased equal test lights the face in speckles and wedges.
+/// The bias is a few depth steps plus the face's own slope: far less than any real gap.
+fn highlight_depth(format: Option<wgpu::TextureFormat>) -> Option<wgpu::DepthStencilState> {
+    format.map(|format| wgpu::DepthStencilState {
+        format,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: Default::default(),
+        bias: HIGHLIGHT_BIAS,
+    })
+}
+
+/// See [`highlight_depth`]. Negative: toward the eye (depth grows away from it).
+const HIGHLIGHT_BIAS: wgpu::DepthBiasState = wgpu::DepthBiasState { constant: -8, slope_scale: -1.0, clamp: 0.0 };
+
 fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize) -> Option<Batch> {
     upload_with(device, label, bytes, stride, wgpu::BufferUsages::VERTEX)
 }
 
 fn upload_with(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage: wgpu::BufferUsages) -> Option<Batch> {
-    if bytes.len() < stride {
+    if bytes.len() < stride || stride == 0 {
         return None;
     }
-    Some(Batch {
-        buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage }),
-        count: u32::try_from(bytes.len() / stride).unwrap_or(0),
-    })
+    let chunk = buffer_chunk(stride, device.limits().max_buffer_size);
+    let parts = bytes
+        .chunks(chunk)
+        .filter(|part| part.len() >= stride)
+        .map(|part| {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: part, usage });
+            (buffer, u32::try_from(part.len() / stride).unwrap_or(0))
+        })
+        .collect();
+    Some(Batch { parts, chunk })
+}
+
+/// Bytes per GPU buffer for vertices of `stride` bytes: within the device's limit and a
+/// whole number of triangles and line pairs, so no primitive straddles two buffers.
+fn buffer_chunk(stride: usize, max_buffer_size: u64) -> usize {
+    let unit = stride.max(1) * 6;
+    let max = usize::try_from(max_buffer_size).unwrap_or(usize::MAX).min(1 << 30);
+    (max / unit).max(1) * unit
 }
 
 /// Triangles (3 vertices of `TRI_SIZE` bytes each, position first) ordered far to near along
@@ -691,8 +727,31 @@ impl Batches {
         let (Some(g), false) = (&self.glass, self.glass_cpu.is_empty()) else { return };
         let turned = self.glass_sorted_for.is_none_or(|s| s[0] * back[0] + s[1] * back[1] + s[2] * back[2] < 0.9994);
         if turned {
-            queue.write_buffer(&g.buffer, 0, &sort_back_to_front(&self.glass_cpu, back));
+            let sorted = sort_back_to_front(&self.glass_cpu, back);
+            for ((buffer, _), bytes) in g.parts.iter().zip(sorted.chunks(g.chunk.max(1))) {
+                queue.write_buffer(buffer, 0, bytes);
+            }
             self.glass_sorted_for = Some(back);
+        }
+    }
+}
+
+/// The tessellation pipeline (`shader`: its source), where display plans are evaluated: on a
+/// device that runs compute shaders with the storage buffers the evaluation binds (not WebGL2)
+/// and builds the pipeline. Elsewhere `None`, and bodies are built on the CPU: a device whose
+/// shader compiler rejects the shader (D3D12's FXC once did) only loses GPU evaluation.
+fn tessellation(adapter: &wgpu::Adapter, device: &wgpu::Device, queue: &wgpu::Queue, shader: &str) -> Option<solidcraft_gpu::TessGpu> {
+    let compute = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        && device.limits().max_storage_buffers_per_shader_stage >= 4;
+    if !compute {
+        return None;
+    }
+    let info = adapter.get_info();
+    match solidcraft_gpu::TessGpu::with_shader(info.name.clone(), device.clone(), queue.clone(), shader) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log::warn!("bodies are built on the CPU on {} ({:?}): {e}", info.name, info.backend);
+            None
         }
     }
 }
@@ -700,11 +759,7 @@ impl Batches {
 /// Create the pipelines. Call once with the app's render state and its depth/stencil/MSAA
 /// settings. Without a stencil the section cap does not hide the inside of cut bodies.
 pub fn install(rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) -> GpuTarget {
-    // Display plans are evaluated where the device runs compute shaders with the storage
-    // buffers the evaluation binds (not WebGL2): elsewhere bodies are built on the CPU.
-    let compute = rs.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-        && rs.device.limits().max_storage_buffers_per_shader_stage >= 4;
-    let tess = compute.then(|| solidcraft_gpu::TessGpu::new(rs.adapter.get_info().name, rs.device.clone(), rs.queue.clone()));
+    let tess = tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER);
     let t = GpuTarget { format: rs.target_format, depth: egui_wgpu::depth_format_from_bits(depth_bits, stencil_bits), samples, tess: tess.is_some() };
     let res = Resources::new(&rs.device, t, tess);
     rs.renderer.write().callback_resources.insert(res);
@@ -796,15 +851,19 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         let tris = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, b: &Option<Batch>| {
             if let Some(b) = b {
                 pass.set_pipeline(p);
-                pass.set_vertex_buffer(0, b.buffer.slice(..));
-                pass.draw(0..b.count, 0..1);
+                for (buffer, count) in &b.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
         };
         let lines = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, b: &Option<Batch>| {
             if let Some(b) = b {
                 pass.set_pipeline(p);
-                pass.set_vertex_buffer(0, b.buffer.slice(..));
-                pass.draw(0..6, 0..b.count);
+                for (buffer, count) in &b.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..6, 0..*count);
+                }
             }
         };
         let (m, sk, h, pv) = (&res.model, &res.sketch, &res.highlight, &res.preview);
@@ -848,8 +907,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             if let Some((_, bind)) = res.textures.get(id) {
                 pass.set_pipeline(&res.image);
                 pass.set_bind_group(1, bind, &[]);
-                pass.set_vertex_buffer(0, q.buffer.slice(..));
-                pass.draw(0..q.count, 0..1);
+                for (buffer, count) in &q.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
         }
         tris(pass, &res.ghost, &pv.ghost);
@@ -867,19 +928,43 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
 /// Render `scene` offscreen on a device of its own, through the viewport's real resources and
 /// frame callback (`prepare`, then `paint`), and read the pixels back: straight RGBA, `size` ×
-/// `size`. `None` without a GPU adapter. With `tess`, planned bodies are evaluated on the GPU.
+/// `size`. `None` without a GPU adapter. With `tess` (the tessellation shader), planned bodies
+/// are evaluated on the GPU where the device builds that pipeline, as [`install`] sets it up.
+/// `highlight` is drawn as the viewport's highlight scene (hover and selection).
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) fn render_offscreen(scene: GpuScene, view_proj: [[f32; 4]; 4], back: [f32; 3], eye: [f32; 4], size: u32, tess: bool) -> Option<Vec<u8>> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+fn offscreen_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
         ..Default::default()
     }))
     .ok()?;
+    Some((adapter, device, queue))
+}
+
+/// Whether [`install`] would evaluate plans on the GPU with `shader`, on an offscreen device
+/// (`None` without a GPU adapter).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn offscreen_tessellates(shader: &str) -> Option<bool> {
+    let (adapter, device, queue) = offscreen_device()?;
+    Some(tessellation(&adapter, &device, &queue, shader).is_some())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn render_offscreen(
+    scene: GpuScene,
+    highlight: Option<GpuScene>,
+    view_proj: [[f32; 4]; 4],
+    back: [f32; 3],
+    eye: [f32; 4],
+    size: u32,
+    tess: Option<&str>,
+) -> Option<Vec<u8>> {
+    let (adapter, device, queue) = offscreen_device()?;
     let (format, depth) = (wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Depth24PlusStencil8);
-    let target = GpuTarget { format, depth: Some(depth), samples: 1, tess };
-    let compute = tess.then(|| solidcraft_gpu::TessGpu::new(adapter.get_info().name, device.clone(), queue.clone()));
+    let compute = tess.and_then(|shader| tessellation(&adapter, &device, &queue, shader));
+    let target = GpuTarget { format, depth: Some(depth), samples: 1, tess: compute.is_some() };
     let mut resources = egui_wgpu::CallbackResources::default();
     resources.insert(Resources::new(&device, target, compute));
     let none = || Arc::new(Mutex::new(None));
@@ -888,8 +973,8 @@ pub(crate) fn render_offscreen(scene: GpuScene, view_proj: [[f32; 4]; 4], back: 
         slot: Arc::new(Mutex::new(Some(scene))),
         sketch_key: 0,
         sketch_slot: none(),
-        hl_key: 0,
-        hl_slot: none(),
+        hl_key: u64::from(highlight.is_some()),
+        hl_slot: Arc::new(Mutex::new(highlight)),
         pv_key: 0,
         pv_slot: none(),
         view_proj,
@@ -1078,6 +1163,22 @@ mod tests {
 #[cfg(test)]
 mod glass_tests {
     use super::*;
+
+    /// A large import's triangles once went into one buffer past the device's limit (524 MB
+    /// against 256 MB) and the app crashed (#883): they are split into whole triangles.
+    #[test]
+    fn large_scenes_are_split_into_buffers_within_the_device_limit() {
+        let limit = 256u64 << 20;
+        for stride in [TRI_SIZE, LINE_SIZE, 4] {
+            let chunk = buffer_chunk(stride, limit);
+            assert!(chunk as u64 <= limit && chunk > limit as usize / 2);
+            assert_eq!(chunk % (stride * 3), 0, "whole triangles");
+            assert_eq!(chunk % (stride * 2), 0, "whole line pairs");
+        }
+        let scene = 524_434_680usize;
+        assert_eq!(scene.div_ceil(buffer_chunk(TRI_SIZE, limit)), 2);
+        assert!(buffer_chunk(TRI_SIZE, 1) >= TRI_SIZE * 6, "a tiny limit still holds one unit");
+    }
 
     #[test]
     fn glass_is_drawn_far_to_near() {
