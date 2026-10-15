@@ -223,6 +223,11 @@ impl<'a> Clearance<'a> {
                 return Ok(Reach::Exact);
             }
             let round = surf_of(f, self.tol * 100.0);
+            // A flat face stored otherwise (a revolve's end: a line swept round its axis) is
+            // a plane all the same: its triangles lie in it.
+            if matches!(round, Some(Surf::Plane { .. })) {
+                return Ok(Reach::Exact);
+            }
             let straight = matches!(round, Some(Surf::Cylinder { a, .. }) if a.dot(along).abs() > 1.0 - 1e-12)
                 || crate::prism::wall_along(&surface, along, self.tol * 10.0, &mut 262_144);
             Ok(if straight {

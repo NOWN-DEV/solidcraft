@@ -150,3 +150,27 @@ fn a_cut_ending_on_a_face_leaves_the_rib_beyond_it() {
     assert!(same(before - volume(&s, "Tee"), 100.0 * 100.0 * 10.0), "{}", before - volume(&s, "Tee"));
     assert!(has(&s, "Tee", [90.0, -100.0, 19.5]), "the rib under the window is cut");
 }
+
+/// A hole cut up through a ring from its flat underside (the reference case `60-pipe-flange`).
+/// The ring is revolved, so that face is a line swept round the axis, not a plane, but flat
+/// all the same: the tool still starts past it and the hole opens it, leaving no film of zero
+/// thickness over the hole (two discs of its area more surface).
+#[test]
+fn a_hole_from_a_revolved_rings_flat_side_opens_it() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Profile"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [25, 0], "p1": [75, -16]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"sketch": "Profile", "axis": {"origin": [0, 0, 0], "dir": [0, 0, 1]}, "angle": 360, "body_names": ["Ring"]}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Hole"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [60, 0], "radius": 7}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Hole", "through_all": true, "direction": "positive", "operation": "cut"}));
+    let pi = std::f64::consts::PI;
+    let ring = s.model.state().body("Ring").map(|b| solidcraft_kernel::measure(&b.body).unwrap()).unwrap();
+    let want = 2.0 * pi * (75.0 * 75.0 - 25.0 * 25.0 - 7.0 * 7.0) + 2.0 * pi * (75.0 + 25.0 + 7.0) * 16.0;
+    assert!((ring.area - want).abs() < 1e-3 * want, "area {} instead of {want}", ring.area);
+    let volume = pi * (75.0 * 75.0 - 25.0 * 25.0 - 7.0 * 7.0) * 16.0;
+    assert!((ring.volume / volume - 1.0).abs() < 1e-3, "volume {} instead of {volume}", ring.volume);
+    assert!(!has(&s, "Ring", [60.0, 0.0, 8.0]), "the hole is not cut");
+}
