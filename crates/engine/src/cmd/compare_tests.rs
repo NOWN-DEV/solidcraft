@@ -208,4 +208,5 @@ fn bad_parameters_are_refused() {
     assert_eq!(r["b"]["name"], "C");
     assert_eq!(r["only_in_a"]["regions"], 1, "{r}");
     assert!(close(f(&r["only_in_a"]["volume_mm3"]), 12_000.0 - 125.0, 0.01), "{r}");
+    assert!(r["verdict"].as_str().unwrap_or_default().starts_with("1 region differs by more than 0.01 mm"), "{}", r["verdict"]);
 }

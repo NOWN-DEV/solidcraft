@@ -15,7 +15,7 @@ use crate::{Result, Sel, Session};
 pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("inspect.compare", "Compare Bodies", compare_bodies).params(
     "a, b: body names (default: the two selected bodies, or the design's only two), in world placement; tolerance?: mm (0.001 to 10, default 0.01): \
      surfaces closer than this agree; spacing?: mm (default 0.5): the largest piece of a face sampled as one point, coarser for a body that would need \
-     more than max_points? (default 2 million, up to 50 million) samples; max_regions? (default 50); color?: true | {only_in_a?, only_in_b?: \"#rrggbb\"} \
+     more than max_points? (default 8 million, up to 50 million) samples; max_regions? (default 50); color?: true | {only_in_a?, only_in_b?: \"#rrggbb\"} \
      (colours the faces that hold a region, red where only a has material and green where only b has: the faces mostly beyond the tolerance, else the \
      one with the largest share; an undo step) → a, b: volume_mm3, area_mm2, center_of_mass, bbox; difference: b − a; \
      deviation: a_to_b, b_to_a (max_mm, mean_mm, at, area_beyond_mm2); regions, largest first: side (only_in_a | only_in_b), volume_mm3 (integrated along \
@@ -152,7 +152,7 @@ fn compare_bodies(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "inspect.compare";
     let tolerance = number(cmd, p, "tolerance", 0.01, 0.001..=10.0)?;
     let spacing = number(cmd, p, "spacing", 0.5, 0.01..=1000.0)?;
-    let max_points = number(cmd, p, "max_points", 2e6, 1e4..=5e7)? as usize;
+    let max_points = number(cmd, p, "max_points", 8e6, 1e4..=5e7)? as usize;
     let max_regions = number(cmd, p, "max_regions", 50.0, 1.0..=1000.0)? as usize;
     let colors = colours(cmd, p)?;
     let st = s.world_state();
@@ -218,9 +218,9 @@ fn compare_bodies(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         let more = if c.unlisted > 0 { format!(" (and {} more, not measured)", c.unlisted) } else { String::new() };
         format!(
-            "{} region{} differ by more than {tolerance} mm: {ca} with material only in `{na}` ({va:.3} mm³), {cb} only in `{nb}` ({vb:.3} mm³){more}",
+            "{} {} by more than {tolerance} mm: {ca} with material only in `{na}` ({va:.3} mm³), {cb} only in `{nb}` ({vb:.3} mm³){more}",
             c.regions.len(),
-            if c.regions.len() == 1 { "" } else { "s" }
+            if c.regions.len() == 1 { "region differs" } else { "regions differ" }
         )
     };
     if !warnings.is_empty() {

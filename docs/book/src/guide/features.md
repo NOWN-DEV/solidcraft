@@ -150,8 +150,8 @@ That is one undo step; without `color` the command changes nothing.
 
 The bodies are meshed within a quarter of the tolerance. The kernel meshes no finer than a
 millionth of a body's size, so keep the tolerance at least twice that (0.02 mm for a part 10 m
-across). Large bodies are sampled more coarsely, at about `max_points` (two million) points each
-at most; `sampling.spacing_mm` says what was used, and a larger `max_points` (up to 50 million)
+across). Large bodies are sampled more coarsely, at about `max_points` (eight million) points
+each; `sampling.spacing_mm` says what was used, and a larger `max_points` (up to 50 million)
 samples them finer, at the cost of time.
 
 ## Editing a feature from a script

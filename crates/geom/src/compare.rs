@@ -36,7 +36,8 @@ pub struct CompareOptions {
     /// The largest size of the pieces a triangle is sampled in (mm); raised when a mesh would
     /// need more than `max_points` samples.
     pub spacing: f64,
-    /// Sample points per mesh, about (the corners of a very fine mesh are sampled anyway).
+    /// Sample points per mesh, about (a mesh of more triangles than two thirds of this is
+    /// sampled once per triangle, at its centre and corners, anyway).
     pub max_points: usize,
     /// Lines through a region for its volume, at most.
     pub max_lines: usize,
@@ -47,7 +48,7 @@ pub struct CompareOptions {
 
 impl Default for CompareOptions {
     fn default() -> Self {
-        CompareOptions { tolerance: 0.01, spacing: 0.5, max_points: 2_000_000, max_lines: 40_000, max_regions: 50 }
+        CompareOptions { tolerance: 0.01, spacing: 0.5, max_points: 8_000_000, max_lines: 40_000, max_regions: 50 }
     }
 }
 
@@ -400,20 +401,56 @@ fn for_each_sample(t: &[Vec3; 3], h: f64, stack: &mut Vec<[Vec3; 3]>, mut f: imp
     }
 }
 
-/// The spacing at which `mesh` needs about `max` sample points (at least `want`).
+/// The spacing at which `mesh` needs about `max` sample points (at least `want`; a mesh whose
+/// triangles alone need more gets one piece per triangle).
 fn spacing_for(mesh: &Mesh, want: f64, max: usize) -> f64 {
     let tris: Vec<[Vec3; 3]> = mesh.triangles.iter().filter_map(|t| mesh.tri(t)).filter(|t| t.iter().all(|p| p.is_finite())).collect();
-    // A piece is sampled at its centre and (shared with its neighbours) about one corner.
-    let count = |h: f64| tris.iter().map(|t| 2.0 * pieces_estimate(t, h) + 1.0).sum::<f64>();
-    let fewest = 3.0 * tris.len() as f64;
+    // Every piece is sampled at its centre and its corners, each corner once: a triangulated
+    // surface has about half as many corners as triangles, so 1.5 samples a piece.
+    let fewest = 1.5 * tris.len() as f64;
     let max = max.max(1) as f64;
+    let coarser = |h: f64, total: f64| h * (total / max).sqrt() * 1.02;
     let mut h = if want.is_finite() && want > 0.0 { want } else { 1.0 };
+    // A spacing known to need too many, to close in on from above.
+    let mut over = None;
+    // First from the estimate, cheaply; then from the exact count, which the estimate can be
+    // a few times under (long thin triangles, the halving's steps).
     for _ in 0..40 {
-        let total = count(h);
+        let total = tris.iter().map(|t| 1.5 * pieces_estimate(t, h)).sum::<f64>();
         if total <= max || total <= fewest * 1.001 {
-            return h;
+            break;
         }
-        h *= (total / max).sqrt() * 1.02;
+        over = Some(h);
+        h = coarser(h, total);
+    }
+    let mut stack = Vec::new();
+    let mut count = |h: f64| {
+        let mut pieces = 0usize;
+        for t in &tris {
+            for_each_sample(t, h, &mut stack, |_, w| pieces += usize::from(w > 0.0));
+        }
+        1.5 * pieces as f64
+    };
+    let mut total = count(h);
+    for _ in 0..12 {
+        if total <= max || total <= fewest * 1.001 {
+            break;
+        }
+        over = Some(h);
+        h = coarser(h, total);
+        total = count(h);
+    }
+    // The count falls in steps (each halving doubles a triangle's pieces), so the last step may
+    // have gone a step too far: the finest spacing within the budget lies between.
+    if let Some(mut lo) = over.filter(|_| total <= max) {
+        for _ in 0..10 {
+            let mid = (lo * h).sqrt();
+            if count(mid) <= max {
+                h = mid;
+            } else {
+                lo = mid;
+            }
+        }
     }
     h
 }

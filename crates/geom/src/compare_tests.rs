@@ -113,6 +113,6 @@ fn a_tight_budget_coarsens_the_spacing() {
     let o = CompareOptions { max_points: 20_000, ..CompareOptions::default() };
     let c = compare(&a, &a, &o, &serial);
     assert!(c.spacing > 0.5, "{}", c.spacing);
-    assert!(c.a_to_b.points < 60_000, "{}", c.a_to_b.points);
+    assert!((5_000..=24_000).contains(&c.a_to_b.points), "{}", c.a_to_b.points);
     assert!(c.regions.is_empty());
 }
