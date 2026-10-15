@@ -191,6 +191,11 @@
 //!   A bend point can also lie on a bend modelled with its radius (a cylinder between two flat
 //!   faces tangent to it), which then is one bend at the two faces' virtual sharp with the
 //!   rule's radius; 0.11.0 found no edge there or refused the curved face.
+//!   Nothing new is saved for converted sheets' corners and bend ends, but a design converts as
+//!   the rule says when it is evaluated: corners between the walls take the rule's corner relief
+//!   and a bend ending beside more of the fixed face its bend relief (0.11.0 left every corner a
+//!   notch and cut no bend relief), and a wall on part of an edge bends only where it stands
+//!   (0.11.0 refused it).
 
 use serde_json::Value;
 
