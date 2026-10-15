@@ -212,6 +212,11 @@
 //!   parentheses (`2,5 mm` is `2.5 mm`, #1347; inside a function's parentheses the comma still
 //!   separates its arguments). Nothing new is saved, but an expression typed that way is saved as
 //!   typed; 0.12.0 asks for an update instead of failing to evaluate it.
+//!   Also under 22, a sketch text's link source can say that its place, height or angle are
+//!   expressions (`exprs`: `x`, `y`, `height`, `angle`, each an expression over the design's
+//!   parameters); the source's `at`, `height` and `angle` then hold the numbers they last came
+//!   to. A text without `exprs` is set as it always was; 0.12.0 asks for an update instead of
+//!   dropping the expressions and keeping the text at its last numbers.
 
 use serde_json::Value;
 
