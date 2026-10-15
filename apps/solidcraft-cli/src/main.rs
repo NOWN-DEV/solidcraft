@@ -336,6 +336,9 @@ fn cmd_script(args: &[String]) -> Result<(), String> {
 
 fn cmd_snapshot(args: &[String]) -> Result<(), String> {
     known_flags("snapshot", args, &["--in", "--out", "--width", "--height", "--view", "--camera"], &["--no-grid", "--no-axes"])?;
+    if positional(args).is_none() && flag(args, "--in").is_none() {
+        return Err(USAGE.to_string());
+    }
     let out = flag(args, "--out").ok_or("snapshot needs --out FILE.png")?;
     let size = |name: &str, default: usize| match flag(args, name) {
         None => Ok(default),
