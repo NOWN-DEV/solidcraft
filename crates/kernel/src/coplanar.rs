@@ -85,6 +85,19 @@ pub(crate) fn push_faces(b: &Body, n: Vec3, d: f64, delta: f64) -> Result<Body> 
 }
 
 pub(crate) fn push_faces_exact(b: &Body, n: Vec3, d: f64, delta: f64) -> Result<Body> {
+    push_exact(b, n, d, delta, None)
+}
+
+/// [`push_faces_exact`] of face `face` of `b` alone (by its place in the face order), which lies
+/// in the plane (n, d): the other faces in that plane stay where they are. Its neighbours must
+/// stand square to it, as there: a face beside it in the plane would keep its place along an
+/// edge that moves.
+pub(crate) fn push_face_exact(b: &Body, face: usize, n: Vec3, d: f64, delta: f64) -> Result<Body> {
+    push_exact(b, n, d, delta, Some(face))
+}
+
+/// [`push_faces_exact`]: of the faces in the plane, `only` that one where it is given.
+fn push_exact(b: &Body, n: Vec3, d: f64, delta: f64, only: Option<usize>) -> Result<Body> {
     let size = b.size();
     let tol = (size * 1e-7).max(1e-9);
     let fail = |m: &str| KernelError::Failed(format!("pushing a face: {m}"));
@@ -93,6 +106,7 @@ pub(crate) fn push_faces_exact(b: &Body, n: Vec3, d: f64, delta: f64) -> Result<
         // The copy's edges are b's, in order; the faces come out in place, one for one.
         let mut edge_origins = record::edge_origins(&solid, 0);
         let mut faces_from = Vec::new();
+        let mut moved = false;
         let shift = n * delta;
         let mat = mt::Matrix4::from_translation(v3(shift));
         let mut shells = Vec::new();
@@ -106,8 +120,10 @@ pub(crate) fn push_faces_exact(b: &Body, n: Vec3, d: f64, delta: f64) -> Result<
                 }
                 _ => false,
             };
-            let moving: Vec<usize> = (0..faces.len()).filter(|i| faces.get(*i).is_some_and(on_plane)).collect();
             let first = faces_from.len();
+            let moving: Vec<usize> =
+                (0..faces.len()).filter(|i| only.is_none_or(|o| o == first + i) && faces.get(*i).is_some_and(on_plane)).collect();
+            moved |= !moving.is_empty();
             if moving.is_empty() {
                 faces_from.extend((first..first + faces.len()).map(|i| record::from_face(0, i, Change::Kept)));
                 shells.push(sh.clone());
@@ -234,6 +250,9 @@ pub(crate) fn push_faces_exact(b: &Body, n: Vec3, d: f64, delta: f64) -> Result<
                 out.push(nf);
             }
             shells.push(out.into());
+        }
+        if only.is_some() && !moved {
+            return Err(fail("the face is not in the plane"));
         }
         let s = Solid::try_new(shells).map_err(|e| fail(&e.to_string()))?;
         record::build(s, &record::counts(&[b]), Some(faces_from), Some(&edge_origins))

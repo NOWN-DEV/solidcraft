@@ -14,8 +14,12 @@ use truck_modeling as mt;
 use crate::body::{Body, from_p3};
 use crate::{BoolOp, KernelError, Result};
 
+#[path = "prism_face_cut.rs"]
+mod face_cut;
 #[path = "prism_lineage.rs"]
 mod lineage;
+
+pub(crate) use face_cut::cut_by_face_extrusion;
 
 const MAX_PLANAR_SEGMENTS: usize = 8192;
 const MAX_PLANAR_EVENTS: usize = 131_072;

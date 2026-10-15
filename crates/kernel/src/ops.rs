@@ -512,6 +512,18 @@ fn boolean_whole(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
             return Ok(Some(body.clone()));
         }
     }
+    // A cut by a planar face's own extrusion (Extrude Cut from a whole face) on a body that is no
+    // prism (a chamfer or a round elsewhere on it): the tool's walls lie on the face's neighbours,
+    // and on rounded ones every try below fails (#1275). The face moves in by the tool's depth
+    // instead, exactly, before either body is meshed.
+    if op == BoolOp::Cut
+        && let Some(body) = crate::prism::cut_by_face_extrusion(a, b)
+    {
+        let (va0, vb0) = (volume(a), volume(b));
+        if plausible(volume(&body), op, va0, vb0, 2e-3 * (va0 + vb0) + 1e-9) {
+            return Ok(Some(body));
+        }
+    }
     let meshes = (a.tessellate_with(tol_m, true).ok(), b.tessellate_with(tol_m, true).ok());
     let (va, vb) = match &meshes {
         (Some(ma), Some(mb)) => (ma.measure().volume, mb.measure().volume),

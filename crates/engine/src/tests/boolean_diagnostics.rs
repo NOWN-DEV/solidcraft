@@ -82,3 +82,49 @@ fn a_barrel_joined_between_the_sides_of_a_leaf_needs_no_retry() {
     let actual = plate.tessellate(1e-4).unwrap().measure().volume;
     assert!(rel(actual, expected) < 1e-5, "{actual} vs {expected}");
 }
+
+/// Extrude Cut from a whole face after a chamfer or a round around the bottom of a body with
+/// rounded corners (#1275, the issue's script): a rounded square 40 × 40, radius 8, 20 high, its
+/// top face cut 5 down. The cut's walls lie on the body's walls and corner cylinders; it failed
+/// after every retry ("boolean Cut: the operation failed: no result"). The top moves down
+/// instead, with no retry: the body keeps the rounded square's section up to z = 15, and every
+/// edge ends at the level of its bottom, its blend or its new top.
+#[test]
+fn a_whole_face_cut_after_a_bottom_blend_lowers_the_face() {
+    let outline = 1600. - (4. - PI) * 64.;
+    // What the 2 mm blend takes along the four 24 mm sides, and turned a quarter about each
+    // corner's axis (Pappus): the chamfer's triangle of area 2, its centroid (8 + 8 + 6) / 3 from
+    // the axis; the round's region of area 4 − π, its centroid 2 (10 − 3π) / (3 (4 − π)) in from
+    // the wall.
+    let chamfer = 2. * 96. + 2. * 2. * PI * 22. / 3.;
+    let round = (4. - PI) * (96. + 2. * PI * (8. - 2. * (10. - 3. * PI) / (3. * (4. - PI))));
+    let edges =
+        json!([[20, 0, 0], [40, 20, 0], [20, 40, 0], [0, 20, 0], [2.343, 2.343, 0], [37.657, 2.343, 0], [37.657, 37.657, 0], [2.343, 37.657, 0]]);
+    for (blend, params, takes) in
+        [("solid.chamfer", json!({"distance": 2, "edges": edges}), chamfer), ("solid.fillet", json!({"radius": 2, "edges": edges}), round)]
+    {
+        let mut session = Session::default();
+        run(&mut session, "sketch.create", json!({"plane": "XY"}));
+        run(&mut session, "sketch.rectangle.rounded", json!({"p0": [0, 0], "p1": [40, 40], "radius": 8}));
+        run(&mut session, "sketch.finish", json!({}));
+        run(&mut session, "solid.extrude", json!({"distance": 20, "operation": "new"}));
+        run(&mut session, blend, params);
+        let reply = run(&mut session, "solid.extrude", json!({"face": [20, 20, 20], "distance": -5, "operation": "cut"}));
+        assert!(reply["warning"].is_null(), "{blend}: {reply}");
+        let result = session.model.result(reply["feature"].as_u64().unwrap()).unwrap();
+        assert!(result.boolean_diagnostics.events.is_empty(), "{blend}: {:?}", result.boolean_diagnostics);
+        let state = session.model.state();
+        let body = &state.body("Body1").unwrap().body;
+        assert_eq!(body.shell_count(), 1, "{blend}");
+        assert!(body.validity().is_empty(), "{blend}: {:?}", body.validity());
+        for edge in body.edges(1e-3).unwrap() {
+            for p in [edge.points.first(), edge.points.last()].into_iter().flatten() {
+                assert!([0., 2., 15.].iter().any(|z| (p.z - z).abs() < 1e-9), "{blend}: an edge ends at {p:?}");
+            }
+        }
+        // Measured on a mesh, whose chords along the curved walls take a few hundredths of a mm³.
+        let expected = outline * 15. - takes;
+        let actual = body.tessellate(1e-4).unwrap().measure().volume;
+        assert!(rel(actual, expected) < 2e-6, "{blend}: {actual} vs {expected}");
+    }
+}
