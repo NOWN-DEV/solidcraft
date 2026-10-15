@@ -542,7 +542,7 @@ pub fn flat_dxf(sh: &SheetBody, curves: DxfCurves) -> Result<String> {
                 "BEND_DOWN" => 5,
                 _ => 3,
             };
-            DxfLayer { name, color }
+            DxfLayer::new(name, color)
         })
         .collect();
     let mut loops: Vec<_> = regions.iter().flat_map(|r| std::iter::once(&r.outer).chain(&r.holes)).map(|lp| (lp, "OUTLINE".to_string())).collect();
