@@ -229,15 +229,15 @@
 //!   transformation: a link without `coupling` is a plain motion link, as it always was; 0.13.0
 //!   (which reads up to 22) asks for an update instead of keeping a gear's ratio when its radius
 //!   changes.
+//!   Also under 23, an Import's `file` can name a FreeCAD `.FCStd` or Rhino `.3dm` file (#1435,
+//!   read through cadmpeg); its `step` is still the STEP text the file was restated as, so the
+//!   feature's fields are unchanged and version 22 designs need no transformation; 0.13.x asks
+//!   for an update before it meets these imports.
 //! - 24: an Edge Flange feature can choose its own corner relief (`corner_relief_shape`: notch,
 //!   round, rectangular or tear, and `corner_relief`, the size across), for the corners its
 //!   flanges make. Version 23 designs need no transformation: a feature without them follows the
 //!   sheet metal rule, as it always did, and saves as before; 0.13.0 (which reads up to 22) asks
 //!   for an update instead of silently building the rule's relief where a design asks for another.
-//!   Also under 23, an Import's `file` can name a FreeCAD `.FCStd` or Rhino `.3dm` file (#1435,
-//!   read through cadmpeg); its `step` is still the STEP text the file was restated as, so the
-//!   feature's fields are unchanged and version 22 designs need no transformation; 0.13.x asks
-//!   for an update before it meets these imports.
 
 use serde_json::Value;
 
