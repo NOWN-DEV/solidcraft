@@ -222,18 +222,18 @@
 //!   parameters); the source's `at`, `height` and `angle` then hold the numbers they last came
 //!   to. A text without `exprs` is set as it always was; 0.12.0 asks for an update instead of
 //!   dropping the expressions and keeping the text at its last numbers.
-//!   Also under 22, an Edge Flange feature can choose its own corner relief
-//!   (`corner_relief_shape`: notch, round, rectangular or tear, and `corner_relief`, the size
-//!   across), for the corners its flanges make. A feature without them follows the sheet metal
-//!   rule, as it always did, and saves as before; 0.12.0 asks for an update instead of silently
-//!   building the rule's relief where a design asks for another.
+//! - 23: an Edge Flange feature can choose its own corner relief (`corner_relief_shape`: notch,
+//!   round, rectangular or tear, and `corner_relief`, the size across), for the corners its
+//!   flanges make. Version 22 designs need no transformation: a feature without them follows the
+//!   sheet metal rule, as it always did, and saves as before; 0.13.0 (which reads up to 22) asks
+//!   for an update instead of silently building the rule's relief where a design asks for another.
 
 use serde_json::Value;
 
 use crate::{DocError, Document, Result};
 
 /// The format this build writes.
-pub const FORMAT: u32 = 22;
+pub const FORMAT: u32 = 23;
 
 pub fn format_string(n: u32) -> String {
     format!("solidcraft/{n}")
@@ -250,7 +250,7 @@ pub fn version_of(s: &str) -> Option<u32> {
 
 /// JSON-level upgrades: entry `i` turns format `i + 1` into `i + 2`.
 type JsonStep = fn(&mut Value) -> Result<()>;
-const JSON_STEPS: [JsonStep; 21] = [
+const JSON_STEPS: [JsonStep; 22] = [
     |_| Ok(()),
     v2_to_v3,
     v3_to_v4,
@@ -264,6 +264,7 @@ const JSON_STEPS: [JsonStep; 21] = [
     |_| Ok(()),
     |_| Ok(()),
     v13_to_v14,
+    |_| Ok(()),
     |_| Ok(()),
     |_| Ok(()),
     |_| Ok(()),
@@ -1004,10 +1005,10 @@ fn normalise(d: &mut Document) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 22 added the corner relief of an edge flange: a no-op step carries a 21 design up, a flange
-    /// without a relief of its own saves as before, and one with it is saved under 22 and kept.
+    /// 23 added the corner relief of an edge flange: a no-op step carries a 22 design up, a flange
+    /// without a relief of its own saves as before, and one with it is saved under 23 and kept.
     #[test]
-    fn version_twenty_one_designs_open_and_an_edge_flange_relief_is_saved_in_twenty_two() {
+    fn version_twenty_two_designs_open_and_an_edge_flange_relief_is_saved_in_twenty_three() {
         assert_eq!(JSON_STEPS.len(), FORMAT as usize - 1, "one upgrade step for each format");
         let flange = |shape: Option<&str>, size: Option<&str>| crate::FeatureKind::SheetFlange {
             edges: vec![crate::FlangeEdge::at(solidcraft_geom::Vec3::ZERO)],
@@ -1021,24 +1022,24 @@ mod tests {
             corner_relief: size.map(Into::into),
         };
         let saved = |document: &Document| -> Value { serde_json::from_str(&document.to_json()).unwrap() };
-        // A flange that follows the rule saves neither key, and a design of format 21 opens as it was.
+        // A flange that follows the rule saves neither key, and a design of format 22 opens as it was.
         let mut plain = Document::new("A");
         plain.add_feature(flange(None, None), None).unwrap();
         let mut file = saved(&plain);
         let feature = file["features"].as_array().and_then(|f| f.last()).cloned().unwrap();
         assert_eq!(feature["type"], "sheet_flange");
         assert!(feature.get("corner_relief_shape").is_none() && feature.get("corner_relief").is_none(), "{feature}");
-        file["format"] = Value::from("solidcraft/21");
+        file["format"] = Value::from("solidcraft/22");
         let opened = read(&file.to_string()).unwrap();
         assert_eq!(opened.format, format_string(FORMAT));
         assert_eq!(opened.features, plain.features);
-        // One that chooses its relief says so in the file, which is stamped 22 and keeps it.
+        // One that chooses its relief says so in the file, which is stamped 23 and keeps it.
         let mut own = Document::new("A");
         own.add_feature(flange(Some("round"), Some("6 mm")), None).unwrap();
         let file = saved(&own);
         let feature = file["features"].as_array().and_then(|f| f.last()).cloned().unwrap();
         assert_eq!((&feature["corner_relief_shape"], &feature["corner_relief"]), (&Value::from("round"), &Value::from("6 mm")));
-        // A build that reads up to 21 asks for an update on that stamp instead of dropping the relief.
+        // A build that reads up to 22 asks for an update on that stamp instead of dropping the relief.
         assert_eq!(version_of(file["format"].as_str().unwrap_or_default()), Some(FORMAT));
         assert_eq!(read(&file.to_string()).unwrap(), own);
     }

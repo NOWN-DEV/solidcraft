@@ -73,7 +73,7 @@ relieved only between the flanges of one feature, so a feature's choice never me
 corner, and two edge flange features of one part can have different reliefs under one rule. A
 base or contour flange takes its corners from the rule only and refuses both parameters. The
 flange gap and the rule's other values stay with the rule for every flange. The feature's choice is
-saved with the design (file format 22).
+saved with the design (file format 23).
 
 ```json
 {"command":"sheet.flange","params":{"edges":[[60,0,2],[120,45,2],[60,90,2],[0,45,2]],
