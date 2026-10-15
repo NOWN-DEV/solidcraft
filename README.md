@@ -129,7 +129,8 @@ rebuild with no errors, replayed here at 2× speed.
   components as assemblies; revolved faces as native planes, cylinders, cones, spheres and tori),
   IGES 5.3 (manifold solid B-reps with names and colours), 3MF, STL (binary/ASCII) and OBJ, and
   assemblies with joints as URDF for robot simulators (docs/urdf.md);
-  3MF, STL and OBJ import as mesh bodies (they render, measure, move and export; solid features
+  3MF, STL, OBJ and glTF 2.0 (`.glb`/`.gltf`, its node tree as components and its materials as
+  appearances) import as mesh bodies (they render, measure, move and export; solid features
   need B-rep bodies). The `mesh.convert` command reconstructs supported closed constant-section parts
   as parametric solids with planar and circular cylindrical faces;
   STEP import (AP203/AP214/AP242 solids, assemblies, units, names, colours) and IGES import
@@ -178,7 +179,9 @@ Windows builds: `cargo xwin build --release --target x86_64-pc-windows-msvc -p s
 On Windows and Linux, SolidCraft detects a connected 3Dconnexion SpaceNavigator or SpaceMouse through its
 multi-axis HID interface. Move the cap to pan and zoom, and tilt or twist it to rotate the 3D view.
 While editing a sketch, the cap pans and zooms without changing the sketch view. The Navigation
-page in Preferences has an on/off switch and a speed control for the 3D mouse.
+page in Preferences has an on/off switch and a speed control for the 3D mouse. The web app reads
+it too, through the browser; Firefox needs a 3DxWare setting first (see
+[Getting started › 3D mouse in the browser](docs/book/src/guide/getting-started.md#3d-mouse-in-the-browser)).
 
 On Linux SolidCraft reads `/dev/hidrawN` directly, so the logged-in user needs access to the
 device. A udev rule that adds the `uaccess` tag does that, for example
@@ -230,7 +233,7 @@ configuration and an example session: [docs/mcp.md](docs/mcp.md).
 | L0 | `geom` | vectors, planes, profiles, meshes and their measures |
 | L1 | `sketch`, `kernel`, `render` | constraint solver and profiles; the B-rep kernel boundary (truck); view math and CPU rasterizer |
 | L2 | `doc` | parameters, expressions, the feature timeline and its incremental evaluation |
-| L3 | `io` | design files, STL/OBJ/STEP/3MF export, STEP and 3MF/STL import features |
+| L3 | `io` | design files, STL/OBJ/STEP/3MF export, STEP and 3MF/STL/OBJ/glTF import features |
 | L4 | `engine` | the session and the command registry (everything is a command) |
 | L5 | `gpu`, `ui-egui`, `mcp` | compute-shader evaluation of display tessellation plans; the swappable desktop front end; the MCP server (headless or bridged to the app) |
 | apps | `solidcraft`, `solidcraft-cli` | desktop app, headless CLI |
