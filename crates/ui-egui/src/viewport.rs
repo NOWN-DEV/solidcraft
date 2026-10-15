@@ -11,6 +11,7 @@ use solidcraft_engine::view::{colors, grid_step, sketch_lines_with_sampler};
 use std::hash::{Hash, Hasher};
 
 use crate::gpu::{GpuScene, GpuTarget, SceneSlot, ViewportCallback};
+use crate::navigation::{CameraInput, NavCaps, OrbitSnap, orbit_drag};
 use crate::selection::{BoxSel, origin_quads, origin_size, ray_quad};
 use crate::theme::Tokens;
 use crate::{SolveApp, icons};
@@ -18,6 +19,10 @@ use crate::{SolveApp, icons};
 #[cfg(test)]
 #[path = "viewport_appearance_tests.rs"]
 mod appearance_tests;
+
+#[cfg(test)]
+#[path = "viewport_removed_later_tests.rs"]
+mod removed_later_tests;
 
 #[cfg(test)]
 #[path = "viewport_plane_target_tests.rs"]
@@ -40,10 +45,15 @@ pub struct ViewportState {
     pick_bounds: std::sync::Mutex<Option<BodyBounds>>,
     /// The model scene's blocks of bodies by key, from the last scene built.
     pub(crate) blocks: std::sync::Mutex<std::collections::HashMap<u64, CachedBlock>>,
+    /// View-dependent display refinement (#1320): which bodies are drawn finer than the chosen
+    /// display quality, and their refined plans.
+    pub(crate) lod: std::sync::Mutex<crate::display_lod::Lod>,
+    /// The view and model the refinement was last chosen for.
+    lod_view: u64,
     /// Each body mesh's box (the mesh held, so its address stays its own), from the last state.
     mesh_bounds: std::sync::Mutex<std::collections::HashMap<usize, (std::sync::Arc<solidcraft_engine::geom::Mesh>, solidcraft_engine::geom::Aabb3)>>,
     /// The last click in the view was the middle button's (for the middle double-click).
-    middle_clicked: bool,
+    pub(crate) middle_clicked: bool,
     /// The last pick (its key and hits): reused while nothing it depends on changed.
     last_pick: Option<(u64, Vec<Hit>)>,
     pub rect: Option<Rect>,
@@ -66,6 +76,8 @@ pub struct ViewportState {
     /// The preset's navigation for the left-button drag under way (Alias: Shift+Alt), taken
     /// when the button went down, so the drag neither selects nor moves sketch geometry.
     pub primary_nav: Option<NavMode>,
+    /// Button-free gesture and its last owned pointer position, kept through pauses.
+    pub(crate) modifier_nav: Option<(NavMode, Pos2)>,
     /// What a click would pick now (after the active command's filter).
     pub hover: Option<Hit>,
     pub mouse: Option<Pos2>,
@@ -80,13 +92,13 @@ pub struct ViewportState {
     /// Continuous orbit: the view turns about the vertical until the next click or key.
     pub spin: bool,
     /// After immediate zoom, ignore egui's outstanding smoothing until the gesture ends.
-    wheel_zoom_raw_until_idle: bool,
+    pub(crate) wheel_zoom_raw_until_idle: bool,
     /// While trackpad scrolling runs, ignore egui's smoothing tail for zoom so
     /// two-finger input is not replayed as zoom after it pans.
-    trackpad_until_idle: bool,
+    pub(crate) trackpad_until_idle: bool,
     /// Inside a bracketed trackpad scroll (`Start` without its `End` yet):
     /// point moves pan, bare moves are a mouse.
-    trackpad_gesture: bool,
+    pub(crate) trackpad_gesture: bool,
     /// A primary press on the axis gizmo: the pointer position used by its last orbit step.
     pub axis_drag: Option<Pos2>,
     /// Unsnapped camera while Shift-orbit previews a standard or diagonal view.
@@ -94,6 +106,9 @@ pub struct ViewportState {
     /// Spring toward the chosen orientation, including after the drag ends.
     pub(crate) orbit_snap: Option<OrbitSnap>,
     pub build_ms: f64,
+    /// Adaptive supersampling (#1288): the view drawn last (its view-projection and pixels) and
+    /// since when it has held still (app time, s).
+    pub(crate) ss_view: (u64, f64),
     /// The right-click menu, open at this screen position.
     pub context_menu: Option<Pos2>,
     /// Select Other: its list, a press being held, and click cycling.
@@ -264,6 +279,8 @@ fn scene_key(app: &SolveApp) -> u64 {
     app.ui.show_grid.hash(&mut h);
     app.ui.visual_style.hash(&mut h);
     app.ui.ground_shadow.hash(&mut h);
+    solidcraft_engine::doc::display_quality::current().hash(&mut h);
+    lod_generation(app).hash(&mut h);
     // The section plane (its cut outlines are part of the model scene).
     section_plane(app).map(|(o, n)| [o.x, o.y, o.z, n.x, n.y, n.z].map(f64::to_bits)).hash(&mut h);
     app.cam.up.hash(&mut h);
@@ -328,10 +345,42 @@ fn body_faded(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, active_bodi
     }
 }
 
+/// How many times the viewport's pixels to draw this frame each way (#1288; 1: off): the
+/// preference, and with adaptive supersampling only once the view has held still for a moment,
+/// so orbiting and zooming stay as quick as without it.
+fn supersampling(app: &mut SolveApp, ctx: &egui::Context, view_proj: [[f32; 4]; 4], size_px: [f32; 2]) -> f32 {
+    let factor = app.preferences.supersampling;
+    if !(factor > 1.0) {
+        return 1.0;
+    }
+    if !app.preferences.supersampling_adaptive {
+        return factor;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    view_proj.iter().flatten().chain(&size_px).for_each(|x| x.to_bits().hash(&mut h));
+    let view = h.finish();
+    let now = ctx.input(|i| i.time);
+    if view != app.viewport.ss_view.0 {
+        app.viewport.ss_view = (view, now);
+    }
+    let still = now - app.viewport.ss_view.1;
+    if still >= SS_SETTLE {
+        factor
+    } else {
+        // Draw it supersampled once the view settles.
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(SS_SETTLE - still + 0.01));
+        1.0
+    }
+}
+
+/// How long the view holds still before adaptive supersampling draws it at full quality (s).
+const SS_SETTLE: f64 = 0.25;
+
 /// The display plan the model scene draws `b` from on the GPU, or `None` when its faces are built
 /// here from the reference mesh. Opaque shaded bodies (`opaque`: not faded, and no see-through
 /// body or face) are drawn from their plans where the device evaluates them; faded and
-/// see-through ones (sorted and blended per triangle) are built here.
+/// see-through ones (sorted and blended per triangle) are built here. A body seen up close is
+/// drawn from its refined plan ([`crate::display_lod`]).
 fn drawn_plan(
     app: &SolveApp,
     b: &solidcraft_engine::doc::ModelBody,
@@ -339,13 +388,24 @@ fn drawn_plan(
 ) -> Option<std::sync::Arc<solidcraft_engine::geom::tess::TessPlan>> {
     let shaded = app.ui.visual_style != 2;
     (shaded && opaque && app.viewport.gpu.is_some_and(|g| g.tess))
-        .then(|| b.display_plan())
+        .then(|| refined(app, b).map(|(plan, _)| plan).or_else(|| b.display_plan()))
         .flatten()
         .filter(|plan| plan.vertex_count() <= solidcraft_gpu::MAX_BATCH)
 }
 
+/// The refined plan and mesh `b` is drawn from, when the view has it drawn finer than the chosen
+/// display quality (#1320).
+fn refined(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> crate::display_lod::Refined {
+    app.viewport.lod.lock().ok()?.refined(b, solidcraft_engine::doc::display_quality::current())
+}
+
+/// Changes whenever a body's refinement changes (the scene and highlight keys).
+fn lod_generation(app: &SolveApp) -> u64 {
+    app.viewport.lod.lock().map_or(0, |l| l.generation)
+}
+
 /// The mesh whose triangles the model scene shows for `b`'s faces: the plan's (evaluated on the
-/// CPU, the same triangles the GPU draws) or the reference mesh. A face highlighted over the model
+/// CPU, the same triangles the GPU draws) or [`drawn_mesh`]. A face highlighted over the model
 /// must use the same triangles: another triangulation of the same face fights it at equal depth
 /// and shimmers.
 fn shown_mesh(
@@ -353,6 +413,10 @@ fn shown_mesh(
     b: &solidcraft_engine::doc::ModelBody,
     active_bodies: &Option<Vec<String>>,
 ) -> std::sync::Arc<solidcraft_engine::geom::Mesh> {
+    if let Some((_, mesh)) = refined(app, b) {
+        // Refined: faces drawn from the refined plan on the GPU or built from its mesh here.
+        return mesh;
+    }
     let doc = &app.session.doc;
     let opaque =
         || !body_faded(app, b, active_bodies) && doc.model_body_opacity(b) >= 0.999 && doc.face_colors(b).iter().all(|(_, l)| l.opacity >= 0.999);
@@ -360,7 +424,82 @@ fn shown_mesh(
         .then(|| drawn_plan(app, b, true))
         .flatten()
         .and_then(|_| b.plan_mesh())
-        .unwrap_or_else(|| b.mesh())
+        .unwrap_or_else(|| drawn_mesh(app, b))
+}
+
+/// The mesh the model scene builds `b` from on the CPU (its edges always, its faces when they
+/// are not drawn from the plan on the GPU): a refined plan's mesh when the view has one for it
+/// (#1320), the reference mesh at Normal display quality, else the plan's mesh at the chosen
+/// quality (finer or coarser faces and edges alike), falling back to the reference mesh when the
+/// body has no plan.
+fn drawn_mesh(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> std::sync::Arc<solidcraft_engine::geom::Mesh> {
+    use solidcraft_engine::doc::display_quality::{DisplayQuality, current};
+    if let Some((_, mesh)) = refined(app, b) {
+        return mesh;
+    }
+    if current() == DisplayQuality::Normal { b.mesh() } else { b.plan_mesh().unwrap_or_else(|| b.mesh()) }
+}
+
+/// Choose which bodies to draw finer than the chosen display quality for this view (#1320):
+/// each shown body's screen-space error from its box on screen, refinements planned off the UI
+/// thread and swapped in when ready. Keeps repainting while refinements are being planned.
+fn update_refinement(app: &mut SolveApp, ctx: &egui::Context, proj: &Proj) {
+    if app.viewport.gpu.is_none() || !crate::display_lod::enabled() {
+        return; // The CPU picture draws the reference mesh.
+    }
+    let q = solidcraft_engine::doc::display_quality::current();
+    // Nothing to choose again while the view, the model and the planning stand still.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scene_key(app).hash(&mut h);
+    crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
+    let view = h.finish();
+    // While refinements are being planned, the view standing still: only collect finished ones.
+    if view == app.viewport.lod_view {
+        let (busy, finished) = app.viewport.lod.lock().map_or((false, false), |mut l| {
+            let finished = l.collect();
+            (l.busy(), finished)
+        });
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        if !finished {
+            return;
+        }
+    }
+    let t0 = crate::now_ms();
+    app.viewport.lod_view = view;
+    let st = app.session.world_state();
+    let ppp = f64::from(app.viewport.pixels_per_point());
+    let lens = crate::display_lod::Lens::new(&proj.cam, f64::from(proj.rect.height()) * ppp);
+    let bounds = body_bounds(app, &st);
+    let mut live = std::collections::HashSet::with_capacity(st.bodies.len());
+    let mut candidates = Vec::new();
+    for (b, (name, bx)) in st.bodies.iter().zip(bounds.iter()) {
+        let id = crate::display_lod::body_id(b).0;
+        live.insert(id);
+        if b.name != *name || b.body.is_mesh() {
+            continue;
+        }
+        let shown = app.session.body_visible(&b.name) && !app.preview.replaced.contains(&b.name);
+        let on_screen = match screen_box(proj, bx, 0.0).filter(|_| shown) {
+            Some(r) => r.intersects(proj.rect).then(|| f64::from(r.width().max(r.height())) * ppp),
+            // A corner behind the eye: the view is inside or right by the box.
+            None => (shown && proj.cam.fov > 0.0 && lens.in_front(bx)).then_some(f64::INFINITY),
+        };
+        let err_px = crate::display_lod::error_px(q, b.body.size(), bx, on_screen, &lens);
+        candidates.push(crate::display_lod::Candidate { body: b, err_px, triangles: b.mesh().triangles.len() });
+    }
+    let busy = match app.viewport.lod.lock() {
+        Ok(mut lod) => {
+            lod.update(q, candidates, &live);
+            lod.stats.choose_ms = crate::now_ms() - t0;
+            lod.busy()
+        }
+        Err(_) => false,
+    };
+    if busy {
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
 }
 
 /// A model scene block kept by the viewport: its bytes and the meshes they were built from
@@ -511,7 +650,7 @@ fn build_scene(app: &SolveApp) -> GpuScene {
                 .collect();
             sc.planned.push(crate::gpu::PlannedBody { plan, face_colors });
         }
-        let body = BodyDraw { mesh: b.mesh(), col, faded, opacity, face_looks, on_gpu };
+        let body = BodyDraw { mesh: drawn_mesh(app, b), col, faded, opacity, face_looks, on_gpu };
         let key = body.key(shaded, edges, hidden_edges, edge_col, hidden_col);
         key.hash(&mut run_key);
         run.push(body);
@@ -887,7 +1026,7 @@ fn screen_box(proj: &Proj, b: &solidcraft_engine::geom::Aabb3, px: f32) -> Optio
 
 /// What is under `pos`, reusing the last answer while the cursor, the camera and the model are
 /// unchanged.
-fn pick_cached(app: &mut SolveApp, proj: &Proj, pos: Pos2) -> Vec<Hit> {
+pub(crate) fn pick_cached(app: &mut SolveApp, proj: &Proj, pos: Pos2) -> Vec<Hit> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     pos.x.to_bits().hash(&mut h);
     pos.y.to_bits().hash(&mut h);
@@ -1359,6 +1498,76 @@ fn analysis_uniform(app: &SolveApp) -> [f32; 8] {
     }
 }
 
+/// While Draft, Accessibility or Curvature Map analysis is on, what each of its colours means and
+/// the values it stands for, at the bottom left of the viewport (#973). The colours alone don't
+/// say, and with colour vision loss they can be hard to tell apart.
+fn analysis_legend(app: &SolveApp, painter: &egui::Painter, rect: Rect) {
+    use solidcraft_engine::SurfaceAnalysis as A;
+    let t = Tokens::get();
+    let tr = crate::i18n::tr_label;
+    let col = |c: [f32; 3]| {
+        let u = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Color32::from_rgb(u(c[0]), u(c[1]), u(c[2]))
+    };
+    let dir = |v: Vec3| format!("({:.2}, {:.2}, {:.2})", v.x, v.y, v.z);
+    let a = &t.analysis;
+    // (title, the direction it measures along, rows of colour, text, hatched).
+    let (title, along, rows): (&str, Option<String>, Vec<(Color32, String, bool)>) = match app.session.analysis {
+        Some(A::Draft { pull, angle }) => (
+            tr("Draft Analysis"),
+            Some(format!("{} {}", tr("Pull direction"), dir(pull))),
+            vec![
+                (col(a.draft[0]), format!("≥ {angle:.1}°"), false),
+                (col(a.draft[1]), format!("−{angle:.1}° … {angle:.1}°"), false),
+                (col(a.draft[2]), format!("≤ −{angle:.1}°"), a.hatch),
+            ],
+        ),
+        Some(A::Access { dir: d }) => (
+            tr("Accessibility Analysis"),
+            Some(format!("{} {}", tr("Tool direction"), dir(d))),
+            vec![(col(a.access[0]), tr("Reachable").to_string(), false), (col(a.access[1]), tr("Blocked").to_string(), a.hatch)],
+        ),
+        // The shader's scale reaches its middle at twice the analysis radius.
+        Some(A::Curvature { radius }) => (
+            tr("Curvature Map Analysis"),
+            None,
+            vec![
+                (col(a.curvature[0]), tr("Flat").to_string(), false),
+                (col(a.curvature[1]), format!("{} {}", tr("Radius"), crate::prefs::show_mm(app, 2.0 * radius, 1)), false),
+                (col(a.curvature[2]), format!("{} ≤ {}", tr("Radius"), crate::prefs::show_mm(app, radius, 1)), false),
+            ],
+        ),
+        _ => return,
+    };
+    let (pad, row) = (8.0, 18.0);
+    let h = pad * 2.0 + 18.0 + along.as_ref().map_or(0.0, |_| row) + row * rows.len() as f32;
+    let r = Rect::from_min_size(pos2(rect.left() + 12.0, rect.bottom() - 12.0 - h), vec2(230.0, h));
+    painter.rect(r, 6.0, t.overlay, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    crate::scenario::publish_handle("analysis:legend", r.center());
+    let mut y = r.top() + pad;
+    painter.text(pos2(r.left() + pad, y), Align2::LEFT_TOP, title, FontId::proportional(13.0), t.text);
+    y += 18.0;
+    if let Some(along) = along {
+        painter.text(pos2(r.left() + pad, y), Align2::LEFT_TOP, along, FontId::proportional(11.5), t.text_dim);
+        y += row;
+    }
+    for (c, text, hatched) in rows {
+        let sw = Rect::from_min_size(pos2(r.left() + pad, y + 2.0), vec2(12.0, 12.0));
+        painter.rect_filled(sw, 2.0, c);
+        if hatched {
+            // The stripes the viewport adds to these faces (colour vision modes).
+            for k in [3.0, 7.0, 11.0] {
+                painter.line_segment(
+                    [pos2(sw.left() + k - 3.0, sw.bottom()), pos2(sw.left() + k + 1.0, sw.top())],
+                    Stroke::new(1.2, Color32::from_black_alpha(110)),
+                );
+            }
+        }
+        painter.text(pos2(sw.right() + 8.0, y), Align2::LEFT_TOP, text, FontId::proportional(12.0), t.text);
+        y += row;
+    }
+}
+
 fn section_clip(app: &SolveApp) -> [f32; 4] {
     match section_plane(app) {
         Some((o, n)) => [n.x as f32, n.y as f32, n.z as f32, n.dot(o) as f32],
@@ -1444,6 +1653,10 @@ fn hit_candidate(app: &SolveApp, h: &Hit) -> Option<(Hit, Sel)> {
 
 /// A pick for the open dialog's active input (a click, or a Select Other row).
 pub(crate) fn dialog_pick(app: &mut SolveApp, hit: &Hit, sel: Sel) {
+    // While OK computes, the dialog's inputs hold.
+    if app.applying.is_some() {
+        return;
+    }
     let Some(mut d) = app.dialog.take() else { return };
     d.pick(&app.session, sel);
     if let crate::dialogs::Kind::PathPlane { sketch, .. } = &mut d.kind {
@@ -1538,15 +1751,16 @@ pub(crate) fn profile_fill(sc: &mut GpuScene, app: &SolveApp, sketch: u64, index
     }
 }
 
+/// An origin or construction plane: reference geometry, which a section does not cut (#1229).
 fn quad(sc: &mut GpuScene, q: &[Vec3; 4], fill: Color32, edge: Color32) {
     let col = c4(fill);
     for i in [0, 1, 2, 0, 2, 3] {
         if let Some(p) = q.get(i) {
-            sc.trans_tri(p.to_f32(), [0.0; 3], col);
+            sc.guide_tri(p.to_f32(), col);
         }
     }
     for i in 0..4 {
-        sc.line(q[i].to_f32(), q[(i + 1) % 4].to_f32(), c4(edge), 1.2, false);
+        sc.guide_line(q[i].to_f32(), q[(i + 1) % 4].to_f32(), c4(edge), 1.2);
     }
 }
 
@@ -1558,6 +1772,7 @@ fn highlight_key(app: &SolveApp) -> u64 {
     app.viewport.hover_feature.hash(&mut h);
     app.viewport.hover_bodies.hash(&mut h);
     // Which mesh lights a face follows how the model draws its body (see `shown_mesh`).
+    lod_generation(app).hash(&mut h);
     app.session.active_component.hash(&mut h);
     app.session.active_occurrence_path.hash(&mut h);
     app.ui.visual_style.hash(&mut h);
@@ -1622,11 +1837,11 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
         };
         let on = sel.iter().any(|x| matches!(x, Sel::Axis { name: n } if n == name)) || matches!(hover, Some(Hit::Axis { name: n }) if n == name);
         let w = if on { 4.0 } else { 2.0 };
-        sc.line([0.0; 3], (dir * size).to_f32(), c4(col), w, false);
+        sc.guide_line([0.0; 3], (dir * size).to_f32(), c4(col), w);
         let dash = size * 0.08;
         let mut a = size + dash;
         while a < size * AXIS_LEN {
-            sc.line((dir * a).to_f32(), (dir * (a + dash)).to_f32(), c4(col), w * 0.75, false);
+            sc.guide_line((dir * a).to_f32(), (dir * (a + dash)).to_f32(), c4(col), w * 0.75);
             a += dash * 2.0;
         }
     }
@@ -1641,7 +1856,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
         let mut s = 0.0;
         while s < len {
             let e = (s + dash).min(len);
-            sc.line(a.lerp(b, s / len).to_f32(), a.lerp(b, e / len).to_f32(), col, w, false);
+            sc.guide_line(a.lerp(b, s / len).to_f32(), a.lerp(b, e / len).to_f32(), col, w);
             s += dash * 1.6;
         }
     }
@@ -1658,7 +1873,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
                 // A live preview stands in for the body: its old faces would fight with it.
                 if let Some(b) = st.body(body).filter(|_| app.session.body_visible(body) && !app.preview.replaced.contains(body)) {
                     face_tris(&mut sc, &shown(b), *index, c4(t.sel_face), false);
-                    hidden_face_outline(&mut sc, &b.mesh(), *index, t.sel_edge);
+                    hidden_face_outline(&mut sc, &drawn_mesh(app, b), *index, t.sel_edge);
                 }
             }
             Sel::Body { name } => {
@@ -1674,7 +1889,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
             Sel::Edge { body, index, point } => {
                 if let Some(b) = st.body(body)
                     && app.session.body_visible(body)
-                    && let Some(e) = edge_of(&b.mesh(), *index, *point)
+                    && let Some(e) = edge_of(&drawn_mesh(app, b), *index, *point)
                 {
                     edge_lines(&mut sc, e, t.sel_edge, t.sel_edge_rim, 3.0);
                 }
@@ -1738,7 +1953,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
         }
         let k = t.hover_face_lift;
         let c = body_rgb(app, &b.name);
-        let m = b.mesh();
+        let m = drawn_mesh(app, b);
         let lit = shown(b);
         for &f in &faces {
             if !sel.iter().any(|x| {
@@ -1773,7 +1988,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
             if let Some(b) = st.body(body) {
                 let k = t.hover_face_lift;
                 let c = body_rgb(app, body);
-                let m = b.mesh();
+                let m = drawn_mesh(app, b);
                 let patch = m.surface_patch(*index);
                 let lit = shown(b);
                 for &f in &patch {
@@ -1790,7 +2005,8 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
         }
         Some(Hit::Edge { body, index, mid }) => {
             if let Some(b) = st.body(body) {
-                let m = b.mesh();
+                // Lit over the drawn edges (finer away from Normal display quality).
+                let m = drawn_mesh(app, b);
                 for i in m.circular_rim(*index) {
                     let selected = sel.iter().any(|x| matches!(x, Sel::Edge { body: b, index: j, .. } if b == body && *j == i));
                     if !selected && let Some(e) = if i == *index { edge_of(&m, i, *mid) } else { m.edges.get(i) } {
@@ -1878,308 +2094,34 @@ pub fn delete_selection(app: &mut SolveApp) {
     crate::delete::delete_selection(app);
 }
 
-/// Raw wheel/trackpad input for one frame, split by source.
-///
-/// Mouse wheels report lines or pages; trackpads report points. Trackpad
-/// scrolls arrive bracketed (`Start` … `Move` … `End`, momentum included)
-/// while mouse wheels send bare `Move` events, so phases tell them apart.
-struct RawWheel {
-    /// Vertical mouse-wheel input in points (zooms).
-    zoom: f32,
-    /// Trackpad point input, routed like the wheel (zooms when panning is off).
-    point_zoom: f32,
-    /// Bracketed two-finger scroll in points (pans when panning is on).
-    pan: egui::Vec2,
-    /// Bare horizontal input in points (thumb wheel: always pans sideways).
-    mouse_pan: egui::Vec2,
-}
-
-/// Route wheel points to the vertical axis, matching egui's scroll modifiers.
-fn route_wheel_vertical(points: egui::Vec2, modifiers: egui::Modifiers, options: egui::InputOptions) -> f32 {
-    let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
-    let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
-    if horizontal && !vertical {
-        0.0
-    } else if vertical && !horizontal {
-        points.x + points.y
-    } else {
-        points.y
-    }
-}
-
-/// Match egui's wheel units and modifier routing, without its temporal smoothing.
-///
-/// `gesture` tracks an ongoing bracketed trackpad scroll (`Start` … `End`):
-/// moves inside one pan, bare `Move` input is a mouse (vertical zooms,
-/// horizontal pans). Only point input brackets; line/page input always zooms.
-fn immediate_wheel(input: &egui::InputState, options: egui::InputOptions, page_height: f32, gesture: &mut bool) -> RawWheel {
-    let mut out = RawWheel { zoom: 0.0, point_zoom: 0.0, pan: egui::Vec2::ZERO, mouse_pan: egui::Vec2::ZERO };
-    for event in &input.events {
-        let egui::Event::MouseWheel { unit, delta, modifiers, phase } = event else { continue };
-        if modifiers.matches_any(options.zoom_modifier) {
-            continue;
-        }
-        let point = matches!(unit, egui::MouseWheelUnit::Point);
-        match phase {
-            egui::TouchPhase::Start => {
-                if point {
-                    *gesture = true;
-                }
-                continue;
-            }
-            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
-                if point {
-                    *gesture = false;
-                }
-                continue;
-            }
-            egui::TouchPhase::Move => {}
-        }
-        let points = match unit {
-            egui::MouseWheelUnit::Point => *delta,
-            egui::MouseWheelUnit::Line => *delta * options.line_scroll_speed,
-            egui::MouseWheelUnit::Page => *delta * page_height,
-        };
-        if point && *gesture {
-            out.pan += points;
-            // Legacy path only (ignored while panning is on).
-            out.point_zoom += route_wheel_vertical(points, *modifiers, options);
-        } else if point {
-            // Bare moves are a mouse: vertical zooms, horizontal pans sideways.
-            // A wheel needs the opposite sign of fingers for the same motion.
-            out.zoom += route_wheel_vertical(points, *modifiers, options);
-            out.mouse_pan += egui::vec2(-points.x, 0.0);
-        } else {
-            out.zoom += route_wheel_vertical(points, *modifiers, options);
-        }
-    }
-    out
-}
-
-/// Combined pinch-to-zoom factor for one frame (1 = no pinch input).
-fn pinch_factor(input: &egui::InputState) -> f32 {
-    input
-        .events
-        .iter()
-        .filter_map(|event| {
-            let egui::Event::Zoom(f) = event else { return None };
-            (*f).is_finite().then_some(*f).filter(|f| *f > 0.0)
-        })
-        .fold(1.0, |acc, f| acc * f)
-}
-
-/// Zoom anchor: the model point under the cursor, else the target's depth.
-/// Preferences › Navigation › Zoom to the cursor (off: toward the view's centre).
-fn zoom_anchor(app: &mut SolveApp, rect: egui::Rect, hover: Option<egui::Pos2>) -> Option<Vec3> {
-    hover.filter(|_| app.preferences.zoom_to_cursor).map(|p| {
-        let proj = projection(app, rect);
-        // Toward the model's surface under the cursor, else the target's depth.
-        if let Some(q) = pick_cached(app, &proj, p).iter().find_map(|h| if let Hit::Face { point, .. } = h { Some(*point) } else { None }) {
-            return q;
-        }
-        let (o, d) = proj.ray(p);
-        let n = app.cam.back();
-        let den = d.dot(n);
-        if den.abs() > 1e-9 { o + d * ((app.cam.target - o).dot(n) / den) } else { app.cam.target }
-    })
-}
-
 pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     let rect = ui.max_rect();
     app.viewport.rect = Some(rect);
     refresh_layout(app, ui.ctx().pixels_per_point());
     let resp = ui.interact(rect, ui.id().with("viewport"), Sense::click_and_drag());
-    let (hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, primary_released, delta) = ui.input(|i| {
-        (
-            i.pointer.hover_pos(),
-            i.smooth_scroll_delta.y,
-            i.modifiers,
-            i.pointer.middle_down(),
-            i.pointer.secondary_down(),
-            i.pointer.primary_down(),
-            i.pointer.primary_pressed(),
-            i.pointer.primary_released(),
-            i.pointer.delta(),
-        )
-    });
-    // The right button belongs to the marking menu while it is open.
-    let secondary_down = secondary_down && app.viewport.context_menu.is_none();
-    // The axis view handles its own clicks; the model underneath must not see them.
-    let axes = axis_rect(app, rect);
-    // Floating windows and menus own input over the model, including wheel navigation. egui's
-    // hit test also counts the model as under the pointer a few points past its own edge and
-    // inside a window's or a list's edge (#678), so the pointer must be in the viewport too,
-    // with no window or menu above it.
-    let inside = resp.contains_pointer() && ui.rect_contains_pointer(rect) && hover.is_some_and(|p| !axes.contains(p));
-    app.viewport.mouse = hover.filter(|_| inside);
-    // Ctrl or Alt held: drawing and dragging don't snap.
-    crate::drag_snap::set_suppressed(mods.ctrl || mods.alt || mods.command);
-    middle_double_click(app, ui, inside);
-
-    // ---- navigation ----
-    let trackpad_pan = app.preferences.trackpad_pan;
-    if !app.preferences.smooth_wheel_zoom {
-        app.viewport.wheel_zoom_raw_until_idle = true;
-    } else if !ui.input(|i| i.is_scrolling()) {
-        app.viewport.wheel_zoom_raw_until_idle = false;
+    let flat = crate::dialogs_sheet::flat_active(app);
+    if !flat {
+        app.flat_view.fitted = false;
     }
-    let options = ui.ctx().options(|o| o.input_options);
-    let page_height = ui.ctx().viewport_rect().height();
-    let raw = ui.input(|i| immediate_wheel(i, options, page_height, &mut app.viewport.trackpad_gesture));
-    if trackpad_pan && raw.pan != egui::Vec2::ZERO {
-        // Swallow egui's smoothing tail while the trackpad runs (a wheel-only
-        // tail ends the moment trackpad input starts; mixed input is rare).
-        app.viewport.trackpad_until_idle = true;
-    } else if !ui.input(|i| i.is_scrolling()) {
-        app.viewport.trackpad_until_idle = false;
-        // Self-healing: with no scroll activity no gesture can be mid-flight
-        // (its End was lost); a stuck flag would pan future mouse input.
-        app.viewport.trackpad_gesture = false;
-    }
-    let pan = if trackpad_pan { raw.pan } else { egui::Vec2::ZERO } + raw.mouse_pan;
-    let scroll = if app.viewport.wheel_zoom_raw_until_idle || (trackpad_pan && app.viewport.trackpad_until_idle) {
-        raw.zoom + if trackpad_pan { 0.0 } else { raw.point_zoom }
-    } else {
-        scroll
-    };
-    // Pinch-to-zoom (trackpad): direct manipulation, never smoothed.
-    let pinch = ui.input(pinch_factor);
-    let h = rect.height().max(1.0) as f64;
-    if inside && pinch != 1.0 {
-        app.viewport.orbit_snap = None;
-        app.viewport.orbit_free = None;
-        // Spread zooms in: the camera distance shrinks by the pinch factor.
-        let f = f64::from(pinch).powf(-crate::prefs::zoom_sign(app));
-        let anchor = zoom_anchor(app, rect, hover);
-        app.cancel_view_animation();
-        app.cam.zoom_at(f, anchor);
-    }
-    if inside && scroll != 0.0 {
-        app.viewport.orbit_snap = None;
-        app.viewport.orbit_free = None;
-        let f = (-scroll as f64 * 0.0015 * crate::prefs::zoom_sign(app)).exp();
-        let anchor = zoom_anchor(app, rect, hover);
-        app.cancel_view_animation();
-        app.cam.zoom_at(f, anchor);
-    }
-    // Two-finger scroll pans the model with the fingers.
-    if inside && pan != egui::Vec2::ZERO {
-        app.viewport.orbit_snap = None;
-        app.viewport.orbit_free = None;
-        app.cancel_view_animation();
-        app.cam.pan(f64::from(pan.x), f64::from(pan.y), h);
-    }
-    // A left press with the preset's keys (Alias: Shift+Alt) navigates until the button is let
-    // go (kept through the release frame, so the end of the drag doesn't select either).
-    if primary_pressed && inside {
-        let empty_space = |app: &SolveApp| {
-            app.viewport.context_menu.is_none()
-                && hover.is_some_and(|p| {
-                    let proj = projection(app, rect);
-                    pick(app, &proj, p).is_empty() && crate::dim_view::hit(p).is_none() && crate::sketch_tools::glyph_at(p).is_none()
-                })
-        };
-        let openscad_orbit =
-            app.preferences.nav == crate::prefs::OPENSCAD_NAV && app.tool.is_none() && app.dialog.is_none() && !mods.shift && empty_space(app);
-        let preset = if app.preferences.nav != crate::prefs::OPENSCAD_NAV || openscad_orbit {
-            crate::prefs::nav_mode(app, crate::prefs::NavButton::Left, mods)
-        } else {
-            None
-        };
-        // Ctrl+left drag from empty space orbits in every preset (Cmd on macOS). A Ctrl+click
-        // still selects, and Ctrl on geometry still drags it without snapping.
-        let ctrl_orbit = (mods.ctrl || mods.command) && !mods.shift && !mods.alt && empty_space(app);
-        app.viewport.primary_nav = preset.or(ctrl_orbit.then_some(NavMode::Orbit));
-    } else if !primary_down && !primary_released {
-        app.viewport.primary_nav = None;
-    }
-    // The fixed navigation mode (navigation bar) or the preset's left-button binding.
-    let primary_nav = app.viewport.nav.or(app.viewport.primary_nav);
-    let button = if middle {
-        Some(crate::prefs::NavButton::Middle)
-    } else if secondary_down {
-        Some(crate::prefs::NavButton::Right)
-    } else {
-        None
-    };
-    let dragging = resp.dragged() || (inside && button.is_some());
-    let mode = if dragging && app.viewport.axis_drag.is_none() {
-        match button {
-            Some(b) => crate::prefs::nav_mode(app, b, mods),
-            None if primary_down => primary_nav,
-            None => None,
-        }
-    } else {
-        None
-    };
-    if mode == Some(NavMode::Orbit) {
-        let press = ui.input(|i| i.pointer.press_origin());
-        app.cancel_view_animation();
-        // Shift can be required to enter orbit (Fusion/Inventor middle drag, Alias Shift+Alt),
-        // rather than an additional request for snapping. Only an extra modifier snaps.
-        let without_shift = egui::Modifiers { shift: false, ..mods };
-        let snap = app.preferences.nav != crate::prefs::OPENSCAD_NAV
-            && mods.shift
-            && match button {
-                Some(b) => crate::prefs::nav_mode(app, b, without_shift) == Some(NavMode::Orbit),
-                None => app.viewport.nav.is_some(),
-            };
-        orbit_drag(app, rect, f64::from(delta.x), f64::from(delta.y), press, snap, true);
-    } else {
-        if matches!(mode, Some(NavMode::Pan | NavMode::Zoom)) {
-            app.viewport.orbit_snap = None;
-        }
-        if app.viewport.axis_drag.is_none() {
-            app.viewport.orbit_free = None;
-        }
-        if delta != egui::Vec2::ZERO {
-            if mode.is_some() {
-                app.cancel_view_animation();
-            }
-            match mode {
-                Some(NavMode::Pan) => app.cam.pan(f64::from(delta.x), f64::from(delta.y), h),
-                Some(NavMode::Zoom) => app.cam.zoom_at((f64::from(delta.y) * 0.01).exp(), None),
-                _ => {}
-            }
-        }
-    }
-    if !dragging {
-        app.viewport.orbit_pivot = None;
-    }
-    if app.viewport.spin {
-        // A click on the navigation bar (its own button) is not a stop.
-        let bar = app
-            .viewport
-            .layout
-            .as_ref()
-            .map(|l| l.navigation)
-            .unwrap_or_else(|| Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 22.0), vec2(320.0, 30.0)));
-        let (pressed, key, dt) = ui.input(|i| {
-            (
-                i.pointer.any_pressed() && inside && !i.pointer.press_origin().is_some_and(|p| bar.contains(p)),
-                i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
-                i.stable_dt,
-            )
-        });
-        if pressed || key || dragging {
-            app.viewport.spin = false;
-        } else {
-            app.cam.orbit(f64::from(dt.min(0.1)) * 30.0, 0.0);
-            ui.ctx().request_repaint();
-        }
-    }
-    if !app.cam.is_valid() {
-        app.viewport.orbit_free = None;
-        app.viewport.orbit_snap = None;
-        app.cam = Camera::default();
-        app.fit_view();
-    }
-
-    step_orbit_snap(app, rect, ui.input(|i| f64::from(i.stable_dt)));
-    if app.viewport.orbit_snap.is_some() {
-        ui.ctx().request_repaint();
-    }
+    let input =
+        if flat { crate::dialogs_sheet::navigate(app, ui, rect, &resp) } else { crate::navigation::handle(app, ui, rect, &resp, NavCaps::MODEL) };
+    let CameraInput {
+        hover,
+        scroll,
+        mods,
+        middle,
+        secondary_down,
+        primary_down,
+        primary_pressed,
+        delta,
+        inside,
+        axes,
+        pinch,
+        pan,
+        primary_nav,
+        mode,
+    } = input;
     app.viewport.physical_scale = ui.ctx().pixels_per_point();
     let proj = projection(app, rect);
     if let Ok(mut cache) = app.viewport.display.lock() {
@@ -2229,6 +2171,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     painter.add(Shape::mesh(mesh));
 
     // ---- model ----
+    update_refinement(app, ui.ctx(), &proj);
     let key = scene_key(app);
     let t0 = crate::now_ms();
     if let Some(_g) = app.viewport.gpu {
@@ -2257,7 +2200,11 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             app.viewport.hl_key = hk;
         }
         let ppp = ui.ctx().pixels_per_point();
+        let size_px = [rect.width() * ppp, rect.height() * ppp];
+        let ssaa = supersampling(app, ui.ctx(), proj.vp.to_f32(), size_px);
         let cb = ViewportCallback {
+            ssaa,
+            product: false,
             key: app.viewport.key,
             slot: app.viewport.slot.clone(),
             sketch_key: app.viewport.sketch_key,
@@ -2270,7 +2217,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             cap: t.section_cap.to_normalized_gamma_f32(),
             view_proj: proj.vp.to_f32(),
             back: proj.cam.back().to_f32(),
-            size_px: [rect.width() * ppp, rect.height() * ppp],
+            size_px,
             images: crate::ref_images::gpu_images(app),
             analysis: analysis_uniform(app),
             analysis_colors: crate::gpu::analysis_colors(&t.analysis),
@@ -2285,6 +2232,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     } else {
         cpu_render(app, ui.ctx(), &painter, rect, &proj);
     }
+    analysis_legend(app, &painter, rect);
 
     // ---- interaction ----
     let add = mods.shift || mods.command || mods.ctrl;
@@ -2729,6 +2677,10 @@ pub(crate) fn measurement_selection(s: &solidcraft_engine::Session, sel: &Sel) -
 /// active input takes (edges, faces or bodies), otherwise bodies.
 fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
     use crate::selection::{BODIES, EDGES, FACES, PROFILES};
+    // While OK computes, the dialog's inputs hold.
+    if app.applying.is_some() {
+        return;
+    }
     let st = app.session.world_state();
     let mut out: Vec<Sel> = Vec::new();
     let to2 = |pts: &[Vec3]| -> Vec<Pos2> { pts.iter().filter_map(|p| proj.to_screen(*p)).collect() };
@@ -3059,7 +3011,7 @@ fn axis_center(app: &SolveApp, rect: Rect) -> Pos2 {
     axis_rect(app, rect).center()
 }
 
-fn axis_rect(app: &SolveApp, rect: Rect) -> Rect {
+pub(crate) fn axis_rect(app: &SolveApp, rect: Rect) -> Rect {
     app.viewport.layout.as_ref().filter(|l| l.viewport == rect).map(|l| l.axis_view).unwrap_or_else(|| {
         let size = axis_view_size(app.preferences.navigator_style);
         Rect::from_min_size(pos2(rect.right() - size, rect.top()), vec2(size, size))
@@ -3082,99 +3034,6 @@ fn axis_tips(cam: &Camera, c: Pos2) -> Vec<(&'static str, Vec3, Pos2, f64)> {
 
 fn axis_hit(tips: &[(&str, Vec3, Pos2, f64)], p: Pos2) -> Option<usize> {
     tips.iter().enumerate().rev().find(|(_, (_, _, at, _))| at.distance(p) <= AXIS_RADIUS).map(|(i, _)| i)
-}
-
-/// Six principal views, twelve edge diagonals and eight isometric corner directions.
-fn snap_directions() -> impl Iterator<Item = Vec3> {
-    [-1.0, 0.0, 1.0].into_iter().flat_map(|x| {
-        [-1.0, 0.0, 1.0].into_iter().flat_map(move |y| [-1.0, 0.0, 1.0].into_iter().filter_map(move |z| Vec3::new(x, y, z).normalized()))
-    })
-}
-
-/// Snap to the nearest standard or diagonal direction in the user's up-axis frame.
-fn snapped_axis_camera(cam: Camera) -> Camera {
-    let b = cam.to_frame(cam.back());
-    let dir = snap_directions().max_by(|a, c| a.dot(b).total_cmp(&c.dot(b))).unwrap_or(Vec3::Z);
-    let mut to = cam.looking_from(cam.from_frame(dir));
-    if dir.x == 0.0 && dir.y == 0.0 {
-        to.yaw = nearest_quarter_turn(cam.yaw);
-    }
-    to
-}
-
-pub(crate) struct OrbitSnap {
-    target: Camera,
-    yaw_velocity: f64,
-    pitch_velocity: f64,
-    pivot: Option<(Vec3, Pos2)>,
-}
-
-/// Pointer motion accumulates independently of the spring preview, so many small deltas
-/// still cross snap boundaries. Keep a small angular margin to avoid boundary flicker.
-fn orbit_drag(app: &mut SolveApp, rect: Rect, dx: f64, dy: f64, press: Option<Pos2>, snap: bool, around_cursor: bool) {
-    let displayed = app.cam;
-    if let Some(free) = app.viewport.orbit_free.take() {
-        app.cam = free;
-    }
-    if around_cursor {
-        crate::prefs::orbit(app, rect, dx, dy, press);
-    } else {
-        app.cam.orbit(dx, dy);
-    }
-    let free = app.cam;
-    app.viewport.orbit_free = Some(free);
-    if snap || !around_cursor || app.viewport.orbit_snap.is_some() {
-        let mut target = if snap { snapped_axis_camera(free) } else { free };
-        if snap && let Some(previous) = app.viewport.orbit_snap.as_ref() {
-            let b = free.back();
-            if previous.target.back().dot(b) + 0.025 >= target.back().dot(b) {
-                target.yaw = previous.target.yaw;
-                target.pitch = previous.target.pitch;
-            }
-        }
-        let pivot = app.viewport.orbit_pivot.filter(|_| around_cursor).and_then(|p| {
-            app.cam = displayed;
-            projection(app, rect).to_screen(p).map(|at| (p, at))
-        });
-        let spring = app.viewport.orbit_snap.get_or_insert(OrbitSnap { target, yaw_velocity: 0.0, pitch_velocity: 0.0, pivot });
-        spring.target = target;
-        spring.pivot = pivot;
-        app.cam = displayed;
-    }
-}
-
-/// A lightly damped spring: mostly settled in about a third of a second, with a small
-/// elastic finish. Bounded substeps keep the behavior consistent across frame rates.
-fn step_orbit_snap(app: &mut SolveApp, rect: Rect, dt: f64) {
-    let Some(mut spring) = app.viewport.orbit_snap.take() else { return };
-    let dt = if dt.is_finite() { dt.clamp(0.0, 0.05) } else { 1.0 / 60.0 };
-    let steps = (dt * 240.0).ceil().max(1.0) as usize;
-    let h = dt / steps as f64;
-    let omega = 16.0;
-    let damping = 0.82;
-    let yaw_error = |yaw: f64| (spring.target.yaw - yaw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
-    for _ in 0..steps.min(12) {
-        spring.yaw_velocity += (omega * omega * yaw_error(app.cam.yaw) - 2.0 * damping * omega * spring.yaw_velocity) * h;
-        spring.pitch_velocity += (omega * omega * (spring.target.pitch - app.cam.pitch) - 2.0 * damping * omega * spring.pitch_velocity) * h;
-        app.cam.yaw += spring.yaw_velocity * h;
-        app.cam.pitch = (app.cam.pitch + spring.pitch_velocity * h).clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-    }
-    app.cam.target = spring.target.target;
-    let done = yaw_error(app.cam.yaw).abs() < 1e-5
-        && (spring.target.pitch - app.cam.pitch).abs() < 1e-5
-        && spring.yaw_velocity.abs() < 1e-4
-        && spring.pitch_velocity.abs() < 1e-4;
-    if done {
-        app.cam = spring.target;
-    }
-    if let Some((pivot, at)) = spring.pivot
-        && let Some(after) = projection(app, rect).to_screen(pivot)
-    {
-        app.cam.pan(f64::from(at.x - after.x), f64::from(at.y - after.y), f64::from(rect.height().max(1.0)));
-    }
-    if !done {
-        app.viewport.orbit_snap = Some(spring);
-    }
 }
 
 /// Dragging anywhere on the axis gizmo orbits about the view centre. A stationary press
@@ -3209,7 +3068,7 @@ fn axis_view_orbit(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) -> bool {
     true
 }
 
-fn axis_view(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
+pub(crate) fn axis_view(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     match app.preferences.navigator_style {
         crate::prefs::NavigatorStyle::Axes => signed_axis_view(app, ui, rect),
         crate::prefs::NavigatorStyle::Cube => navigation_cube::show(app, ui, rect),
@@ -3272,36 +3131,8 @@ fn signed_axis_view(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
-/// A middle-button double-click goes Home (or fits, or nothing: Preferences › Navigation). Only
-/// clicks count: a press that moves (a pan or orbit drag) or is held is not one, and the two
-/// clicks must both be the middle button's, close together in time and place.
-fn middle_double_click(app: &mut SolveApp, ui: &egui::Ui, inside: bool) {
-    use egui::PointerButton::{Extra1, Extra2, Middle, Primary, Secondary};
-    let (double, releases, middle, other, dragging) = ui.input(|i| {
-        (
-            i.pointer.button_double_clicked(Middle),
-            i.events.iter().filter(|e| matches!(e, egui::Event::PointerButton { button: Middle, pressed: false, .. })).count(),
-            i.pointer.button_clicked(Middle),
-            [Primary, Secondary, Extra1, Extra2].into_iter().any(|b| i.pointer.button_clicked(b)),
-            i.pointer.is_decidedly_dragging(),
-        )
-    });
-    // egui pairs clicks of any buttons; the first click must have been the middle one too (or
-    // both arrive in this frame).
-    let go = double && inside && !other && (app.viewport.middle_clicked || releases >= 2);
-    app.viewport.middle_clicked = if other || dragging || go { false } else { middle || app.viewport.middle_clicked };
-    if !go {
-        return;
-    }
-    match crate::prefs::MiddleDoubleClick::of(app) {
-        crate::prefs::MiddleDoubleClick::Home => app.animate_view("home"),
-        crate::prefs::MiddleDoubleClick::Fit => app.animate_fit_all(),
-        crate::prefs::MiddleDoubleClick::Off => {}
-    }
-}
-
 /// At a halfway tie, prefer the square heading nearer the standard plan view.
-fn nearest_quarter_turn(yaw: f64) -> f64 {
+pub(crate) fn nearest_quarter_turn(yaw: f64) -> f64 {
     if !yaw.is_finite() {
         return 0.0;
     }
@@ -3345,15 +3176,17 @@ fn nav_bar(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     let items: [(&str, &str); 10] = [
         (
             "orbit",
-            if app.preferences.nav == crate::prefs::OPENSCAD_NAV {
+            if app.preferences.nav == crate::prefs::TOUCHPAD_NAV {
+                crate::i18n::tr("nav.touchpad.orbit")
+            } else if app.preferences.nav == crate::prefs::OPENSCAD_NAV {
                 "Orbit (left drag on empty space; Shift+left drag box-selects)"
             } else {
                 "Orbit (right drag; hold Shift to snap)"
             },
         ),
         ("spin", "Continuous orbit (stops at the next click or key)"),
-        ("pan", "Pan (drag; or middle drag)"),
-        ("zoom", "Zoom (drag; or wheel)"),
+        ("pan", if app.preferences.nav == crate::prefs::TOUCHPAD_NAV { crate::i18n::tr("nav.touchpad.pan") } else { "Pan (drag; or middle drag)" }),
+        ("zoom", if app.preferences.nav == crate::prefs::TOUCHPAD_NAV { crate::i18n::tr("nav.touchpad.zoom") } else { "Zoom (drag; or wheel)" }),
         ("fit", "Fit (F6)"),
         ("lookat", "Look At the selected face or plane (or the active sketch)"),
         ("home", "Home view"),
@@ -3375,6 +3208,7 @@ fn nav_bar(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
         || ui.rect_contains_pointer(axis_rect(app, rect))
         || app.viewport.axis_drag.is_some()
         || app.viewport.nav.is_some()
+        || app.viewport.modifier_nav.is_some()
         || app.viewport.spin
         || menu_open;
     let mut painter = ui.painter_at(rect);
@@ -3452,6 +3286,17 @@ fn view_menu(app: &mut SolveApp, ui: &mut egui::Ui, button: Rect) -> bool {
                 });
                 ui.checkbox(&mut s.follow_camera, crate::i18n::tr_label("Follow camera (Look At sketches)"));
             });
+            // The agent chat panel, once the chat is turned on in Preferences.
+            if crate::agent_chat::shown(app) {
+                ui.separator();
+                let mut open = app.agent_chat.open;
+                let r = ui.checkbox(&mut open, crate::agent_chat::panel_tip());
+                crate::scenario::publish_handle("view:agent_chat", r.rect.center());
+                if r.changed() {
+                    app.agent_chat.open = open;
+                    app.preferences.agent_chat_minimized &= !open;
+                }
+            }
         });
     });
     let clicked_out = ui.input(|i| i.pointer.any_pressed())
@@ -3462,6 +3307,7 @@ fn view_menu(app: &mut SolveApp, ui: &mut egui::Ui, button: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::navigation::*;
 
     /// Bodies drawn from their display plans, evaluated on the GPU, look like the same bodies
     /// built into triangles on the CPU: the sample design rendered both ways through the
@@ -3562,6 +3408,62 @@ mod tests {
         let n = (SIZE * SIZE) as usize;
         let drawn = img.chunks(4).filter(|p| p[..3] != [255, 255, 255]).count();
         assert!(drawn > n / 20, "the model is drawn: {drawn} pixels");
+    }
+
+    /// Supersampling (#1288): the sample design drawn at 2× and filtered down shows the same
+    /// model (the same pixels covered, give or take its outline) with smoothed edges: pixels part
+    /// model, part background, which a single-sampled frame does not have. Skipped without a GPU
+    /// adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn supersampling_draws_the_same_model_with_smooth_edges() {
+        let mut s = solidcraft_engine::Session::default();
+        s.run_script(&solidcraft_engine::sample::script()).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.viewport.no_pixels = true;
+        app.fit_view();
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        const SIZE: u32 = 256;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let proj = projection(&app, rect);
+        let e = proj.cam.eye().to_f32();
+        let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
+        let render =
+            |ssaa: f32| crate::gpu::render_offscreen_ssaa(build_scene(&app).merged(), proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, ssaa);
+        let (Some(plain), Some(super2)) = (render(1.0), render(2.0)) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let covered = |img: &[u8]| img.chunks(4).filter(|p| p[..3] != [255, 255, 255]).count();
+        let (a, b) = (covered(&plain), covered(&super2));
+        assert!(a > 2000, "the model is drawn: {a} pixels");
+        assert!((a as f64 - b as f64).abs() < a as f64 * 0.1, "same model: {a} vs {b} pixels covered");
+        // Edge pixels against the white background: neither white nor any colour the plain frame
+        // has, so blended. A count well above the plain frame's own.
+        let palette: std::collections::HashSet<[u8; 3]> = plain.chunks(4).map(|p| [p[0], p[1], p[2]]).collect();
+        let new_colours = super2.chunks(4).filter(|p| !palette.contains(&[p[0], p[1], p[2]])).count();
+        assert!(new_colours > 100, "the supersampled frame blends its edges: {new_colours} new colours");
+    }
+
+    /// The supersampled frame stays within the device's largest texture (#869) and a memory
+    /// budget, and is not drawn at all when that leaves too little to gain.
+    #[test]
+    fn supersampling_keeps_within_the_device_texture_limit() {
+        use crate::gpu::supersampled_size;
+        assert_eq!(supersampled_size([1920.0, 1080.0], 2.0, 16384, 1), Some([3840, 2160]));
+        assert_eq!(supersampled_size([1920.0, 1080.0], 1.5, 16384, 1), Some([2880, 1620]));
+        // A 4096 texture limit: a 2560 px wide view gets 1.6×.
+        let [w, h] = supersampled_size([2560.0, 1440.0], 2.0, 4096, 1).unwrap();
+        assert!((4095..=4096).contains(&w) && (2303..=2304).contains(&h), "{w} x {h}");
+        // Under 1.25× is not worth it: drawn as usual.
+        assert_eq!(supersampled_size([3840.0, 2160.0], 2.0, 4096, 1), None);
+        assert_eq!(supersampled_size([1920.0, 1080.0], 1.0, 16384, 1), None);
+        assert_eq!(supersampled_size([0.0, 1080.0], 2.0, 16384, 1), None);
+        // Under 1: drawn smaller and filtered up (the product preview past its budget, #1464).
+        assert_eq!(supersampled_size([3840.0, 2160.0], 0.5, 4096, 4), Some([1920, 1080]));
+        // 4× MSAA at 1440p: the memory budget caps it below 2×.
+        let [w, h] = supersampled_size([2560.0, 1440.0], 2.0, 16384, 4).unwrap();
+        assert!(w < 5120 && w as f32 >= 2560.0 * 1.25 && u64::from(w) * u64::from(h) * 32 <= 384 << 20, "{w} x {h}");
     }
 
     /// A hovered face lights solidly over a body drawn from its display plan on the GPU: the
@@ -4069,6 +3971,220 @@ mod tests {
     }
 
     #[test]
+    fn touchpad_modifier_motion_navigates_without_buttons_or_document_changes() {
+        for alt in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = hover_app(false);
+            app.preferences.nav = "touchpad".into();
+            let p = pos2(350.0, 300.0);
+            hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+            let before = app.cam;
+            let doc = app.session.doc.to_json();
+            let undo = app.session.undo.len();
+            let log = app.session.log.len();
+            let mods = egui::Modifiers { shift: !alt, alt, ..Default::default() };
+            hover_frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(mods)]);
+            hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p + vec2(30.0, 20.0))]);
+            assert!(!ctx.input(|i| i.pointer.any_down()));
+            if alt {
+                assert!((app.cam.yaw - before.yaw - 0.24).abs() < 1e-6);
+                assert_eq!(app.cam.target, before.target);
+            } else {
+                assert_ne!(app.cam.target, before.target);
+                assert_eq!(app.cam.yaw, before.yaw);
+            }
+            assert_eq!(app.cam.distance, before.distance);
+            let after = app.cam;
+            for _ in 0..3 {
+                hover_frame(&mut app, &ctx, vec![]);
+                assert_eq!(app.cam, after, "no drift between pointer events");
+                assert!(app.viewport.hover.is_none());
+            }
+            hover_frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE), egui::Event::PointerMoved(p)]);
+            assert_eq!(app.cam, after, "release ends modifier-only navigation");
+            assert_eq!(app.session.doc.to_json(), doc);
+            assert_eq!(app.session.undo.len(), undo);
+            assert_eq!(app.session.log.len(), log, "continuous motion must not flood the command log");
+            assert!(app.session.selection.is_empty());
+            assert!(app.viewport.boxsel.is_none() && app.viewport.point_drag.is_none());
+        }
+    }
+
+    #[test]
+    fn touchpad_motion_uses_the_effective_perspective_projection() {
+        let mut app = hover_app(false);
+        app.ui.perspective = true;
+        app.cam = Camera { yaw: 0.0, pitch: 0.0, distance: 100.0, ..Default::default() };
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let pivot = Vec3::new(15.0, -50.0, 0.0);
+        let before = projection(&app, rect).to_screen(pivot).unwrap();
+        camera_motion(&mut app, rect, json!({"motion":"orbit","delta":[20,10],"pivot":pivot}));
+        let after = projection(&app, rect).to_screen(pivot).unwrap();
+        assert!(before.distance(after) < 1e-3, "rendered pivot drifted from {before:?} to {after:?}");
+        assert_eq!(app.cam.fov, 0.0, "the projection toggle remains UI state, not a stored-camera mutation");
+    }
+
+    #[test]
+    fn touchpad_motion_does_not_move_the_camera_under_a_canvas_triad() {
+        let ctx = egui::Context::default();
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length":20,"width":20,"height":20})).unwrap();
+        s.selection = vec![Sel::Body { name: "Body1".into() }];
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.preferences.nav = "touchpad".into();
+        app.viewport.no_pixels = true;
+        app.start("solid.move");
+        app.dialog.as_mut().unwrap().focus = false;
+        let p = pos2(100.0, 100.0);
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+        let triad = crate::dialogs_move::triad(&app, app.dialog.as_ref().unwrap()).unwrap();
+        let handle = projection(&app, app.viewport.rect.unwrap()).to_screen(triad.center).unwrap();
+        let mods = egui::Modifiers { alt: true, ..Default::default() };
+        hover_frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(mods)]);
+        assert!(!ctx.egui_wants_keyboard_input());
+        let before = app.cam;
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(handle)]);
+        assert_eq!(app.cam, before, "a triad handle owns its input before the camera changes");
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        assert_eq!(app.cam, before, "leaving the handle rearms without a jump");
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p + vec2(5.0, 0.0))]);
+        assert_ne!(app.cam.yaw, before.yaw, "the exposed viewport remains navigable with Move open");
+    }
+
+    #[test]
+    fn touchpad_motion_preserves_input_ownership_and_rearms_without_jumping() {
+        let ctx = egui::Context::default();
+        let mut app = hover_app(false);
+        app.preferences.nav = "touchpad".into();
+        app.preferences.orbit_around = crate::prefs::OrbitAround::Cursor;
+        let p = pos2(350.0, 300.0);
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        hover_frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(alt)]);
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p + vec2(10.0, 0.0))]);
+        let pivot = app.viewport.orbit_pivot;
+        assert!(pivot.is_some());
+        hover_frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.viewport.orbit_pivot, pivot, "pauses keep the same orbit pivot");
+        let before = app.cam;
+        let bar = app.viewport.layout.as_ref().unwrap().navigation.center();
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(bar)]);
+        assert_eq!(app.cam, before, "the navigation bar owns its input");
+        assert!(app.viewport.orbit_pivot.is_none());
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        assert_eq!(app.cam, before, "reentry must not apply the distance from an overlay");
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p + vec2(5.0, 0.0))]);
+        assert_ne!(app.cam.yaw, before.yaw);
+        let before = app.cam;
+        for mods in [
+            egui::Modifiers::NONE,
+            egui::Modifiers { shift: true, alt: true, ..Default::default() },
+            egui::Modifiers { shift: true, ctrl: true, ..Default::default() },
+            egui::Modifiers { alt: true, command: true, mac_cmd: true, ..Default::default() },
+        ] {
+            hover_frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(mods), egui::Event::PointerMoved(p)]);
+            assert_eq!(app.cam, before, "unbound combinations must not navigate");
+        }
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        hover_frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(shift), egui::Event::PointerMoved(p)]);
+        hover_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: shift }],
+        );
+        hover_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p + vec2(30.0, 20.0))]);
+        assert_eq!(app.cam, before, "Shift+left drag must still box-select, not pan");
+        assert!(app.viewport.boxsel.is_some());
+        hover_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton { pos: p + vec2(30.0, 20.0), button: egui::PointerButton::Primary, pressed: false, modifiers: shift }],
+        );
+        assert_eq!(app.cam, before, "the release frame still belongs to selection");
+    }
+
+    #[test]
+    fn touchpad_focus_and_preset_changes_discard_old_motion() {
+        let ctx = egui::Context::default();
+        let mut app = hover_app(false);
+        app.preferences.nav = "touchpad".into();
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        let frame = |app: &mut SolveApp, focused: bool, p: Pos2| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                    focused,
+                    events: vec![egui::Event::ModifiersChanged(alt), egui::Event::PointerMoved(p)],
+                    ..Default::default()
+                },
+                |ui| show(app, ui),
+            );
+            out.textures_delta.clear();
+        };
+        frame(&mut app, true, pos2(300.0, 300.0));
+        frame(&mut app, true, pos2(310.0, 300.0));
+        let before = app.cam;
+        frame(&mut app, false, pos2(500.0, 400.0));
+        frame(&mut app, true, pos2(350.0, 300.0));
+        assert_eq!(app.cam, before, "focus loss and regain must not jump");
+        frame(&mut app, true, pos2(360.0, 300.0));
+        assert!((app.cam.yaw - before.yaw - 0.08).abs() < 1e-6);
+        app.preferences.nav = "fusion".into();
+        let before = app.cam;
+        frame(&mut app, true, pos2(450.0, 300.0));
+        assert_eq!(app.cam, before);
+        app.preferences.nav = "touchpad".into();
+        frame(&mut app, true, pos2(500.0, 300.0));
+        assert_eq!(app.cam, before, "changing presets must rearm before moving");
+        app.viewport.spin = true;
+        frame(&mut app, true, pos2(510.0, 300.0));
+        assert!(!app.viewport.spin, "pointer-only navigation stops continuous orbit");
+        assert!((app.cam.yaw - before.yaw - 0.08).abs() < 1e-6);
+    }
+
+    #[test]
+    fn touchpad_vertical_trackpad_scroll_zooms_without_overwriting_saved_pan() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.nav = "touchpad".into();
+        h.app.preferences.smooth_wheel_zoom = false;
+        h.app.preferences.zoom_to_cursor = false;
+        h.call("ui.move", json!({"x":800,"y":500}));
+        let before = h.app.cam;
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::Move, egui::TouchPhase::End] {
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase,
+            });
+            h.frame();
+        }
+        assert!((h.app.cam.distance - before.distance * (-0.18_f64).exp()).abs() < 1e-6);
+        assert_eq!(h.app.cam.target, before.target);
+        assert!(h.app.preferences.trackpad_pan);
+        let after = h.app.cam;
+        h.frames(60);
+        assert_eq!(h.app.cam, after);
+        h.app.preferences.nav = "fusion".into();
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::Move, egui::TouchPhase::End] {
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase,
+            });
+            h.frame();
+        }
+        assert_eq!(h.app.cam.distance, after.distance);
+        assert_ne!(h.app.cam.target, after.target);
+    }
+
+    #[test]
     fn hover_stays_off_between_navigation_events_and_returns_on_release() {
         for gpu in [false, true] {
             for button in [egui::PointerButton::Middle, egui::PointerButton::Secondary, egui::PointerButton::Primary] {
@@ -4121,6 +4237,65 @@ mod tests {
         app.cam_anim = None;
         hover_frame(&mut app, &ctx, vec![]);
         assert!(app.viewport.hover.is_some());
+    }
+
+    /// After a close-up refines a body (#1320), the model draws it from the refined plan (on the
+    /// GPU) or its mesh (on the CPU), its edges come from that mesh too, and a hovered face lights
+    /// exactly triangles the model draws, never another triangulation (#1064).
+    #[test]
+    fn a_refined_body_highlights_on_its_drawn_triangles() {
+        use solidcraft_engine::doc::display_quality::current;
+        let tris_of = |bytes: &[u8]| -> Vec<[u32; 9]> {
+            bytes
+                .chunks(3 * crate::gpu::TRI_SIZE)
+                .map(|t| {
+                    let mut v: Vec<[u32; 3]> = t
+                        .chunks(crate::gpu::TRI_SIZE)
+                        .map(|c| std::array::from_fn(|i| u32::from_le_bytes(c[i * 4..i * 4 + 4].try_into().unwrap())))
+                        .collect();
+                    v.sort_unstable();
+                    std::array::from_fn(|i| v[i / 3][i % 3])
+                })
+                .collect()
+        };
+        let mesh_tris = |m: &solidcraft_engine::geom::Mesh| -> std::collections::HashSet<[u32; 9]> {
+            let mut sc = GpuScene::default();
+            for f in 0..m.tri_face.iter().map(|f| *f as usize + 1).max().unwrap_or(0) {
+                face_tris(&mut sc, m, f, [0; 4], true);
+            }
+            tris_of(&sc.tris).into_iter().collect()
+        };
+        for tess in [true, false] {
+            let mut app = cylinder_app();
+            app.viewport.no_pixels = true;
+            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+            let body = app.session.world_state().bodies[0].clone();
+            let before = build_scene(&app).merged();
+            let key = scene_key(&app);
+            assert!(app.viewport.lod.lock().unwrap().force(&body, current(), 2));
+            assert_ne!(scene_key(&app), key, "a refinement rebuilds the scene");
+            let (plan, mesh) = refined(&app, &body).unwrap();
+            assert!(mesh.triangles.len() > body.plan_mesh().unwrap().triangles.len() * 2);
+            let scene = build_scene(&app).merged();
+            if tess {
+                assert!(std::sync::Arc::ptr_eq(&scene.planned[0].plan, &plan), "faces drawn from the refined plan");
+            } else {
+                assert_eq!(scene.tris.len(), mesh.triangles.len() * 3 * crate::gpu::TRI_SIZE, "faces built from the refined mesh");
+                assert!(scene.tris.len() > before.tris.len());
+            }
+            // Edges (lines) from the refined mesh: finer polylines.
+            assert!(scene.lines.len() > before.lines.len(), "{} vs {}", scene.lines.len(), before.lines.len());
+            let drawn = mesh_tris(&mesh);
+            let mut lit_faces = 0;
+            for index in 0..body.body.face_count() {
+                app.viewport.hover = Some(Hit::Face { body: body.name.clone(), index, point: Vec3::ZERO });
+                let lit = tris_of(&build_highlight(&app).tris);
+                assert!(!lit.is_empty(), "face {index} lights");
+                assert!(lit.iter().all(|t| drawn.contains(t)), "face {index}: every lit triangle is a drawn one");
+                lit_faces += 1;
+            }
+            assert!(lit_faces >= 3, "{lit_faces} faces");
+        }
     }
 
     fn cylinder_app() -> SolveApp {
@@ -4282,6 +4457,47 @@ mod tests {
         assert_eq!(d.items().len(), 2, "a rim and a wall are two measurement targets");
         d.pick(&app.session, Sel::Face { body: b.name.clone(), index: faces[1] as usize, point: Vec3::new(-10.0, 0.0, 10.0) });
         assert_eq!(d.items().len(), 1, "the other half toggles the same wall");
+    }
+
+    #[test]
+    fn colour_analyses_show_a_legend() {
+        // #973: Draft, Accessibility and Curvature Map say what their colours mean; Zebra and no
+        // analysis draw no legend.
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+        let legend = |h: &mut crate::scenario::Harness| {
+            h.frames(2);
+            crate::scenario::handle_at("analysis:legend").is_some()
+        };
+        assert!(!legend(&mut h));
+        for (cmd, shown) in [("inspect.draft", true), ("inspect.accessibility", true), ("inspect.curvature_map", true), ("inspect.zebra", false)] {
+            h.app.session.analysis = None;
+            h.app.run(cmd, json!({})).unwrap();
+            assert!(h.app.session.analysis.is_some(), "{cmd}");
+            assert_eq!(legend(&mut h), shown, "{cmd}");
+        }
+        h.app.session.analysis = None;
+        assert!(!legend(&mut h));
+    }
+
+    #[test]
+    fn a_section_leaves_the_origin_planes_and_axes_whole() {
+        // #1229: the origin planes and axes are reference geometry; the section plane cuts the
+        // model, not them, so they go to the lists the GPU draws without the section clip.
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":20,"corner":[-10,-10,-10]})).unwrap();
+        h.app.run("inspect.section", json!({"plane": "XZ", "offset": 0})).unwrap();
+        h.app.ui.show_origin = true;
+        h.frames(2);
+        assert!(section_plane(&h.app).is_some());
+        let sc = build_highlight(&h.app);
+        let planes = origin_planes(&h.app).len();
+        assert!(planes > 0);
+        assert_eq!(sc.guide_trans.len(), planes * 6 * crate::gpu::TRI_SIZE);
+        assert!(sc.trans.is_empty(), "no origin plane is drawn where the section clips");
+        // Each origin axis: a solid part and dashes beyond, plus each plane's four edges.
+        assert!(sc.guide_lines.len() >= (planes * 4 + 3) * crate::gpu::LINE_SIZE);
     }
 
     #[test]
@@ -4974,10 +5190,35 @@ mod tests {
         }
     }
 
+    /// The origin pivot holds through a Shift drag that snaps to an axis: the spring eases the
+    /// view round without letting the origin slide on screen.
+    #[test]
+    fn snapping_keeps_the_origin_still() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.orbit_around = crate::prefs::OrbitAround::Origin;
+        h.app.run("solid.box", json!({"length":40,"width":40,"height":40})).unwrap();
+        h.app.fit_view();
+        let rect = h.app.viewport.rect.unwrap();
+        let at = rect.center() + vec2(50.0, -20.0);
+        orbit_drag(&mut h.app, rect, 0.0, 0.0, Some(at), true, true);
+        assert_eq!(
+            h.app.viewport.orbit_snap.as_ref().and_then(|s| s.pivot).map(|(p, _)| p),
+            Some(Vec3::ZERO),
+            "the origin is the pivot while snapping"
+        );
+        let before = projection(&h.app, rect).to_screen(Vec3::ZERO).unwrap();
+        for _ in 0..30 {
+            orbit_drag(&mut h.app, rect, 4.0, 2.0, Some(at), true, true);
+            step_orbit_snap(&mut h.app, rect, 1.0 / 60.0);
+            let after = projection(&h.app, rect).to_screen(Vec3::ZERO).unwrap();
+            assert!(after.distance(before) < 2.0, "{before:?} -> {after:?}");
+        }
+    }
+
     #[test]
     fn shift_orbit_keeps_cursor_pivot_and_default_middle_pan() {
         let mut h = crate::scenario::Harness::new();
-        h.app.preferences.orbit_cursor = true;
+        h.app.preferences.orbit_around = crate::prefs::OrbitAround::Cursor;
         h.app.run("solid.box", json!({"length":40,"width":40,"height":40})).unwrap();
         h.app.fit_view();
         let rect = h.app.viewport.rect.unwrap();

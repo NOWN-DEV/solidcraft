@@ -231,6 +231,11 @@ pub(crate) fn extension_fits(face: &mt::Face, p: Vec3, q: Vec3, tol: f64) -> boo
             {
                 return false;
             }
+            // Curve endpoints may round to opposite sides of a ray that follows a
+            // straight boundary into the face. Treat points within its clearance as
+            // on the ray, so a shared endpoint contributes one crossing.
+            let ay = if ay.abs() <= tol { 0.0 } else { ay };
+            let by = if by.abs() <= tol { 0.0 } else { by };
             if (ay > 0.0) != (by > 0.0) {
                 let hit = ax - ay * (bx - ax) / (by - ay);
                 if hit > tol && hit <= len + tol {
@@ -2117,6 +2122,21 @@ fn chamfer_built(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
             Err(_) => {}
         }
     }
+    // A curved blend follows the whole tangent chain. Give it all picks together so
+    // picks on that chain are consumed once, rather than chamfering its new rails again.
+    if tools.is_err() && edges.len() > 1 {
+        let solid = cur.deep_copy();
+        let ids = edge_ids(&cur, &solid, edges)?;
+        let all = Body::unique_edges(&solid);
+        let same_chain = ids
+            .first()
+            .and_then(|id| all.iter().find(|e| e.id() == *id))
+            .and_then(|e| smooth_chain(&solid, e))
+            .is_some_and(|chain| ids.len() > 1 && ids.iter().all(|id| chain.contains(id)));
+        if same_chain && let Ok(result) = blend(&cur, edges, distance, Shape::Flat, "chamfer") {
+            return Ok(result);
+        }
+    }
     let start = cur.clone();
     let one_by_one = || -> Result<Body> {
         let mut cur = start.clone();
@@ -2663,12 +2683,20 @@ mod tests {
             ),
             (Shape::Flat, 0.32, 0.8 / 3.0),
         ] {
-            let out = blend(&body, &[Vec3::new(52.0, 20.0, 0.0)], 0.8, shape, "blend").unwrap();
+            let picks = [Vec3::new(52.0, 20.0, 0.0)];
+            let out = match shape {
+                Shape::Round => fillet(&body, &picks, 0.8),
+                _ => chamfer(&body, &picks, 0.8),
+            }
+            .unwrap();
             assert!(out.validity().is_empty(), "{:?}", out.validity());
             // Pappus: the section turned half round the axis at its centroid's radius.
             let want = area * std::f64::consts::PI * (12.0 - c);
             let removed = v0 - vol(&out);
             assert!((removed - want).abs() < want * 2e-3, "{removed} vs {want}");
+            // The app's planned mesh must also close, with the same analytic removal.
+            let planned = crate::issue_851_tests::planned_volume(&body) - crate::issue_851_tests::planned_volume(&out);
+            assert!((planned - want).abs() < want * 2e-3, "display mesh: {planned} vs {want}");
         }
     }
 

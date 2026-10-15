@@ -27,11 +27,13 @@ new uses of it anywhere else. Public docs/web/Flatpak deployments use project Pa
 ## Never crash
 People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
-  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`). The two exceptions, in the app crate
+  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`). The three exceptions, in the app crate
   (which denies it instead), have no safe API: two functions in
   `apps/solidcraft/src/open_documents.rs` (macOS hands Finder files only to an Objective-C
-  method) and the Windows-only `apps/solidcraft/src/native_crash.rs` (the exception filter that
-  records crashes inside native code such as graphics drivers).
+  method), the Windows-only `apps/solidcraft/src/native_crash.rs` (the exception filter that
+  records crashes inside native code such as graphics drivers) and the Windows-only
+  `apps/solidcraft/src/native_frame.rs` (the window procedure that answers the resize-border hit
+  test of the window without OS decorations).
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
   returns an error ("not supported yet: …"); it never panics.
 - **Input-derived numbers are hostile** (command parameters, design files, control-channel
@@ -79,6 +81,10 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
   egui/eframe/winit/wgpu/rfd. **The UI crate is swappable.** Only `crates/kernel` may use `truck`.
 - **The UI is thin**: panels read engine state and act through `app.run(id, params)` /
   `app.start(id)`. Colours come from `theme::Tokens`.
+- **One set of camera controls**: every page or canvas with a camera (viewport, Render
+  preview, future flat pattern or drawing pages) calls `navigation::handle` with its `NavCaps`
+  (orbit off for flat 2D pages). New canvases must use `navigation::handle`; never hand-roll
+  camera input (a test rejects it).
 - **Rust only.** Units are millimetres and radians internally; Z is up. The one exception is
   JavaScript the browser requires: the service worker `apps/solidcraft-web/sw.js` (browsers only
   run service workers as JavaScript) and the small inline scripts in `apps/solidcraft-web/index.html`.

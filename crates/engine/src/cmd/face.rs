@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use solidcraft_doc::{EmbossFace, apply_point, mat_inverse, mat_mul};
 use solidcraft_geom::{Mesh, Vec2, Vec3};
 
-use crate::params::bad;
+use crate::params::{bad, vec3};
 use crate::{Result, Session};
 
 fn point_triangle_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
@@ -55,6 +55,22 @@ pub(super) fn face_is_planar(s: &Session, p: Vec3) -> Option<bool> {
         .collect();
     let n0 = *ns.first()?;
     Some(ns.iter().all(|n| n.dot(n0) > 1.0 - 1e-6))
+}
+
+/// A face given to a command: a point `[x, y, z]` on it (or `{point}`), or its name as
+/// `model.faces` lists it, looked up on `body` (any body without one). A name becomes a point on
+/// that face, which the feature keeps like a picked one, so it also keeps the face's name.
+/// The point is in the frame of the command's other picks: the component's own when
+/// they were mapped into it, else the world's.
+pub(super) fn face_ref(s: &Session, v: &Value, body: Option<&str>, cmd: &str) -> Result<Vec3> {
+    if let Some(name) = v.as_str() {
+        if name.is_empty() || name.len() > 512 {
+            return Err(bad(cmd, "a face name is 1…512 characters"));
+        }
+        let st = if crate::frames::mapped() { s.model.state() } else { s.world_state() };
+        return solidcraft_doc::naming::named_face_point(&st, body, name).map_err(|why| bad(cmd, why));
+    }
+    vec3(v).or_else(|| v.get("point").and_then(vec3)).ok_or_else(|| bad(cmd, "a face is a point [x, y, z] on it, or its name from model.faces"))
 }
 
 /// The body face under a point: (mesh, face index, distance, body).
@@ -112,8 +128,9 @@ fn xy(v: Vec2) -> Value {
 }
 
 /// Start a sketch on the planar face at `point` holding a copy of the face boundary. Returns
-/// the sketch id and a point inside the face (sketch coordinates). The sketch is left active.
-pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body: Option<&str>) -> Result<(u64, Vec2)> {
+/// the sketch id, a point inside the face (sketch coordinates), and the picked body's name.
+/// The sketch is left active.
+pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body: Option<&str>) -> Result<(u64, Vec2, String)> {
     let none = || match face_body {
         Some(b) => bad(cmd, format!("no face of `{b}` at `face`")),
         None => bad(cmd, "no body face at `face`"),
@@ -183,7 +200,7 @@ pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body:
     // The face's edges came in as linked projections: they follow the face when earlier
     // features change, so nothing is copied.
     if r.get("projected").is_some_and(|x| !x.is_null()) {
-        return Ok((sid, plane.to_local(author_inside)));
+        return Ok((sid, plane.to_local(author_inside), body));
     }
     for e in &edges {
         let pts: Vec<Vec2> = e.iter().map(|p| plane.to_local(*p)).collect();
@@ -221,9 +238,13 @@ pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body:
             }
         };
     }
-    Ok((sid, plane.to_local(author_inside)))
+    Ok((sid, plane.to_local(author_inside), body))
 }
 
 #[cfg(test)]
 #[path = "face_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "face_join_tests.rs"]
+mod join_tests;

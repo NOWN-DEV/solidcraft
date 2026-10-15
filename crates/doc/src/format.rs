@@ -158,13 +158,77 @@
 //!   transformation (an absent field means no setups, and empty render state is not saved); the
 //!   version stamp makes 0.11.0 (which reads up to 20) ask for an update instead of silently
 //!   dropping saved setups.
+//!   Also first saved in 21, a design can carry `metadata` (#1015): design properties
+//!   (`project`, `part_number`, `revision`, `author`, `organization`, `description`, `license`,
+//!   each text) and other tools' data, each tool's under its own reverse-DNS key
+//!   (`com.example.tool`). Every key is kept as it is, and nothing in it is checked when the
+//!   design opens. A design without it saves as before. 0.11.x refuses format 21, so no
+//!   released build drops the properties when it saves.
+//!   Under the same version, looks can explicitly select opaque PBR parameters (`pbr`: metal
+//!   fraction, roughness, dielectric IOR). Absent fields keep the scalar shading a look always
+//!   had; 0.11.0 asks for an update instead of silently dropping the response.
+//!   A `SurfaceUntrim` feature (Untrim: a `face` as `body` and `point`, optional `holes`
+//!   points, `outer` and `in_place`) is also first saved in 21; 0.11.0 asks for an update
+//!   instead of meeting a feature it can't read.
+//!   A `SurfaceRuled` feature (Ruled Surface: `body`, `edges` points, `distance`, optional
+//!   `mode`, `angle`, `direction`, `flip`, `corners` and `face`) is also first saved in 21;
+//!   0.11.0 asks for an update instead of meeting a feature it can't read.
+//!   Under the same version, a `SurfaceExtend` can say how it continues the surface (`mode`:
+//!   `tangent` or `curvature`; `natural` when absent), extend up to something instead of its
+//!   `distance` (`up_to`: a `plane`, a `face` as `body` and `point`, or `bounds`) and keep the
+//!   neighbouring edges as they are (`neighbours: false`). An Extend without them builds the
+//!   planar extension it always did and saves as before; 0.11.0 asks for an update instead of
+//!   dropping them and extending a plane by the distance.
+//!   Under the same version, an extrude's extent records how a symmetric `distance` is read
+//!   (`convention`: `total_distance`, split evenly around the start plane, which new solid
+//!   extrudes save; or `legacy_per_side`). An extent without it keeps the per-side reading
+//!   designs always had, so their thickness and parameters don't change; 0.11.0 asks for an
+//!   update instead of doubling a total-distance extrude.
+//!   Under the same version, a Convert to Sheet Metal bend point can lie in the middle of a
+//!   chamfer (a flat strip between two faces), which then is one bend at the two faces' virtual
+//!   sharp; 0.11.0 bent the chamfer's nearest edge instead or found no edge there. Bend points
+//!   on edges convert as before.
+//!   A bend point can also lie on a bend modelled with its radius (a cylinder between two flat
+//!   faces tangent to it), which then is one bend at the two faces' virtual sharp with the
+//!   rule's radius; 0.11.0 found no edge there or refused the curved face.
+//!   Also under 21, a Sweep and a Surface Sweep can carry `orientation` (`parallel`, or
+//!   `{direction: [x, y, z]}`; absent: perpendicular), `twist` (an angle expression) and `scale`
+//!   (the end scale, an expression). A sweep without them saves as before; 0.11.x refuses
+//!   format 21, so no released build sweeps a twisted or scaled profile straight.
+//!   Nothing new is saved for converted sheets' corners and bend ends, but a design converts as
+//!   the rule says when it is evaluated: corners between the walls take the rule's corner relief
+//!   and a bend ending beside more of the fixed face its bend relief (0.11.0 left every corner a
+//!   notch and cut no bend relief), and a wall on part of an edge bends only where it stands
+//!   (0.11.0 refused it).
+//! - 22: an Import (STEP) feature can list `skip`: indices of the file's bodies it does not
+//!   build, because they are later instances of a part the file places more than once and the
+//!   other occurrences of that part's component show them (#1386: an imported file becomes a
+//!   component, an assembly in it nested components). Version 21 designs need no
+//!   transformation: an Import without it builds every body, as it always did, and designs
+//!   whose imports sit loose in a component are left as they are. The version stamp makes
+//!   0.12.0 (which reads up to 21) ask for an update instead of building those instances again
+//!   on top of their occurrences.
+//!   Also under 22, a number in an expression can be written with a decimal comma outside
+//!   parentheses (`2,5 mm` is `2.5 mm`, #1347; inside a function's parentheses the comma still
+//!   separates its arguments). Nothing new is saved, but an expression typed that way is saved as
+//!   typed; 0.12.0 asks for an update instead of failing to evaluate it.
+//!   Also under 22, a design can hold a `SurfaceBlend` (Blend Surface: `from`/`to` edge chains of
+//!   two bodies, optional `continuity`, `bulge`, `align`, `stitch`), and a `Patch` can carry a
+//!   `crown` (0 by default, and then not saved: a bump that vanishes on the loop, so the face
+//!   still meets the picked edges). Version 21 designs need no transformation; 0.12.0 asks for an
+//!   update instead of meeting a feature it can't read or dropping a patch's crown.
+//!   Also under 22, a sketch text's link source can say that its place, height or angle are
+//!   expressions (`exprs`: `x`, `y`, `height`, `angle`, each an expression over the design's
+//!   parameters); the source's `at`, `height` and `angle` then hold the numbers they last came
+//!   to. A text without `exprs` is set as it always was; 0.12.0 asks for an update instead of
+//!   dropping the expressions and keeping the text at its last numbers.
 
 use serde_json::Value;
 
 use crate::{DocError, Document, Result};
 
 /// The format this build writes.
-pub const FORMAT: u32 = 21;
+pub const FORMAT: u32 = 22;
 
 pub fn format_string(n: u32) -> String {
     format!("solidcraft/{n}")
@@ -181,7 +245,7 @@ pub fn version_of(s: &str) -> Option<u32> {
 
 /// JSON-level upgrades: entry `i` turns format `i + 1` into `i + 2`.
 type JsonStep = fn(&mut Value) -> Result<()>;
-const JSON_STEPS: [JsonStep; 20] = [
+const JSON_STEPS: [JsonStep; 21] = [
     |_| Ok(()),
     v2_to_v3,
     v3_to_v4,
@@ -195,6 +259,7 @@ const JSON_STEPS: [JsonStep; 20] = [
     |_| Ok(()),
     |_| Ok(()),
     v13_to_v14,
+    |_| Ok(()),
     |_| Ok(()),
     |_| Ok(()),
     |_| Ok(()),
@@ -400,7 +465,7 @@ pub fn read(s: &str) -> Result<Document> {
             "this design was saved by a newer SolidCraft (file format {version}; this version reads formats up to {FORMAT}): update SolidCraft to open it"
         )));
     }
-    check_numbers(&v, 0)?;
+    check_design_numbers(&v)?;
     crate::config::validate_rules_json(&v)?;
     crate::config::validate_styles_json(&v)?;
     crate::face_anchor::validate_face_anchors_json(&v)?;
@@ -869,6 +934,16 @@ fn validate_freeform_offsets(value: &Value) -> Result<()> {
 /// outside what the kernel's tolerances serve.
 const MAX_REAL: f64 = 1e9;
 
+/// Every number the design itself holds is in range ([`check_numbers`]). `metadata` is left
+/// alone: it is other tools' data, kept as it is and never read as a number (#1015); parsing
+/// already bounds its nesting.
+fn check_design_numbers(v: &Value) -> Result<()> {
+    match v {
+        Value::Object(m) => m.iter().filter(|(k, _)| k.as_str() != "metadata").try_for_each(|(_, x)| check_numbers(x, 1)),
+        v => check_numbers(v, 0),
+    }
+}
+
 /// Every non-integer number in the file is finite and within ±`MAX_REAL` (a damaged or hostile
 /// file is refused instead of overflowing the geometry later).
 fn check_numbers(v: &Value, depth: usize) -> Result<()> {
@@ -1100,6 +1175,7 @@ mod tests {
                     sketch,
                     profiles: ProfileSel::All,
                     extent: Extent {
+                        convention: crate::ExtrudeConvention::LegacyPerSide,
                         distance: "10".into(),
                         direction: Direction::Negative,
                         distance2: None,
@@ -1718,5 +1794,29 @@ mod tests {
         assert_eq!(back.components.len(), before);
         let json = edited(&d, |v| v["components"][1]["id"] = u64::MAX.into());
         assert!(read(&json).unwrap_err().to_string().contains("damaged design"));
+    }
+
+    /// A sweep saved before its options existed loads as a plain sweep and saves as it was; the
+    /// options round-trip.
+    #[test]
+    fn sweep_options_are_optional_and_round_trip() {
+        use crate::{FeatureKind, SweepOrientation};
+        let old =
+            serde_json::json!({"type": "sweep", "sketch": 1, "profiles": {"type": "all"}, "path_sketch": 2, "path": ["l1"], "operation": "new_body"});
+        let k: FeatureKind = serde_json::from_value(old.clone()).unwrap();
+        let FeatureKind::Sweep { orientation, twist, scale, .. } = &k else { panic!("{k:?}") };
+        assert!(orientation.is_perpendicular() && twist.is_none() && scale.is_none());
+        assert_eq!(serde_json::to_value(&k).unwrap(), old);
+        let old = serde_json::json!({"type": "surface_sweep", "sketch": 1, "path_sketch": 2, "path": ["l1"]});
+        let k: FeatureKind = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&k).unwrap(), old);
+        let new = serde_json::json!({"type": "surface_sweep", "sketch": 1, "path_sketch": 2, "path": ["l1"],
+            "orientation": {"direction": [0.0, 1.0, 0.0]}, "twist": "90 deg", "scale": "0.5"});
+        let k: FeatureKind = serde_json::from_value(new.clone()).unwrap();
+        let FeatureKind::SurfaceSweep { orientation, .. } = &k else { panic!("{k:?}") };
+        assert_eq!(*orientation, SweepOrientation::Direction(solidcraft_geom::Vec3::Y));
+        assert_eq!(serde_json::to_value(&k).unwrap(), new);
+        let parallel: SweepOrientation = serde_json::from_value(serde_json::json!("parallel")).unwrap();
+        assert_eq!(parallel, SweepOrientation::Parallel);
     }
 }

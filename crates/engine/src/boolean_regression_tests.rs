@@ -250,3 +250,41 @@ fn press_pull_on_the_enclosure_lid_is_prompt() {
     }
     assert!(total(&s) > before, "{before} -> {}", total(&s));
 }
+
+/// A lip swept round a block's rim, flush with its sides and round its corners, joins it as one
+/// solid of both volumes: the block (50 × 40 with R4.5 corners, 10 high) and the lip (1 × 1 along
+/// 41 + 31 + 41 mm of straight rim and two quarter turns between radii 3.5 and 4.5).
+#[test]
+fn lip_swept_flush_round_a_corner_joins() {
+    let s = replay(include_str!("../../../examples/regressions/lip_swept_flush_round_corner.json"));
+    let bodies = &s.model.state().bodies;
+    assert_eq!(bodies.len(), 1);
+    let b = &bodies[0];
+    assert!(b.body.validity().is_empty(), "{:?}", b.body.validity());
+    assert_eq!(b.body.shell_count(), 1);
+    let block = (50.0 * 40.0 - (4.0 - std::f64::consts::PI) * 4.5 * 4.5) * 10.0;
+    let lip = 41.0 + 31.0 + 41.0 + 2.0 * std::f64::consts::PI * (4.5 * 4.5 - 3.5 * 3.5) / 4.0;
+    let volume = b.body.tessellate(1e-5).unwrap().measure().volume;
+    assert!((volume - block - lip).abs() < 0.02, "{volume} expected {}", block + lip);
+}
+
+/// #1275: an Extrude Cut of a whole face of a rounded-rectangle block with a bottom chamfer. The
+/// tool's corner cylinders lay on the block's; they are grown off them now, as straight edges
+/// were, and the cut takes 5 mm off the top.
+#[test]
+fn cut_of_a_whole_face_beside_round_corners_after_a_chamfer() {
+    let s = replay(include_str!("../../../examples/regressions/cut_whole_face_after_bottom_chamfer.json"));
+    let bodies = &s.model.state().bodies;
+    assert_eq!(bodies.len(), 1);
+    let b = &bodies[0];
+    assert!(b.body.validity().is_empty(), "{:?}", b.body.validity());
+    let pi = std::f64::consts::PI;
+    let block = (40.0 * 40.0 - (4.0 - pi) * 8.0 * 8.0) * 15.0;
+    // The chamfer's 2 × 2 triangle swept along the loop (Pappus: its centroid is 2/3 mm in).
+    let chamfer = 2.0 * (4.0 * 24.0 + 2.0 * pi * (8.0 - 2.0 / 3.0));
+    let mesh = b.body.tessellate(1e-4).unwrap();
+    let volume = mesh.measure().volume;
+    assert!((volume - (block - chamfer)).abs() < 0.05, "{volume} expected {}", block - chamfer);
+    let top = mesh.bounds().max.z;
+    assert!((top - 15.0).abs() < 1e-6, "top at {top}");
+}

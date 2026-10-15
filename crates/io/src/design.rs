@@ -640,7 +640,8 @@ mod tests {
     fn seekable_preview_defers_large_source_blob_until_document_read() {
         let mut doc = Document::new("Deferred source");
         let step = "ISO-10303-21;".repeat(200_000);
-        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new() }, None).unwrap();
+        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new(), skip: Vec::new() }, None)
+            .unwrap();
         let preview = DesignPreview { meshes: vec![mesh()] };
         let bytes = write_design_container_with_preview(&doc, DesignCompression::Fast, Some(&preview)).unwrap();
         let count = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -699,7 +700,8 @@ mod tests {
     fn native_cache_round_trip_and_preview_defer_original_sources() {
         let mut doc = Document::new("Native cache");
         let step = "ISO-10303-21;".repeat(200_000);
-        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new() }, None).unwrap();
+        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new(), skip: Vec::new() }, None)
+            .unwrap();
         let bodies = native_geometry();
         let bytes = write_design_container_with_cache(&doc, DesignCompression::Fast, None, Some(&bodies)).unwrap();
         let entries = parts(&bytes);
@@ -811,7 +813,12 @@ mod tests {
         let mut doc = Document::new("Payloads");
         for _ in 0..2 {
             doc.add_feature(
-                FeatureKind::Import { file: "example.step".into(), step: "ISO-10303-21;\nEND-ISO-10303-21;".into(), components: Vec::new() },
+                FeatureKind::Import {
+                    file: "example.step".into(),
+                    step: "ISO-10303-21;\nEND-ISO-10303-21;".into(),
+                    components: Vec::new(),
+                    skip: Vec::new(),
+                },
                 None,
             )
             .unwrap();
@@ -1130,8 +1137,15 @@ mod tests {
         doc.param_comments.insert("test".into(), "metadata".into());
         let setup = solidcraft_doc::render_settings::RenderSetup { exposure_ev: 1.5, ..Default::default() };
         std::sync::Arc::make_mut(&mut doc.render).setups.insert("Studio".into(), setup);
+        // Design properties and other tools' data (#1015), kept as they are in both forms.
+        doc.metadata = serde_json::from_value(json!({
+            "author": 42,
+            "revision": "B",
+            "com.acme.description": {"shop_id": 88123, "list": [1, 2.5, null, true, "x", {"deep": []}]},
+        }))
+        .unwrap();
         let expected = crate::read_design(&crate::write_design(&doc)).unwrap();
-        assert_eq!(expected.render, doc.render);
+        assert_eq!(expected, doc);
         assert_eq!(crate::read_design(&write_design_container(&doc).unwrap()).unwrap(), expected);
     }
 
@@ -1160,7 +1174,8 @@ mod tests {
             .collect();
         let step = solidcraft_kernel::step_export(&bodies.iter().collect::<Vec<_>>(), "SolidCraft storage benchmark").unwrap();
         let mut doc = Document::new("Generated STEP benchmark");
-        doc.add_feature(FeatureKind::Import { file: "generated.step".into(), step: step.into(), components: Vec::new() }, None).unwrap();
+        doc.add_feature(FeatureKind::Import { file: "generated.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new() }, None)
+            .unwrap();
         measure_storage(&doc, "step");
     }
 

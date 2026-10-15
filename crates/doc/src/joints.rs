@@ -544,35 +544,7 @@ fn close_loops(tree: &Tree, closing: &[u64], asm: &Assembly, held: &Held, vals: 
         return (Values::new(), stuck);
     }
     let linked: BTreeSet<(u64, usize)> = asm.links.iter().map(|l| (l.b, l.ib)).collect();
-    // Each loop: its closing joint and the joints on the tree paths between its sides; loops that
-    // share a joint (or a value feeding them through links) are solved together.
-    let mut groups: Vec<(Vec<u64>, BTreeSet<u64>, BTreeSet<(u64, usize)>)> = Vec::new();
-    for id in closing {
-        let Some(j) = tree.joints.get(id) else { continue };
-        // A joint between an occurrence and itself (only a hand-edited file has one) is only checked.
-        if j.a.occurrence == j.b.occurrence {
-            continue;
-        }
-        let side = |occ: u64| -> BTreeSet<u64> { tree.path(occ).1.iter().map(|(k, _)| *k).collect() };
-        let mut around: BTreeSet<u64> = side(j.a.occurrence).symmetric_difference(&side(j.b.occurrence)).copied().collect();
-        around.insert(*id);
-        // The values the loop depends on: its joints' and those its links read. Loops tie together
-        // through a shared value only (a rigid joint on both paths has none; two values of one
-        // joint can feed two independent loops).
-        let mut touches = link_chains(asm, tree, &around, &linked).0;
-        touches.extend(around.iter().filter_map(|id| tree.joints.get(id)).flat_map(|j| (0..j.kind.dofs().len()).map(|i| (j.id, i))));
-        let mut members = vec![*id];
-        groups.retain(|(c, a, t)| {
-            if t.is_disjoint(&touches) {
-                return true;
-            }
-            members.extend(c.iter().copied());
-            around.extend(a.iter().copied());
-            touches.extend(t.iter().copied());
-            false
-        });
-        groups.push((members, around, touches));
-    }
+    let groups = loop_groups(tree, closing, asm, &linked);
     let spent = std::cell::Cell::new(0usize);
     for (group, around, touches) in &groups {
         let moves = held_moves(asm, held, touches, vals);
@@ -599,6 +571,304 @@ fn close_loops(tree: &Tree, closing: &[u64], asm: &Assembly, held: &Held, vals: 
     (moved, stuck)
 }
 
+/// A group of loops solved together: its closing joints, the joints around them, and the values
+/// it touches.
+type Group = (Vec<u64>, BTreeSet<u64>, BTreeSet<(u64, usize)>);
+
+/// The loops' groups. Each loop: its closing joint and the joints on the tree paths between its
+/// sides; loops that share a value (of a joint, or one feeding them through links) are solved
+/// together.
+fn loop_groups(tree: &Tree, closing: &[u64], asm: &Assembly, linked: &BTreeSet<(u64, usize)>) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    for id in closing {
+        let Some(j) = tree.joints.get(id) else { continue };
+        // A joint between an occurrence and itself (only a hand-edited file has one) is only checked.
+        if j.a.occurrence == j.b.occurrence {
+            continue;
+        }
+        let side = |occ: u64| -> BTreeSet<u64> { tree.path(occ).1.iter().map(|(k, _)| *k).collect() };
+        let mut around: BTreeSet<u64> = side(j.a.occurrence).symmetric_difference(&side(j.b.occurrence)).copied().collect();
+        around.insert(*id);
+        // The values the loop depends on: its joints' and those its links read. Loops tie together
+        // through a shared value only (a rigid joint on both paths has none; two values of one
+        // joint can feed two independent loops).
+        let mut touches = link_chains(asm, tree, &around, linked).0;
+        touches.extend(around.iter().filter_map(|id| tree.joints.get(id)).flat_map(|j| (0..j.kind.dofs().len()).map(|i| (j.id, i))));
+        let mut members = vec![*id];
+        groups.retain(|(c, a, t)| {
+            if t.is_disjoint(&touches) {
+                return true;
+            }
+            members.extend(c.iter().copied());
+            around.extend(a.iter().copied());
+            touches.extend(t.iter().copied());
+            false
+        });
+        groups.push((members, around, touches));
+    }
+    groups
+}
+
+/// The values a solve of the loops `around` moves: every value of their joints but the `held`
+/// ones and motion-link targets, and the values the targets' link chains start from.
+fn unknowns(tree: &Tree, around: &BTreeSet<u64>, asm: &Assembly, linked: &BTreeSet<(u64, usize)>, held: &Held) -> Vec<(u64, usize)> {
+    let mut vars: Vec<(u64, usize)> = Vec::new();
+    for j in around.iter().filter_map(|id| tree.joints.get(id)) {
+        vars.extend((0..j.kind.dofs().len()).map(|i| (j.id, i)).filter(|v| !linked.contains(v) && !held.contains_key(v)));
+    }
+    for v in link_chains(asm, tree, around, linked).1 {
+        if !held.contains_key(&v) && !vars.contains(&v) {
+            vars.push(v);
+        }
+    }
+    vars
+}
+
+/// Each value's limits, or none.
+fn limit_bounds(tree: &Tree, vars: &[(u64, usize)]) -> Vec<(f64, f64)> {
+    vars.iter()
+        .map(|(id, i)| match tree.joints.get(id).and_then(|j| j.limits.get(*i).copied().flatten()) {
+            Some((lo, hi)) => (lo.min(hi), hi.max(lo)),
+            None => (f64::NEG_INFINITY, f64::INFINITY),
+        })
+        .collect()
+}
+
+/// The loops' size: the diagonal of the box around their joints' A frames, 1 mm to 1 km. Points
+/// that far apart weigh turns like moves.
+fn loop_scale(tree: &Tree, around: &BTreeSet<u64>, vals: &Values) -> f64 {
+    let (mut lo, mut hi) = (Vec3::new(f64::MAX, f64::MAX, f64::MAX), Vec3::new(f64::MIN, f64::MIN, f64::MIN));
+    for id in around {
+        let (Some(j), Some((fa, _))) = (tree.joints.get(id), tree.frames.get(id)) else { continue };
+        let Some(t) = tree.world(j.a.occurrence, vals) else { continue };
+        let p = apply_point(&mat_mul(&t, fa), Vec3::ZERO);
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    if lo.x <= hi.x { (hi - lo).len().clamp(1.0, 1e6) } else { 1.0 }
+}
+
+/// How far each closing joint is from meeting: three points of B's joint frame, `scale` apart,
+/// where the joint wants them against where the tree puts them (appended to `out`).
+fn closure_gaps(tree: &Tree, closing: &[u64], vals: &Values, scale: f64, out: &mut Vec<f64>) -> Option<()> {
+    for id in closing {
+        let (j, (_, fb)) = (tree.joints.get(id)?, tree.frames.get(id)?);
+        let tb = tree.world(j.b.occurrence, vals)?;
+        let want = tree.step(*id, true, &tree.world(j.a.occurrence, vals)?, vals)?;
+        for p in [Vec3::ZERO, Vec3::X * scale, Vec3::Y * scale] {
+            let at = apply_point(fb, p);
+            let d = apply_point(&want, at) - apply_point(&tb, at);
+            out.extend([d.x, d.y, d.z]);
+        }
+    }
+    Some(())
+}
+
+/// Occurrences whose degrees of freedom are worked out through their loops, at most; the rest
+/// keep the tree's count.
+const MAX_DOF_OCCURRENCES: usize = 256;
+
+/// How far `nearby_pose` moves each value: radians for an angle, a share of the loops' size for a
+/// distance. Far enough for a part's motion that vanishes at a dead point to show in a rank, near
+/// enough to stay on the mechanism's branch.
+const NUDGE: f64 = 1e-3;
+
+/// A pose of the loops near `vals`: each value they move nudged by an amount of its own within
+/// its limits (so the nudge points in no special direction), then each group of loops closed
+/// again. A group that can't close again, or only further away than a few nudges (on another
+/// branch), keeps its values. It has a work budget of its own.
+fn nearby_pose(tree: &Tree, groups: &[Group], asm: &Assembly, linked: &BTreeSet<(u64, usize)>, vals: &Values) -> Values {
+    let mut near = vals.clone();
+    let mut spent = 0usize;
+    for (closing, around, _) in groups {
+        let vars = unknowns(tree, around, asm, linked, &Held::new());
+        if vars.is_empty() || vars.len() > MAX_LOOP_VALUES {
+            continue;
+        }
+        let scale = loop_scale(tree, around, vals);
+        let step: Vec<f64> =
+            vars.iter().map(|(id, i)| NUDGE * if tree.joints.get(id).is_some_and(|j| j.kind.is_angle(*i)) { 1.0 } else { scale }).collect();
+        let bounds = limit_bounds(tree, &vars);
+        let x0: Vec<f64> = vars.iter().map(|(id, i)| near.get(id).and_then(|q| q.get(*i)).copied().unwrap_or(0.0)).collect();
+        let mut x: Vec<f64> = x0
+            .iter()
+            .zip(step.iter().zip(&bounds))
+            .enumerate()
+            .map(|(k, (v, (d, (lo, hi))))| {
+                // 0.5 to 1.5 nudges, alternately up and down.
+                let w = 0.5 + (k as f64 * 0.618_034).fract();
+                (v + d * if k % 2 == 0 { w } else { -w }).max(*lo).min(*hi)
+            })
+            .collect();
+        let mut work = near.clone();
+        let mut gaps = |x: &[f64]| -> Option<Vec<f64>> {
+            spent += 1;
+            if spent > MAX_LOOP_WORK {
+                return None;
+            }
+            for ((id, i), v) in vars.iter().zip(x) {
+                if let Some(slot) = work.get_mut(id).and_then(|q| q.get_mut(*i)) {
+                    *slot = *v;
+                }
+            }
+            apply_links(asm, &mut work);
+            let mut out = Vec::with_capacity(closing.len() * 9);
+            closure_gaps(tree, closing, &work, scale, &mut out)?;
+            out.iter().all(|v| v.is_finite()).then_some(out)
+        };
+        if least_squares(&mut gaps, &mut x, &bounds, (1e-10 * scale).min(1e-7))
+            && x.iter().zip(&x0).zip(&step).all(|((a, b), d)| (a - b).abs() <= 4.0 * d)
+            && gaps(&x).is_some()
+        {
+            near = work;
+        }
+    }
+    near
+}
+
+/// The degrees of freedom of the occurrences loops constrain: how many independent ways each can
+/// still move with every loop kept closed, the rank of its placement over the joint values once
+/// the loops' closure is taken out (rank [J_loops; J_placement] - rank J_loops). An occurrence's
+/// values are those on its tree path and the unknowns of the loops on that path. It is counted at
+/// the pose and at a pose nearby, and the larger count stands: at a dead point of its loop (an
+/// actuator in line with the path of its tip pin) a part's motion vanishes to first order, so the
+/// pose alone counts 0. The tree's count stands where a loop group is over the solver's caps or
+/// the work runs out.
+fn loop_dof(tree: &Tree, closing: &[u64], asm: &Assembly, vals: &Values, dof: &mut BTreeMap<u64, usize>) {
+    if closing.len() > MAX_LOOPS {
+        return;
+    }
+    let linked: BTreeSet<(u64, usize)> = asm.links.iter().map(|l| (l.b, l.ib)).collect();
+    let groups = loop_groups(tree, closing, asm, &linked);
+    // The joints loops depend on: those around them, those whose values they read, and those a
+    // motion link carries any of these values into.
+    let mut relevant: BTreeSet<u64> = groups.iter().flat_map(|(_, a, t)| a.iter().copied().chain(t.iter().map(|(j, _)| *j))).collect();
+    for _ in 0..MAX_LINK_PASSES {
+        let more: Vec<u64> = asm.links.iter().filter(|l| relevant.contains(&l.a) && !relevant.contains(&l.b)).map(|l| l.b).collect();
+        if more.is_empty() {
+            break;
+        }
+        relevant.extend(more);
+    }
+    // The occurrences a loop may hold or move: placed by such a joint, or below one that is
+    // (worked out down the tree, parents first). The others keep the tree's count.
+    let mut candidates: BTreeSet<u64> = BTreeSet::new();
+    for occ in &tree.order {
+        if let Some(&(from, joint, _)) = tree.parent.get(occ)
+            && (relevant.contains(&joint) || candidates.contains(&from))
+        {
+            candidates.insert(*occ);
+        }
+    }
+    let (mut spent, mut counted) = (0usize, 0usize);
+    // A pose nearby, when one differs.
+    let near = (!candidates.is_empty()).then(|| nearby_pose(tree, &groups, asm, &linked, vals)).filter(|n| n != vals);
+    for occ in tree.order.iter().filter(|o| candidates.contains(o)) {
+        let path: Vec<u64> = tree.path(*occ).1.iter().map(|(k, _)| *k).collect();
+        let (mut values, mut have): (Vec<(u64, usize)>, BTreeSet<(u64, usize)>) = (Vec::new(), BTreeSet::new());
+        let mut add = |values: &mut Vec<(u64, usize)>, v: (u64, usize)| {
+            if have.insert(v) {
+                values.push(v);
+            }
+        };
+        for j in path.iter().filter_map(|k| tree.joints.get(k)) {
+            for v in (0..j.kind.dofs().len()).map(|i| (j.id, i)).filter(|v| !linked.contains(v)) {
+                add(&mut values, v);
+            }
+            if values.len() > MAX_LOOP_VALUES {
+                break;
+            }
+        }
+        if values.len() > MAX_LOOP_VALUES {
+            continue;
+        }
+        // A value on the path a motion link sets moves with the values its link chain starts from.
+        let on_path: BTreeSet<u64> = path.iter().copied().collect();
+        for v in link_chains(asm, tree, &on_path, &linked).1 {
+            add(&mut values, v);
+        }
+        // The loops on the path, and every loop whose values those reach (a linked source may be
+        // held by a loop of its own), each once.
+        let (mut closers, mut around) = (Vec::new(), BTreeSet::new());
+        let mut taken: BTreeSet<usize> = BTreeSet::new();
+        loop {
+            let more: Vec<usize> = groups
+                .iter()
+                .enumerate()
+                .filter(|(g, _)| !taken.contains(g))
+                .filter(|(_, (_, a, t))| path.iter().any(|k| a.contains(k)) || t.iter().any(|v| values.contains(v)))
+                .map(|(g, _)| g)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            for (c, a, _) in more.iter().filter_map(|g| groups.get(*g)) {
+                closers.extend(c.iter().copied());
+                around.extend(a.iter().copied());
+                for v in unknowns(tree, a, asm, &linked, &Held::new()) {
+                    add(&mut values, v);
+                }
+            }
+            taken.extend(more);
+        }
+        // No loop reaches this occurrence's values (not even through a motion link it drives):
+        // the tree's count stands.
+        if taken.is_empty() {
+            continue;
+        }
+        counted += 1;
+        if counted > MAX_DOF_OCCURRENCES || spent > MAX_LOOP_WORK {
+            return;
+        }
+        if values.len() > MAX_LOOP_VALUES {
+            continue;
+        }
+        let scale = loop_scale(tree, &around, vals);
+        let (n, gaps) = (values.len(), closers.len() * 9);
+        // How many ways the occurrence moves at a pose, with the loops kept closed.
+        let mut free_at = |at: &Values| -> Option<usize> {
+            let mut work = at.clone();
+            // The loops' gaps, then three points of the occurrence `scale` apart.
+            let mut f = |x: &[f64]| -> Option<Vec<f64>> {
+                spent += 1;
+                for ((id, i), v) in values.iter().zip(x) {
+                    if let Some(slot) = work.get_mut(id).and_then(|q| q.get_mut(*i)) {
+                        *slot = *v;
+                    }
+                }
+                apply_links(asm, &mut work);
+                let mut out = Vec::with_capacity(closers.len() * 9 + 9);
+                closure_gaps(tree, &closers, &work, scale, &mut out)?;
+                let t = tree.world(*occ, &work)?;
+                for p in [Vec3::ZERO, Vec3::X * scale, Vec3::Y * scale] {
+                    let q = apply_point(&t, p);
+                    out.extend([q.x, q.y, q.z]);
+                }
+                out.iter().all(|v| v.is_finite()).then_some(out)
+            };
+            let x0: Vec<f64> = values.iter().map(|(id, i)| at.get(id).and_then(|q| q.get(*i)).copied().unwrap_or(0.0)).collect();
+            let jac = jacobian(&mut f, &x0, gaps + 9)?;
+            let rank = |rows: usize| {
+                let mut a = linalg::Mat::zeros(rows, n);
+                let mut big = 0.0f64;
+                for r in 0..rows {
+                    for c in 0..n {
+                        let v = jac.get(r * n + c).copied().unwrap_or(0.0);
+                        big = big.max(v.abs());
+                        a.set(r, c, v);
+                    }
+                }
+                linalg::rref(&mut a, 1e-6 * big.max(1.0)).len()
+            };
+            Some(rank(gaps + 9).saturating_sub(rank(gaps)))
+        };
+        let here = free_at(vals);
+        let there = near.as_ref().and_then(&mut free_at);
+        let Some(free) = here.max(there) else { continue };
+        dof.insert(*occ, free.min(6));
+    }
+}
+
 /// Close one group of loops: move the values of the joints `around` them (all but the `held`
 /// values, motion-link targets and rigid joints, within their limits; a linked value moves
 /// through the start of its link chain) until every loop-closing joint meets. A loop open at the
@@ -619,36 +889,12 @@ fn close_group(
     spent: &std::cell::Cell<usize>,
     vals: &mut Values,
 ) -> Option<BTreeMap<(u64, usize), f64>> {
-    let starts = link_chains(asm, tree, around, linked).1;
-    let mut vars: Vec<(u64, usize)> = Vec::new();
-    for j in around.iter().filter_map(|id| tree.joints.get(id)) {
-        vars.extend((0..j.kind.dofs().len()).map(|i| (j.id, i)).filter(|v| !linked.contains(v) && !held.contains_key(v)));
-    }
-    for v in starts {
-        if !held.contains_key(&v) && !vars.contains(&v) {
-            vars.push(v);
-        }
-    }
+    let vars = unknowns(tree, around, asm, linked, held);
     if vars.len() > MAX_LOOP_VALUES {
         return Some(BTreeMap::new());
     }
-    let bounds: Vec<(f64, f64)> = vars
-        .iter()
-        .map(|(id, i)| match tree.joints.get(id).and_then(|j| j.limits.get(*i).copied().flatten()) {
-            Some((lo, hi)) => (lo.min(hi), hi.max(lo)),
-            None => (f64::NEG_INFINITY, f64::INFINITY),
-        })
-        .collect();
-    // Turns weigh like moves through points a loop's size apart.
-    let (mut lo, mut hi) = (Vec3::new(f64::MAX, f64::MAX, f64::MAX), Vec3::new(f64::MIN, f64::MIN, f64::MIN));
-    for id in around {
-        let (Some(j), Some((fa, _))) = (tree.joints.get(id), tree.frames.get(id)) else { continue };
-        let Some(t) = tree.world(j.a.occurrence, vals) else { continue };
-        let p = apply_point(&mat_mul(&t, fa), Vec3::ZERO);
-        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
-        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
-    }
-    let scale = if lo.x <= hi.x { (hi - lo).len().clamp(1.0, 1e6) } else { 1.0 };
+    let bounds = limit_bounds(tree, &vars);
+    let scale = loop_scale(tree, around, vals);
     // Closer than the conflict check needs: 1e-7 mm, and turns of 1e-10 rad across the loop.
     let tol = (1e-10 * scale).min(1e-7);
     // The values with the held ones `t` of the way along (and the unknowns at `x`).
@@ -699,16 +945,7 @@ fn close_group(
         }
         place(&mut work, x, t);
         let mut out = Vec::with_capacity(closing.len() * 9);
-        for id in closing {
-            let (j, (_, fb)) = (tree.joints.get(id)?, tree.frames.get(id)?);
-            let tb = tree.world(j.b.occurrence, &work)?;
-            let want = tree.step(*id, true, &tree.world(j.a.occurrence, &work)?, &work)?;
-            for p in [Vec3::ZERO, Vec3::X * scale, Vec3::Y * scale] {
-                let at = apply_point(fb, p);
-                let d = apply_point(&want, at) - apply_point(&tb, at);
-                out.extend([d.x, d.y, d.z]);
-            }
-        }
+        closure_gaps(tree, closing, &work, scale, &mut out)?;
         out.iter().all(|v| v.is_finite()).then_some(out)
     };
     // Already closed, with no held value moving. (A moving one is followed all the way: a
@@ -764,8 +1001,28 @@ fn largest(r: &[f64]) -> f64 {
 
 /// Levenberg–Marquardt: move `x` (kept within `bounds`) until every value of `f` is within
 /// `tol` of zero. False when it can't get there.
-fn least_squares(f: &mut dyn FnMut(&[f64]) -> Option<Vec<f64>>, x: &mut Vec<f64>, bounds: &[(f64, f64)], tol: f64) -> bool {
+/// The Jacobian of `f` (`m` values) at `x` by central differences, row-major.
+fn jacobian(f: &mut dyn FnMut(&[f64]) -> Option<Vec<f64>>, x: &[f64], m: usize) -> Option<Vec<f64>> {
     const H: f64 = 1e-6;
+    let n = x.len();
+    let mut jac = vec![0.0; m * n];
+    for k in 0..n {
+        let (mut xp, mut xm) = (x.to_vec(), x.to_vec());
+        if let (Some(p), Some(q)) = (xp.get_mut(k), xm.get_mut(k)) {
+            *p += H;
+            *q -= H;
+        }
+        let (rp, rm) = (f(&xp)?, f(&xm)?);
+        for (i, (a, b)) in rp.iter().zip(&rm).enumerate().take(m) {
+            if let Some(slot) = jac.get_mut(i * n + k) {
+                *slot = (a - b) / (2.0 * H);
+            }
+        }
+    }
+    Some(jac)
+}
+
+fn least_squares(f: &mut dyn FnMut(&[f64]) -> Option<Vec<f64>>, x: &mut Vec<f64>, bounds: &[(f64, f64)], tol: f64) -> bool {
     let n = x.len();
     let norm = |r: &[f64]| r.iter().map(|v| v * v).sum::<f64>();
     let Some(mut r) = f(x) else { return false };
@@ -779,20 +1036,7 @@ fn least_squares(f: &mut dyn FnMut(&[f64]) -> Option<Vec<f64>>, x: &mut Vec<f64>
         }
         // The Jacobian by central differences, then the normal equations JᵀJ δ = −Jᵀr.
         let m = r.len();
-        let mut jac = vec![0.0; m * n];
-        for k in 0..n {
-            let (mut xp, mut xm) = (x.clone(), x.clone());
-            if let (Some(p), Some(q)) = (xp.get_mut(k), xm.get_mut(k)) {
-                *p += H;
-                *q -= H;
-            }
-            let (Some(rp), Some(rm)) = (f(&xp), f(&xm)) else { return false };
-            for (i, (a, b)) in rp.iter().zip(&rm).enumerate() {
-                if let Some(slot) = jac.get_mut(i * n + k) {
-                    *slot = (a - b) / (2.0 * H);
-                }
-            }
-        }
+        let Some(jac) = jacobian(f, x, m) else { return false };
         let mut jtj = linalg::Mat::zeros(n, n);
         let mut g = vec![0.0; n];
         for (i, ri) in r.iter().enumerate() {
@@ -883,9 +1127,18 @@ pub fn solve_holding(doc: &Document, st: &ModelState, held: &Held) -> Solution {
         Tree { joints: asm.joints.iter().map(|j| (j.id, j)).collect(), frames, fixed: placed.clone(), parent: BTreeMap::new(), order: Vec::new() };
     let mut used: BTreeSet<u64> = BTreeSet::new();
     let mut queue: VecDeque<u64> = placed.keys().copied().collect();
+    // The joints at each occurrence, in the joints' order (a large assembly is not walked joint by
+    // joint for every occurrence).
+    let mut at: BTreeMap<u64, Vec<&Joint>> = BTreeMap::new();
+    for j in joints.iter().copied() {
+        at.entry(j.a.occurrence).or_default().push(j);
+        if j.b.occurrence != j.a.occurrence {
+            at.entry(j.b.occurrence).or_default().push(j);
+        }
+    }
     while let Some(occ) = queue.pop_front() {
         let Some(t) = placed.get(&occ).copied() else { continue };
-        for j in &joints {
+        for j in at.get(&occ).map(Vec::as_slice).unwrap_or_default() {
             if used.contains(&j.id) || !tree.frames.contains_key(&j.id) {
                 continue;
             }
@@ -939,6 +1192,9 @@ pub fn solve_holding(doc: &Document, st: &ModelState, held: &Held) -> Solution {
             // driven a full turn ends where it started).
             sol.conflicts.push((j.id, j.name.clone(), "the loop can't stay closed on the way to these values".into()));
         }
+    }
+    if !closing.is_empty() {
+        loop_dof(&tree, &closing, asm, &vals, &mut dof);
     }
     for o in &doc.occurrences {
         dof.entry(o.id).or_insert(6);

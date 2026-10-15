@@ -27,6 +27,15 @@ Open the release `.dmg` and drag `SolidCraft.app` onto Applications.
 When updating from a build released under the previous product name, follow the
 [macOS upgrade notes](https://github.com/bherbruck/solidcraft/blob/main/docs/compatibility.md#macos) so you replace it rather than install a second copy.
 
+### Linux AppImage
+
+The first time you open the AppImage it adds a menu entry and icons under `~/.local/share`
+(`applications/ai.storyteller.solidcraft.desktop`, `icons/hicolor`), so the desktop shows the
+right name and icon. It adds nothing if [appimaged](https://github.com/probonopd/go-appimage)
+already made an entry for the file (and removes the entry SolidCraft added before). To
+turn it off for good, create an empty file `~/.local/share/solidcraft/no-desktop-integration`, or
+start the AppImage with `SOLIDCRAFT_NO_DESKTOP_INTEGRATION=1`.
+
 ### Linux Flatpak
 
 Install Flatpak using your distribution's package manager. For an installation that receives
@@ -73,14 +82,25 @@ doesn't update automatically.
 ## Web
 
 The same app runs in the browser: [open SolidCraft on the web](../app/) (`?sample` opens the sample
-part, `?webgl` forces WebGL2 where WebGPU is missing). Designs are saved in the browser's private
-file storage, which needs HTTPS or localhost.
+part, `?webgl` forces WebGL2 where WebGPU is missing or misbehaves; the browser remembers it until
+`?webgpu`, and an app installed from Chrome or Edge starts with it too). Designs are saved in the
+browser's private file storage, which needs HTTPS or localhost.
+Planned worker and tiered-storage integration is
+described in [web-runtime.md](https://github.com/bherbruck/solidcraft/blob/main/docs/web-runtime.md)
+(design; not yet wired in the shipped wasm build).
 
 After the first visit the web app works offline: the browser keeps a copy of it. Online, each
 launch gets the latest published build (the browser downloads it once when it changes); offline,
 when the network doesn't answer within a few seconds, or when a new build can't be downloaded
-whole, the kept copy starts (and the download carries on for the next launch). To build it
-yourself:
+whole, the kept copy starts (and the download carries on for the next launch).
+
+Browsers that can install web apps add **Install app…** to the File menu: it installs SolidCraft
+as an app with its own window and launcher icon, working offline like the page. In Chrome, Edge
+and other Chromium browsers it shows the browser's install prompt, and once SolidCraft is
+installed the item is gone. Safari has no such prompt, so the item shows its steps instead:
+Share › Add to Home Screen on iPhone and iPad, File › Add to Dock on a Mac (Safari 17 or later).
+
+To build it yourself:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -116,10 +136,30 @@ A script is a list of commands:
 
 ![The bracket example, rendered by solidcraft-cli snapshot](../generated/bracket.png)
 
+`snapshot` looks at the model from the iso view. `--view NAME` takes another standard view (`front`, `back`, `top`, `bottom`, `left`, `right`) or the name of a view saved in the design with `view.save`. `--camera JSON` takes any camera, as the MCP `screenshot` tool does (its conventions are in [the MCP page](mcp.md#camera-and-close-up-recipe)). A script that applies a view itself with `view.apply` sets the camera too. The ground grid lies on Z 0, so it cuts through a part that straddles it: `--no-grid` leaves it out of the picture, and `--no-axes` the origin's axes.
+
+```sh
+solidcraft-cli snapshot part.solidcraft --out photo.png --view Photo
+solidcraft-cli snapshot part.solidcraft --out close-up.png --no-grid --no-axes --camera '{"target": [30, -20, 0], "yaw": 0.6, "pitch": 0.25, "distance": 60}'
+```
+
+Windows PowerShell 5.1 drops the double quotes inside an argument it passes to a program: write them as `\"` there.
+
 A command that fails stops the script. A feature can also fail later, when a parameter change
 rebuilds it; `run` then exits with status 1, lists the failing features and writes none of
 its `--out` and `--save` files, because the bodies lack what those features should have made.
 `--allow-errors` writes them anyway.
+
+`run` prints each command's result with `--results` (otherwise the measurement), and `eval`
+prints the measurement, as JSON on stdout. `--json-out FILE` writes that JSON to a file
+instead. The file is plain UTF-8, which is not what a redirect gives you everywhere: Windows
+PowerShell's `>` re-encodes a program's output, as UTF-16 or as UTF-8 with a byte-order mark
+depending on its settings, and strict JSON readers such as Python's `json.load` then refuse it.
+
+```sh
+cargo run --release -p solidcraft-cli -- run examples/bracket.json --results --json-out results.json
+cargo run --release -p solidcraft-cli -- eval examples/bracket.json --json-out measures.json
+```
 
 A design's history turns into a script that rebuilds it, which makes a bug that only shows
 on one design a one-file reproduction:

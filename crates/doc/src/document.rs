@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use solidcraft_geom::{Plane, Vec2, Vec3};
+use solidcraft_kernel::Continuity;
 use solidcraft_sketch::Sketch;
 
 use crate::construct::{AxisDef, GeoRef, PointDef};
@@ -134,8 +135,46 @@ pub enum Direction {
     #[default]
     Positive,
     Negative,
-    /// Both sides; `distance` per side.
+    /// Both sides; the extent convention determines whether `distance` is total or per side.
     Symmetric,
+}
+
+/// The direction a ruled surface leaves its edges (`surface.ruled`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuledMode {
+    /// Along the normal of the face beside each edge.
+    #[default]
+    Normal,
+    /// Continuing the face beside each edge.
+    Tangent,
+    /// At an angle from a reference direction (the face's normal unless one is given).
+    Angle,
+    /// Along a fixed direction.
+    Direction,
+}
+
+impl RuledMode {
+    fn is_normal(&self) -> bool {
+        *self == RuledMode::Normal
+    }
+}
+
+/// How a ruled surface's strips meet at sharp corners of its edge chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuledCorners {
+    /// Extended or cut back until they meet.
+    #[default]
+    Mitre,
+    /// Joined by a sector (inside corners are cut back).
+    Round,
+}
+
+impl RuledCorners {
+    fn is_mitre(&self) -> bool {
+        *self == RuledCorners::Mitre
+    }
 }
 
 /// Angular starts in older designs used the raw axis sign. New revolves measure starts
@@ -148,50 +187,100 @@ pub enum RevolveConvention {
     SketchNormal,
 }
 
+/// Symmetric distance semantics. Missing markers preserve existing designs' thickness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtrudeConvention {
+    #[default]
+    LegacyPerSide,
+    TotalDistance,
+}
+
+impl ExtrudeConvention {
+    /// Distance from the mid-plane to either cap for a distance-limited extent.
+    pub fn symmetric_half_distance(self, distance: f64) -> f64 {
+        match self {
+            Self::LegacyPerSide => distance,
+            Self::TotalDistance => distance * 0.5,
+        }
+    }
+}
+
 /// Extent of an extrude.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct Extent {
+    #[walk(length = "Distance")]
     pub distance: String,
+    #[serde(default)]
+    pub convention: ExtrudeConvention,
     #[serde(default)]
     pub direction: Direction,
     /// Optional second side distance (two-sided extrude), along the negative normal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(length = "Distance 2")]
     pub distance2: Option<String>,
     /// Start offset from the sketch plane (expression), along the sketch normal whatever the
     /// direction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(length = "Start offset")]
     pub start_offset: Option<String>,
     /// Through all bodies in the direction(s) instead of `distance`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub through_all: bool,
     /// Taper angle (expression; positive grows the profile).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(angle = "Taper angle")]
     pub taper: Option<String>,
     /// To Object: end at the face (or vertex/point) at this point, instead of `distance`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(pick)]
     pub to: Option<Vec3>,
     /// Offset past the To Object face (expression; negative stops short).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(length = "To offset")]
     pub to_offset: Option<String>,
     /// From Object: start at the face (or point) here instead of the sketch plane (plus
     /// `start_offset`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(pick)]
     pub from: Option<Vec3>,
 }
 
 /// Thin Extrude: a wall of constant thickness along sketch curves instead of the profiles.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct ThinWall {
     /// The sketch curves the wall follows: open chains and closed loops, joined where they
     /// meet end to end.
     pub curves: Vec<String>,
     /// The wall thickness (expression); with `side: two_sides`, the thickness inside.
+    #[walk(length = "Thickness")]
     pub thickness: String,
     #[serde(default, skip_serializing_if = "ThinSide::is_center")]
     pub side: ThinSide,
     /// With `side: two_sides`, the thickness outside (expression).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(length = "Thickness 2")]
     pub thickness2: Option<String>,
+}
+
+/// How a swept profile turns as it follows its path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepOrientation {
+    /// Square to the path, turning with it (a rotation-minimising frame).
+    #[default]
+    Perpendicular,
+    /// As drawn: the profile moves along the path without turning.
+    Parallel,
+    /// Square to the path, its turn about the path fixed by this direction (in the feature's
+    /// frame): the direction's projection onto the profile stays where it was at the start.
+    Direction(#[walk(dir)] Vec3),
+}
+
+impl SweepOrientation {
+    pub fn is_perpendicular(&self) -> bool {
+        *self == SweepOrientation::Perpendicular
+    }
 }
 
 /// Where a thin wall lies against its curves. A closed loop's inside is the area it encloses;
@@ -225,7 +314,7 @@ impl ThinSide {
 }
 
 /// Revolve axis.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AxisRef {
     /// A line of the profile's sketch.
@@ -235,13 +324,20 @@ pub enum AxisRef {
     /// World X / Y / Z axis through the origin.
     World { axis: String },
     /// Any line in the sketch plane, in world coordinates.
-    Line { origin: Vec3, dir: Vec3 },
+    Line {
+        #[walk(pos)]
+        origin: Vec3,
+        #[walk(dir)]
+        dir: Vec3,
+    },
 }
 
 /// Persistent cylindrical Emboss selection, authored in the feature component frame.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct EmbossFace {
+    #[walk(body)]
     pub body: String,
+    #[walk(pinned)]
     pub at: Vec3,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<u64>,
@@ -321,10 +417,13 @@ impl EmbossFace {
 /// edge's own angle and height (expressions) in place of the feature's. In a design file an
 /// edge with neither is the point `[x, y, z]`, as every edge was before; one with its own
 /// values is `{"point": [x, y, z], "angle": "…", "height": "…"}`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, solidcraft_derive::Walk)]
 pub struct FlangeEdge {
+    #[walk(pos)]
     pub point: Vec3,
+    #[walk(angle = "Edge angle")]
     pub angle: Option<String>,
+    #[walk(length = "Edge height")]
     pub height: Option<String>,
 }
 
@@ -385,12 +484,13 @@ impl<'de> Deserialize<'de> for FlangeEdge {
 }
 
 /// Feature definitions.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FeatureKind {
     /// A recorded timeline ownership boundary. Geometry is converted from its
     /// current local frame into the destination component frame exactly once.
     BodyTransfer {
+        #[walk(body)]
         bodies: Vec<String>,
         from: u64,
         to: u64,
@@ -402,29 +502,38 @@ pub enum FeatureKind {
     },
     Extrude {
         /// Feature id of the sketch.
+        #[walk(sketch)]
         sketch: u64,
+        // A thin extrude follows curves; its profiles are not used.
+        #[walk(profiles_of = sketch, when = thin.is_none())]
         profiles: ProfileSel,
         extent: Extent,
         #[serde(default)]
         operation: Operation,
         /// Target body names for join/cut/intersect (empty = all bodies).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
         /// Thin: a wall along sketch curves instead of the profiles (which are then unused).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thin: Option<ThinWall>,
     },
     Revolve {
+        #[walk(sketch)]
         sketch: u64,
+        #[walk(profiles_of = sketch)]
         profiles: ProfileSel,
         axis: AxisRef,
+        #[walk(angle = "Angle")]
         angle: String,
         #[serde(default)]
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
         /// Two Sides: the angle on the other side.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Angle 2")]
         angle2: Option<String>,
         /// Symmetric: `angle` split evenly either side of the profile.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -434,13 +543,17 @@ pub enum FeatureKind {
         convention: RevolveConvention,
         /// To Object: turn until the face, vertex or point here.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(pick)]
         to: Option<Vec3>,
     },
     Fillet {
         /// Reference points on the edges to round (each re-finds the nearest edge).
+        #[walk(pos)]
         edges: Vec<Vec3>,
+        #[walk(length = style.radius_label())]
         radius: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
         /// Constant radius (the default), chord length (`radius` is the width across), or a
         /// radius varying along each edge.
@@ -451,56 +564,76 @@ pub enum FeatureKind {
         fit: FilletFit,
     },
     Chamfer {
+        #[walk(pos)]
         edges: Vec<Vec3>,
+        #[walk(length = "Distance")]
         distance: String,
         /// Unequal chamfers: the distance along the second face…
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Distance 2")]
         distance2: Option<String>,
         /// …or the angle the chamfer makes with the first face.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Angle")]
         angle: Option<String>,
         /// Swap which face is the first (by default the one facing up most).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         flip: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     Box {
         #[serde(with = "point_expr")]
+        #[walk(placement)]
         corner: PointExpr,
+        #[walk(length = "Length")]
         length: String,
+        #[walk(length = "Width")]
         width: String,
+        #[walk(length = "Height")]
         height: String,
         #[serde(default)]
         operation: Operation,
     },
     Cylinder {
         #[serde(with = "point_expr")]
+        #[walk(placement)]
         base: PointExpr,
         #[serde(default = "z_axis")]
+        #[walk(dir)]
         axis: Vec3,
+        #[walk(length = "Radius")]
         radius: String,
+        #[walk(length = "Height")]
         height: String,
         #[serde(default)]
         operation: Operation,
     },
     Sphere {
         #[serde(with = "point_expr")]
+        #[walk(placement)]
         center: PointExpr,
+        #[walk(length = "Radius")]
         radius: String,
         #[serde(default)]
         operation: Operation,
     },
     Torus {
         #[serde(with = "point_expr")]
+        #[walk(placement)]
         center: PointExpr,
+        #[walk(length = "Major radius")]
         major: String,
+        #[walk(length = "Minor radius")]
         minor: String,
         #[serde(default)]
         operation: Operation,
     },
     Combine {
+        #[walk(body)]
         target: String,
+        #[walk(body)]
         tools: Vec<String>,
         operation: Operation,
         #[serde(default)]
@@ -508,18 +641,22 @@ pub enum FeatureKind {
     },
     /// Copies of other features' results, or of bodies (rectangular, circular or along a path).
     Pattern {
+        #[walk(feature)]
         features: Vec<String>,
         pattern: PatternKind,
         /// Copy these bodies (as new bodies) instead of replaying features.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         bodies: Vec<String>,
     },
     /// Mirror copies of other features' results in a plane.
     Mirror {
+        #[walk(feature)]
         features: Vec<String>,
         plane: PlaneRef,
         /// Mirror these bodies instead of replaying features.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         bodies: Vec<String>,
         /// Join each mirrored body with its original.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -527,12 +664,16 @@ pub enum FeatureKind {
     },
     /// A drilled hole (simple, counterbore or countersink) at a point, into the material.
     Hole {
+        #[walk(pick_if = points.is_none())]
         position: Vec3,
         /// Drilling direction (into the material).
+        #[walk(dir)]
         direction: Vec3,
+        #[walk(length = "Diameter")]
         diameter: String,
         /// Depth to the shoulder; `None` = through all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Depth")]
         depth: Option<String>,
         #[serde(default)]
         hole: HoleKind,
@@ -545,17 +686,20 @@ pub enum FeatureKind {
         thread: Option<String>,
         /// To Object: drill down to the face (or point) here instead of `depth`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(pick)]
         to: Option<Vec3>,
     },
     /// A thread on a cylindrical face. Cosmetic by default (no geometry change; drawn and
     /// exported as an annotation); `modeled` cuts the real helical ISO profile into the face.
     /// `designation` is an ISO metric size such as "M8" or "M8x1".
     Thread {
+        #[walk(pick)]
         face: Vec3,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         designation: Option<String>,
         /// Thread length from the face's end nearest `face`; `None` = full length.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Length")]
         length: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         modeled: bool,
@@ -566,24 +710,43 @@ pub enum FeatureKind {
         #[serde(default)]
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
     },
     /// Sweep profiles along a chain of sketch curves.
     Sweep {
+        #[walk(sketch)]
         sketch: u64,
+        #[walk(profiles_of = sketch)]
         profiles: ProfileSel,
+        #[walk(sketch)]
         path_sketch: u64,
         path: Vec<String>,
+        /// How the profile turns along the path (default: perpendicular to it).
+        #[serde(default, skip_serializing_if = "SweepOrientation::is_perpendicular")]
+        orientation: SweepOrientation,
+        /// Angle the profile turns about the path over its length.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Twist")]
+        twist: Option<String>,
+        /// The profile's scale at the end of the path (linear along its length).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = "Scale")]
+        scale: Option<String>,
         #[serde(default)]
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
     },
     /// Hollow a body leaving walls of `thickness`, removing the faces at the given points.
     Shell {
+        #[walk(pick)]
         faces: Vec<Vec3>,
+        #[walk(length = "Thickness")]
         thickness: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
         /// inside (default) | outside | both (the wall straddles the faces).
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -594,11 +757,15 @@ pub enum FeatureKind {
     },
     /// Tilt faces (at the given points) about a neutral plane, leaning toward `pull`.
     Draft {
+        #[walk(pick)]
         faces: Vec<Vec3>,
+        #[walk(angle = "Angle")]
         angle: String,
         neutral: PlaneRef,
+        #[walk(dir)]
         pull: Vec3,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// A construction plane (sketch placement, split tool).
@@ -608,6 +775,7 @@ pub enum FeatureKind {
     /// Split a body into the parts on either side of a plane, or of a face of a body (the face
     /// through `point`, its surface extended) when `tool` is set.
     Split {
+        #[walk(body)]
         body: String,
         plane: PlaneRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,38 +793,50 @@ pub enum FeatureKind {
     /// a face of a body (`tool`, its surface extended) or a sketch's curves (`sketch`, swept
     /// along its normal). The pieces are named after the face (`#k`).
     SplitFace {
+        #[walk(pick)]
         faces: Vec<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
         plane: PlaneRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<FaceAt>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(sketch)]
         sketch: Option<u64>,
     },
     /// Scale bodies about a point (uniform, or per axis).
     Scale {
+        #[walk(body)]
         bodies: Vec<String>,
         #[serde(default)]
+        #[walk(pos)]
         origin: Vec3,
+        #[walk(unitless = "Scale factor")]
         factor: String,
         /// Per-axis factors instead of `factor`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = ["X scale", "Y scale", "Z scale"])]
         factors: Option<[String; 3]>,
     },
     /// Move planar faces (at the given points) along their normals; the body keeps its shape.
     OffsetFace {
+        #[walk(pick)]
         faces: Vec<Vec3>,
+        #[walk(length = "Distance")]
         distance: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Remove faces (at the given points) and heal the gap from the neighbouring planes, as when
     /// a fillet, chamfer, hole or boss is taken off. A picked face brings the rest of its surface
     /// (both halves of a hole's wall).
     DeleteFace {
+        #[walk(pick)]
         faces: Vec<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
         /// Close the gap by extending the neighbouring faces (the default); `false` leaves it
         /// open, the faces left a surface body.
@@ -665,42 +845,55 @@ pub enum FeatureKind {
     },
     /// A box around bodies, grown by a margin.
     BoundingSolid {
+        #[walk(body)]
         bodies: Vec<String>,
         #[serde(default = "zero_expr")]
+        #[walk(length = "Margin")]
         margin: String,
     },
     /// A tube along a chain of sketch curves (solid, or hollow with a wall thickness).
     Pipe {
+        #[walk(sketch)]
         path_sketch: u64,
         path: Vec<String>,
+        #[walk(length = "Diameter")]
         diameter: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Wall")]
         wall: Option<String>,
         #[serde(default)]
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
     },
     /// Raise or sink profiles on a planar face, or wrap them on a selected cylindrical wall.
     Emboss {
+        #[walk(sketch)]
         sketch: u64,
+        #[walk(profiles_of = sketch)]
         profiles: ProfileSel,
+        #[walk(length = "Depth")]
         depth: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         deboss: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         face: Option<EmbossFace>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
     },
     /// A thin wall from open sketch curves: `thickness` across the sketch plane, filling from
     /// the curves toward the body (to the next face, or `depth`). A web makes one per curve.
     Rib {
+        #[walk(sketch)]
         sketch: u64,
         curves: Vec<String>,
+        #[walk(length = "Thickness")]
         thickness: String,
         /// Depth from the curves; `None` = to the next face of the body.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Depth")]
         depth: Option<String>,
         /// Fill toward the other side of the curves.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -711,19 +904,26 @@ pub enum FeatureKind {
     },
     /// Move planar faces (at the given points) onto a target plane parallel to them.
     ReplaceFace {
+        #[walk(pick)]
         faces: Vec<Vec3>,
         target: PlaneRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Move bodies so that `from` lands on `to` (and, with normals, the faces meet face to face).
     Align {
+        #[walk(body)]
         bodies: Vec<String>,
+        #[walk(pos)]
         from: Vec3,
+        #[walk(pos)]
         to: Vec3,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(dir)]
         from_normal: Option<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(dir)]
         to_normal: Option<Vec3>,
         /// Normals the same way instead of facing each other.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -733,12 +933,18 @@ pub enum FeatureKind {
     /// `pitch` per turn, on a helix of `diameter` (the section's centre, or its inside or outside).
     Coil {
         #[serde(with = "point_expr")]
+        #[walk(placement)]
         base: PointExpr,
         #[serde(default = "z_axis")]
+        #[walk(dir)]
         axis: Vec3,
+        #[walk(length = "Diameter")]
         diameter: String,
+        #[walk(length = "Pitch")]
         pitch: String,
+        #[walk(unitless = "Revolutions")]
         turns: String,
+        #[walk(length = "Section size")]
         section_size: String,
         #[serde(default)]
         section: CoilSection,
@@ -748,6 +954,7 @@ pub enum FeatureKind {
         /// Start angle about the axis (expression; 0 = from the axis toward +x, or a
         /// perpendicular direction when the axis is x).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Start angle")]
         start_angle: Option<String>,
         /// Turn the other way (left-handed).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -755,11 +962,14 @@ pub enum FeatureKind {
         #[serde(default)]
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
     },
     /// Sheet metal base flange: a sheet from a closed profile (thickness from the rule).
     SheetBase {
+        #[walk(sketch)]
         sketch: u64,
+        #[walk(profiles_of = sketch)]
         profiles: ProfileSel,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
@@ -769,8 +979,10 @@ pub enum FeatureKind {
     },
     /// Sheet metal contour flange: a sheet bent along an open chain of sketch lines.
     SheetContour {
+        #[walk(sketch)]
         sketch: u64,
         curves: Vec<String>,
+        #[walk(length = "Distance")]
         distance: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
@@ -784,10 +996,14 @@ pub enum FeatureKind {
     /// Edge flanges on sheet edges (points on the top or bottom edges). `height` and `angle`
     /// hold for every edge that doesn't carry its own (see [`FlangeEdge`]).
     SheetFlange {
+        #[walk(after = radius)]
         edges: Vec<FlangeEdge>,
+        #[walk(length = "Height")]
         height: String,
+        #[walk(angle = "Angle")]
         angle: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Bend radius")]
         radius: Option<String>,
         /// inside | outside | middle.
         #[serde(default = "inside_str")]
@@ -795,17 +1011,22 @@ pub enum FeatureKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         flip: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Flat hems on sheet edges.
     SheetHem {
+        #[walk(pos)]
         edges: Vec<Vec3>,
+        #[walk(length = "Length")]
         length: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Gap")]
         gap: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         flip: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// A perforation field (#732): round holes of `diameter` on a staggered (60°) or square grid of `pitch` over the
@@ -813,26 +1034,35 @@ pub enum FeatureKind {
     /// a cosmetic thread: the holes go to the flat pattern, the DXF and the measured volume, not into the B-rep, so a
     /// panel can carry tens of thousands of them.
     SheetPerforate {
+        #[walk(length = "Diameter")]
         diameter: String,
+        #[walk(length = "Pitch")]
         pitch: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Margin")]
         margin: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Fold a sheet along a line on its base face: a sketch line (followed when the sketch
     /// changes), else the points `a`, `b`.
     SheetFold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(sketch)]
         sketch: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         curve: Option<String>,
+        #[walk(pos)]
         a: Vec3,
+        #[walk(pos)]
         b: Vec3,
+        #[walk(angle = "Angle")]
         angle: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Bend radius")]
         radius: Option<String>,
         /// centerline | start | end | mould
         position: String,
@@ -840,13 +1070,16 @@ pub enum FeatureKind {
         flip: bool,
         /// A point on the side that stays put (default: the larger side).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(pos)]
         fixed: Option<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Unfold a sheet body flat (all bends), or refold it.
     SheetUnfold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refold: bool,
@@ -855,105 +1088,146 @@ pub enum FeatureKind {
     /// thickness or, with `bends`, a solid or shelled body whose faces reached from the fixed
     /// face across those edges become the sheet.
     SheetConvert {
+        #[walk(body)]
         body: String,
+        #[walk(pick_if = !bends.is_empty())]
         face: Vec3,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
         /// Points on the sharp edges that become bends.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(pos)]
         bends: Vec<Vec3>,
     },
     /// Plastic boss: a round post on a face (draft, root fillet, hole, ribs).
     Boss {
+        #[walk(pick)]
         position: Vec3,
         /// Out of the face (the boss grows along it).
         #[serde(default = "z_axis")]
+        #[walk(dir)]
         direction: Vec3,
+        #[walk(length = "Diameter")]
         diameter: String,
+        #[walk(length = "Height")]
         height: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Hole diameter")]
         hole_diameter: Option<String>,
         /// Hole depth from the top (default: down to the face).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Hole depth")]
         hole_depth: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Draft angle")]
         draft: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Root fillet")]
         fillet: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = "Ribs")]
         ribs: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Rib thickness")]
         rib_thickness: Option<String>,
         /// Rib reach out from the boss wall.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Rib length")]
         rib_length: Option<String>,
         /// Rib top below the boss top.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Rib offset")]
         rib_offset: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Plastic lip (raised band) or groove (recess) along the rim face picked at `face`.
     Lip {
+        #[walk(pos)]
         face: Vec3,
+        #[walk(length = "Width")]
         width: String,
+        #[walk(length = "Height")]
         height: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         groove: bool,
         /// Clearance added to a groove's width (and depth).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Gap")]
         gap: Option<String>,
         /// Along the rim's outer edge instead of its inner one.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         outside: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Plastic snap fit: a cantilever arm on a face with a hook (catch) at its tip.
     SnapFit {
+        #[walk(pick)]
         position: Vec3,
         /// The arm grows along this (out of the face).
         #[serde(default = "z_axis")]
+        #[walk(dir)]
         direction: Vec3,
         /// The catch sticks out this way.
+        #[walk(dir)]
         hook: Vec3,
+        #[walk(length = "Length")]
         length: String,
+        #[walk(length = "Thickness")]
         thickness: String,
+        #[walk(length = "Width")]
         width: String,
+        #[walk(length = "Catch depth")]
         catch_depth: String,
         /// The catch's height along the arm.
+        #[walk(length = "Catch length")]
         catch_length: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Plastic rest: a raised pad on a face (round, or a rectangle), solid or a hollow wall,
     /// with draft.
     Rest {
+        #[walk(pick)]
         position: Vec3,
         /// Out of the face (the pad grows along it).
         #[serde(default = "z_axis")]
+        #[walk(dir)]
         direction: Vec3,
         /// The rectangle's length runs along this (default: any direction in the face).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(dir)]
         along: Option<Vec3>,
         /// Diameter of a round rest, or the rectangle's width.
+        #[walk(length = "Width")]
         width: String,
         /// The rectangle's length (none: round).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Length", after = height)]
         length: Option<String>,
+        #[walk(length = "Height")]
         height: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Draft angle")]
         draft: Option<String>,
         /// Wall thickness of a hollow rest (none: solid).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Wall thickness")]
         thickness: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
     },
     /// Boundary Fill: solids from the cells the tool bodies enclose (a cell: inside some
     /// tools and outside the rest), each picked by a point inside it.
     BoundaryFill {
+        #[walk(body)]
         tools: Vec<String>,
+        #[walk(pos)]
         cells: Vec<Vec3>,
         #[serde(default)]
         operation: Operation,
@@ -963,43 +1237,59 @@ pub enum FeatureKind {
     },
     /// Remove bodies from the model (from here on in the timeline).
     Remove {
+        #[walk(body)]
         bodies: Vec<String>,
     },
     /// Surface bodies: planar patches filling sketch regions (`profiles` of `sketch`), or a
     /// closed loop of a body's edges (`edges`: points on them, on `body`).
     Patch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(sketch)]
         sketch: Option<u64>,
         #[serde(default = "all_profiles")]
+        #[walk(profiles_of = sketch)]
         profiles: ProfileSel,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(pos)]
         edges: Vec<Vec3>,
+        /// How full a fitted patch's middle is (`crown`, -0.9…3, default 0; a planar loop is an
+        /// exact plane whatever this says).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        crown: f64,
     },
     /// Surface bodies sewn along shared edges into the first one (a solid when they close).
     Stitch {
+        #[walk(body)]
         bodies: Vec<String>,
         #[serde(default = "zero_expr")]
+        #[walk(length = "Tolerance")]
         tolerance: String,
     },
     /// Surface bodies thickened into solids along their normals (by half each way when
     /// `symmetric`).
     Thicken {
+        #[walk(body)]
         bodies: Vec<String>,
+        #[walk(length = "Thickness")]
         thickness: String,
         #[serde(default)]
         symmetric: bool,
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(body)]
         targets: Vec<String>,
     },
     /// A surface body swept straight along the sketch normal from open curve chains and the
     /// boundaries of profiles: walls only, no caps.
     SurfaceExtrude {
+        #[walk(sketch)]
         sketch: u64,
         /// Profiles whose boundary loops are swept (none: only `curves`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(profiles_of = sketch)]
         profiles: Option<ProfileSel>,
         /// Sketch curve ids, grouped into chains of curves that meet end to end.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1009,28 +1299,52 @@ pub enum FeatureKind {
     /// A body taken apart: each face at `faces` (every face when empty) its own surface body,
     /// the faces left one surface body under the body's name. A solid comes apart into surfaces.
     Unstitch {
+        #[walk(body)]
         body: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(pos)]
         faces: Vec<Vec3>,
     },
     /// A surface body with the faces at `faces` (every face when empty) turned over.
     ReverseNormal {
+        #[walk(body)]
         body: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(pos)]
         faces: Vec<Vec3>,
+    },
+    /// The face at `face` restored towards its surface: the inner loops at the `holes` points
+    /// taken away (every one when `None`; none when empty), and with `outer` its outer boundary
+    /// back at the surface's natural bounds (an analytic surface's: the face's own span). A new
+    /// surface body; with `in_place`, a surface body's face is untrimmed where it is.
+    SurfaceUntrim {
+        // The face is picked (and named); the holes are picked by points on their edges.
+        #[walk(picks_faces)]
+        face: FaceAt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(pos)]
+        holes: Option<Vec<Vec3>>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        outer: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        in_place: bool,
     },
     /// A surface body turned about an axis from open curve chains and the boundaries of
     /// profiles: walls only, no caps (a solid where a full turn closes them).
     SurfaceRevolve {
+        #[walk(sketch)]
         sketch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(profiles_of = sketch)]
         profiles: Option<ProfileSel>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         curves: Vec<String>,
         axis: AxisRef,
+        #[walk(angle = "Angle")]
         angle: String,
         /// Two Sides: the angle on the other side.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Angle 2")]
         angle2: Option<String>,
         /// Symmetric: `angle` split evenly either side of the sketch.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1039,13 +1353,27 @@ pub enum FeatureKind {
     /// A surface body swept along a chain of sketch curves from open curve chains and the
     /// boundaries of profiles: walls only, no caps.
     SurfaceSweep {
+        #[walk(sketch)]
         sketch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(profiles_of = sketch)]
         profiles: Option<ProfileSel>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         curves: Vec<String>,
+        #[walk(sketch)]
         path_sketch: u64,
         path: Vec<String>,
+        /// How the profile turns along the path (default: perpendicular to it).
+        #[serde(default, skip_serializing_if = "SweepOrientation::is_perpendicular")]
+        orientation: SweepOrientation,
+        /// Angle the profile turns about the path over its length.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Twist")]
+        twist: Option<String>,
+        /// The profile's scale at the end of the path (linear along its length).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = "Scale")]
+        scale: Option<String>,
     },
     /// A surface body lofted through sections in order, each one open or closed chain of
     /// sketch curves: walls only, no caps.
@@ -1056,36 +1384,104 @@ pub enum FeatureKind {
     /// surface body (0 copies them); `chain` takes each pick's whole smooth chain of faces;
     /// fitted faces within `tolerance`.
     SurfaceOffset {
+        #[walk(pick)]
         faces: Vec<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(body)]
         body: Option<String>,
+        #[walk(length = "Distance")]
         distance: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         chain: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Tolerance")]
         tolerance: Option<String>,
     },
-    /// A planar surface body extended outward by `distance` past the edges through `edges`.
-    SurfaceExtend {
+    /// A strip of ruled surface `distance` wide hanging off the chain of `body`'s edges through
+    /// `edges`, as a new surface body: along `mode` (`angle` from `direction`, or from the
+    /// face's normal; along `direction`), from the face at `face` where it borders the chain;
+    /// `flip` puts it on the other side; sharp corners as `corners` says.
+    SurfaceRuled {
+        #[walk(body)]
         body: String,
+        #[walk(pos)]
         edges: Vec<Vec3>,
+        #[walk(length = "Distance")]
         distance: String,
+        #[serde(default, skip_serializing_if = "RuledMode::is_normal")]
+        mode: RuledMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Angle")]
+        angle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(dir)]
+        direction: Option<Vec3>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flip: bool,
+        #[serde(default, skip_serializing_if = "RuledCorners::is_mitre")]
+        corners: RuledCorners,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(pick)]
+        face: Option<Vec3>,
+    },
+    /// A surface body's boundary edges through `edges` extended outward: by `distance`, or up
+    /// to `up_to`; the surface continued (`mode` natural) or a run-off face along each edge
+    /// (tangent, curvature). `neighbours`: the edges next to an extended edge are lengthened to
+    /// meet it (else the extension's sides run square to the edge).
+    SurfaceExtend {
+        #[walk(body)]
+        body: String,
+        #[walk(pos)]
+        edges: Vec<Vec3>,
+        #[walk(length = "Distance")]
+        distance: String,
+        #[serde(default, skip_serializing_if = "ExtendMode::is_natural")]
+        mode: ExtendMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        up_to: Option<ExtendTo>,
+        #[serde(default = "yes", skip_serializing_if = "is_yes")]
+        neighbours: bool,
+    },
+    /// A blend surface bridging two picked edge chains of two bodies (`surface.blend`): each end
+    /// repeats the surface it leaves up to its requested continuity, with the fullness `bulge`.
+    SurfaceBlend {
+        from: BlendSide,
+        to: BlendSide,
+        /// How much of each support surface the blend repeats: [from, to].
+        #[serde(default = "blend_orders")]
+        continuity: [Continuity; 2],
+        /// How full each end leaves: [from, to]; 0 is the plain bridge.
+        #[serde(default)]
+        bulge: [f64; 2],
+        /// Points the blend leaves towards, when the faces at the picks do not say: [from, to].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(pos)]
+        align: Option<[Vec3; 2]>,
+        /// Sew the blend onto its two bodies where the boundaries meet.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stitch: bool,
     },
     /// A surface body trimmed by a plane, or by a face of a body (`tool`), keeping the side of
     /// `keep`.
     SurfaceTrim {
+        #[walk(body)]
         body: String,
         plane: PlaneRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<FaceAt>,
+        #[walk(pos)]
         keep: Vec3,
     },
     Move {
+        #[walk(body)]
         bodies: Vec<String>,
+        #[walk(length = ["X distance", "Y distance", "Z distance"])]
         translate: [String; 3],
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(dir)]
         rotate_axis: Option<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Angle")]
         angle: Option<String>,
         /// When set, the original bodies are kept and the transform is applied to a new copy
         /// of each instead of moving them in place.
@@ -1103,10 +1499,17 @@ pub enum FeatureKind {
         /// The file's product/assembly tree, kept for components.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         components: Vec<solidcraft_kernel::StepNode>,
+        /// The file's bodies (by index) this feature does not build: later instances of a part
+        /// the file places more than once, shown by the other occurrences of that part's
+        /// component (#1386). Empty in designs from before format 22: every body is built.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skip: Vec<u64>,
     },
     /// Rebuild an upstream constant-section mesh with analytic planar/cylindrical faces.
     MeshConvert {
+        #[walk(body)]
         body: String,
+        #[walk(length = "Tolerance")]
         tolerance: String,
     },
     /// Mesh bodies imported from a 3MF or STL file, embedded in the design.
@@ -1117,8 +1520,39 @@ pub enum FeatureKind {
     },
 }
 
+/// How Extend continues a surface past its edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtendMode {
+    /// The surface itself, continued.
+    #[default]
+    Natural,
+    /// A ruled run-off in the surface's tangent plane (G1).
+    Tangent,
+    /// A run-off that keeps the surface's curvature across the edge (G2).
+    Curvature,
+}
+
+impl ExtendMode {
+    pub fn is_natural(&self) -> bool {
+        *self == ExtendMode::Natural
+    }
+}
+
+/// What Extend extends up to instead of a distance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtendTo {
+    /// A plane.
+    Plane(PlaneRef),
+    /// The surface of a body's face (extended).
+    Face(FaceAt),
+    /// The surface's own bounds (natural only): a trim undone.
+    Bounds,
+}
+
 /// How a fillet's size is given.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FilletStyle {
     #[default]
@@ -1131,9 +1565,12 @@ pub enum FilletStyle {
     /// `radius` at the end of each edge nearest `start`, `radius2` at the other; `mid` radii at
     /// positions between (0 to 1 from the start end); straight between them, or `smooth`.
     Variable {
+        #[walk(length = "End radius")]
         radius2: String,
+        #[walk(pos)]
         start: Vec3,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[walk(length = "Mid radius")]
         mid: Vec<(f64, String)>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         smooth: bool,
@@ -1141,7 +1578,13 @@ pub enum FilletStyle {
     /// The radius along each edge as a clamped B-spline of the position from the end nearest
     /// `start` (0) to the other (1): `radius` is its first control radius and `radii` the rest,
     /// its degree what `knots` leave (knots = control radii + degree + 1).
-    Spline { start: Vec3, knots: Vec<f64>, radii: Vec<String> },
+    Spline {
+        #[walk(pos)]
+        start: Vec3,
+        knots: Vec<f64>,
+        #[walk(length = |i: usize, n: usize| if i + 1 == n { "End radius" } else { "Control radius" })]
+        radii: Vec<String>,
+    },
 }
 
 /// A fillet radius too large for the geometry around its edges: refused (`Exact`, the default),
@@ -1168,6 +1611,16 @@ impl FilletStyle {
         *self == FilletStyle::Constant
     }
 
+    /// What the feature's `radius` is in this style (the label of its parameter).
+    pub fn radius_label(&self) -> &'static str {
+        match self {
+            FilletStyle::Constant => "Radius",
+            FilletStyle::Curvature => "Equivalent radius",
+            FilletStyle::Chord => "Chord length",
+            FilletStyle::Variable { .. } | FilletStyle::Spline { .. } => "Start radius",
+        }
+    }
+
     /// The spline of a [`FilletStyle::Spline`] with its control radii `values` (the first is
     /// the feature's `radius`).
     pub fn spline(knots: &[f64], values: Vec<f64>) -> solidcraft_kernel::RadiusSpline {
@@ -1177,10 +1630,28 @@ impl FilletStyle {
 }
 
 /// A face picked by a point on it, on a named body.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct FaceAt {
+    #[walk(body)]
     pub body: String,
+    #[walk(pos)]
     pub point: Vec3,
+}
+
+/// One end of a blend: a body and the points that pick the edges of its boundary chain. With two
+/// picks on the same edge the chain is that one edge; more pick a chain that runs on from pick to
+/// pick (the order of the picks does not matter).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+pub struct BlendSide {
+    #[walk(body)]
+    pub body: String,
+    #[walk(pos)]
+    pub edges: Vec<Vec3>,
+}
+
+/// The continuity a blend repeats by default: the tangent plane on both sides.
+fn blend_orders() -> [Continuity; 2] {
+    [Continuity::G1, Continuity::G1]
 }
 
 /// Triangles of one imported mesh body (millimetres).
@@ -1196,8 +1667,9 @@ pub struct MeshData {
 }
 
 /// Points of a sketch, by id.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct SketchPoints {
+    #[walk(sketch)]
     pub sketch: u64,
     pub ids: Vec<String>,
     /// Drill the other way: away from the side the holes would go into by themselves.
@@ -1217,9 +1689,11 @@ pub struct Component {
 }
 
 /// One loft section: profiles of a sketch.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct LoftSection {
+    #[walk(sketch)]
     pub sketch: u64,
+    #[walk(profiles_of = sketch, when = point.is_none())]
     pub profiles: ProfileSel,
     /// A sketch point instead of a profile (the loft closes to it, as a pyramid's apex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1228,10 +1702,12 @@ pub struct LoftSection {
 
 /// A section of a surface loft: one chain from a sketch (one profile's boundary, or curves
 /// meeting end to end).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct SheetSection {
+    #[walk(sketch)]
     pub sketch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(profiles_of = sketch)]
     pub profiles: Option<ProfileSel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub curves: Vec<String>,
@@ -1250,55 +1726,78 @@ fn is_zero_i8(v: &i8) -> bool {
     *v == 0
 }
 
+/// A parameter that is left out when it is 0 (an optional shape knob).
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// Hole shapes.
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HoleKind {
     /// Plain hole; blind holes get a drill point when `tip_angle` is set.
     #[default]
     Simple,
     Drilled {
+        #[walk(angle = "Tip angle")]
         tip_angle: String,
     },
     Counterbore {
+        #[walk(length = "Counterbore diameter")]
         cb_diameter: String,
+        #[walk(length = "Counterbore depth")]
         cb_depth: String,
     },
     Countersink {
+        #[walk(length = "Countersink diameter")]
         cs_diameter: String,
+        #[walk(angle = "Countersink angle")]
         cs_angle: String,
     },
 }
 
 /// Pattern layouts.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PatternKind {
     Rectangular {
+        #[walk(dir)]
         dir1: Vec3,
+        #[walk(unitless = "Quantity")]
         count1: String,
+        #[walk(length = "Spacing")]
         spacing1: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(dir)]
         dir2: Option<Vec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = "Quantity 2")]
         count2: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Spacing 2")]
         spacing2: Option<String>,
     },
     Circular {
+        #[walk(pos)]
         origin: Vec3,
+        #[walk(dir)]
         axis: Vec3,
+        #[walk(unitless = "Quantity")]
         count: String,
         /// Total angle (360 deg = evenly around).
+        #[walk(angle = "Total angle")]
         angle: String,
     },
     /// Copies along a chain of sketch curves: instance k moves by path(k·spacing) − path(0),
     /// measured along the path from its start.
     Path {
+        #[walk(sketch)]
         path_sketch: u64,
         path: Vec<String>,
+        #[walk(unitless = "Quantity")]
         count: String,
         /// Distance along the path between instances, or the whole extent when `extent`.
+        #[walk(length = "Distance")]
         spacing: String,
         /// `spacing` is the distance from the first to the last instance.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1438,12 +1937,15 @@ impl FeatureKind {
             FeatureKind::SurfaceRevolve { .. } => "SurfaceRevolveFeature",
             FeatureKind::SurfaceSweep { .. } => "SurfaceSweepFeature",
             FeatureKind::SurfaceLoft { .. } => "SurfaceLoftFeature",
+            FeatureKind::SurfaceBlend { .. } => "BlendFeature",
             FeatureKind::Stitch { .. } => "StitchFeature",
             FeatureKind::Thicken { .. } => "ThickenFeature",
             FeatureKind::SurfaceTrim { .. } => "TrimFeature",
             FeatureKind::SurfaceExtend { .. } => "ExtendFeature",
+            FeatureKind::SurfaceRuled { .. } => "RuledSurfaceFeature",
             FeatureKind::Unstitch { .. } => "UnstitchFeature",
             FeatureKind::ReverseNormal { .. } => "ReverseNormalFeature",
+            FeatureKind::SurfaceUntrim { .. } => "UntrimFeature",
             FeatureKind::Import { .. } => "BaseFeature",
             FeatureKind::MeshImport { .. } => "MeshFeature",
             FeatureKind::MeshConvert { .. } => "MeshConvertFeature",
@@ -1512,12 +2014,15 @@ impl FeatureKind {
             FeatureKind::SurfaceRevolve { .. } => "SurfaceRevolve",
             FeatureKind::SurfaceSweep { .. } => "SurfaceSweep",
             FeatureKind::SurfaceLoft { .. } => "SurfaceLoft",
+            FeatureKind::SurfaceBlend { .. } => "Blend",
             FeatureKind::Stitch { .. } => "Stitch",
             FeatureKind::Thicken { .. } => "Thicken",
             FeatureKind::SurfaceTrim { .. } => "Trim",
             FeatureKind::SurfaceExtend { .. } => "Extend",
+            FeatureKind::SurfaceRuled { .. } => "RuledSurface",
             FeatureKind::Unstitch { .. } => "Unstitch",
             FeatureKind::ReverseNormal { .. } => "ReverseNormal",
+            FeatureKind::SurfaceUntrim { .. } => "Untrim",
             FeatureKind::Import { .. } => "Import",
             FeatureKind::MeshImport { .. } => "Mesh",
             FeatureKind::MeshConvert { .. } => "ConvertMesh",
@@ -1622,6 +2127,9 @@ pub struct Document {
     pub name: String,
     #[serde(default = "default_units")]
     pub units: String,
+    /// Design properties (project, author…) and other tools' data, kept as they are (#1015).
+    #[serde(default, skip_serializing_if = "crate::Metadata::is_empty")]
+    pub metadata: crate::Metadata,
     pub params: Vec<Param>,
     pub features: Vec<Feature>,
     /// Timeline marker: features at or after this index are rolled back (not evaluated).
@@ -1835,6 +2343,7 @@ impl Document {
             format: default_format(),
             name: name.into(),
             units: default_units(),
+            metadata: Default::default(),
             params: Vec::new(),
             features: Vec::new(),
             marker: None,
@@ -2283,6 +2792,7 @@ impl Document {
             }
             if let FeatureKind::Sketch { sketch, .. } = &f.kind {
                 used.extend(sketch.constraints.iter().filter_map(|c| c.param.clone()));
+                used.extend(sketch.text_exprs().into_iter().flat_map(|(_, e)| expr::references(e)));
             }
         }
         for p in &self.params {
@@ -2477,6 +2987,39 @@ impl Document {
         }
         for c in &sk.constraints {
             sk.validate(&c.kind)?;
+        }
+        Ok(())
+    }
+
+    /// Give the texts of a sketch the numbers their expressions come to (in place): a text's
+    /// height, place and angle that were typed as expressions. A text's outlines are rebuilt from
+    /// its numbers when the sketch's links are refreshed, so this comes before that. A number
+    /// typed as a number is left as it is.
+    pub fn apply_text_values(&self, vals: &std::collections::BTreeMap<String, expr::Value>, sk: &mut Sketch) -> Result<()> {
+        use crate::eval::val;
+        for link in &mut sk.links {
+            let solidcraft_sketch::LinkSource::Text { at, height, angle, exprs, .. } = &mut link.source else { continue };
+            let number = |e: &Option<String>, kind: Kind, what: &str| -> Result<Option<f64>> {
+                match e {
+                    None => Ok(None),
+                    Some(e) => val(vals, e, kind).map(Some).map_err(|error| DocError::Expr(format!("{what}: {error}"))),
+                }
+            };
+            if let Some(v) = number(&exprs.x, Kind::Length, "text X")? {
+                at.x = v;
+            }
+            if let Some(v) = number(&exprs.y, Kind::Length, "text Y")? {
+                at.y = v;
+            }
+            if let Some(v) = number(&exprs.height, Kind::Length, "text height")? {
+                *height = v;
+            }
+            if let Some(v) = number(&exprs.angle, Kind::Angle, "text angle")? {
+                *angle = v;
+            }
+            if exprs.height.is_some() && !(*height > 1e-6 && *height < 1e5) {
+                return Err(DocError::Invalid("a text's height must be positive".into()));
+            }
         }
         Ok(())
     }

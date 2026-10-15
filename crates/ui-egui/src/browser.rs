@@ -268,6 +268,9 @@ pub(crate) struct Row<'a> {
     pub(crate) eye: Option<bool>,
     pub(crate) icon: &'a str,
     pub(crate) label: &'a str,
+    /// The label is a name someone gave (a body, sketch, component, …): it is shown as typed,
+    /// not translated when it happens to match a UI label.
+    pub(crate) name: bool,
     pub(crate) selected: bool,
     pub(crate) dim: bool,
     pub(crate) color: Option<Color32>,
@@ -375,7 +378,7 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         x += 21.0;
     }
     let col = row.color.unwrap_or(if row.dim { t.text_dim } else { t.text });
-    let label_display = crate::i18n::tr_dyn(row.label);
+    let label_display = if row.name { crate::i18n::tr_name(row.label) } else { crate::i18n::tr_dyn(row.label) };
     let galley = ui.painter().layout_no_wrap(label_display, FontId::proportional(12.5), col);
     let lw = galley.size().x;
     ui.painter().galley(pos2(x, cy - galley.size().y / 2.0), galley, col);
@@ -596,6 +599,7 @@ fn component_rows(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, depth: usize, 
         eye: (id != 0).then_some(visible),
         icon: "component",
         label: &name,
+        name: true,
         selected: app.tree.picked_components.contains(&id),
         dim: faded,
         radio: Some(active),
@@ -699,6 +703,7 @@ fn occurrence_rows(app: &mut SolveApp, ui: &mut egui::Ui, path: Vec<u64>, depth:
             eye: Some(own_visible),
             icon: "component",
             label: &placement.name,
+            name: true,
             selected,
             dim: faded || !visible,
             radio: Some(active),
@@ -798,6 +803,11 @@ fn doc_settings(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     if draw_row(ui, ui.id().with("params"), &Row { depth: depth + 1, icon: "params", label: &params, ..Default::default() }).clicked {
         app.start("parameters.change");
     }
+    if draw_row(ui, ui.id().with("design_properties"), &Row { depth: depth + 1, icon: "settings", label: "Design Properties", ..Default::default() })
+        .clicked
+    {
+        app.start("document.metadata");
+    }
 }
 
 fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
@@ -849,6 +859,11 @@ fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 app.session.visibility.hidden_origin.retain(|h| h != k);
             }
         }
+        if let Some(p) = r.secondary
+            && icon == "plane"
+        {
+            crate::context_menu::open_for(app, p, Target::OriginPlane { name: k.into() });
+        }
         if r.clicked
             && let Some(x) = sel
         {
@@ -886,7 +901,11 @@ fn named_view_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &m
     }
     let names: Vec<String> = app.session.doc.named_views.iter().map(|v| v.name.clone()).collect();
     for name in names {
-        let r = draw_row(ui, ui.id().with(("view", &name)), &Row { depth: depth + 1, icon: "perspective", label: &name, ..Default::default() });
+        let r = draw_row(
+            ui,
+            ui.id().with(("view", &name)),
+            &Row { depth: depth + 1, icon: "perspective", label: &name, name: true, ..Default::default() },
+        );
         if r.double {
             restore_view(app, &name);
         }
@@ -1026,7 +1045,7 @@ fn canvas_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &mut A
         let r = draw_row(
             ui,
             ui.id().with(("canvas", id)),
-            &Row { depth: depth + 1, eye: Some(visible), icon: "canvas", label: &name, selected, dim: !visible, ..Default::default() },
+            &Row { depth: depth + 1, eye: Some(visible), icon: "canvas", label: &name, name: true, selected, dim: !visible, ..Default::default() },
         );
         if r.eye {
             let _ = app.run("canvas.edit", json!({ "canvas": id, "visible": !visible }));
@@ -1141,7 +1160,7 @@ fn canvas_panel(app: &mut SolveApp, ctx: &egui::Context) {
                     let r3 = ui.add(crate::prefs::length_drag(&mut w, &app.session.doc.units, app.preferences.length_decimals).range(0.01..=1e6));
                     ui.end_row();
                     ui.label(crate::i18n::tr_label("Angle"));
-                    let r4 = ui.add(egui::DragValue::new(&mut ang).speed(1.0).suffix(" deg"));
+                    let r4 = ui.add(egui::DragValue::new(&mut ang).speed(1.0).suffix(" deg").custom_parser(crate::prefs::parse_number));
                     ui.end_row();
                     ui.label(crate::i18n::tr_label("Opacity"));
                     let r5 = ui.add(egui::Slider::new(&mut op, 0.0..=1.0));
@@ -1234,7 +1253,7 @@ fn entries(app: &SolveApp, comp: u64, folder: &str) -> Vec<Entry> {
             .state()
             .bodies
             .iter()
-            .filter(|b| doc.model_body_component(b) == comp)
+            .filter(|b| doc.model_body_component(b) == comp && !app.session.body_removed_later(&b.name))
             .map(|b| Entry {
                 key: b.name.clone(),
                 row_key: format!("b:{}", b.name),
@@ -1456,7 +1475,16 @@ fn folder_rows_at(app: &mut SolveApp, ui: &mut egui::Ui, comp: u64, path: Option
         let r = draw_row(
             ui,
             ui.id().with(&gkey),
-            &Row { depth: depth + 1, fold: Some(gopen), eye: Some(gvis), icon: "folder", label: &label, dim: !gvis, ..Default::default() },
+            &Row {
+                depth: depth + 1,
+                fold: Some(gopen),
+                eye: Some(gvis),
+                icon: "folder",
+                label: &label,
+                name: true,
+                dim: !gvis,
+                ..Default::default()
+            },
         );
         if r.fold || r.clicked {
             toggle(app, &gkey, true);
@@ -1512,6 +1540,7 @@ fn entry_row(
             eye: Some(e.visible),
             icon: e.icon,
             label: &e.label,
+            name: true,
             selected: e.selected,
             dim: !e.visible,
             color: e.color,
@@ -1697,7 +1726,7 @@ fn occurrence_panel(app: &mut SolveApp, ui: &mut egui::Ui) {
                 for (k, axis) in ["X angle", "Y angle", "Z angle"].iter().enumerate() {
                     ui.label(*axis);
                     if let Some(v) = m.angles.get_mut(k) {
-                        let response = ui.add(egui::DragValue::new(v).speed(1.0).suffix(" deg"));
+                        let response = ui.add(egui::DragValue::new(v).speed(1.0).suffix(" deg").custom_parser(crate::prefs::parse_number));
                         crate::scenario::publish_handle(&format!("occurrence-move:angle:{k}"), response.rect.center());
                     }
                     ui.end_row();
@@ -1794,7 +1823,7 @@ fn triad(app: &mut SolveApp, ui: &mut egui::Ui, m: &mut OccMove) {
 /// viewport like the sketch being edited draws its own (`crate::dim_view`), but not editable.
 pub fn dims_overlay(app: &SolveApp, ctx: &egui::Context) {
     use solidcraft_engine::geom::Vec2;
-    use solidcraft_engine::sketch::{DimFrame, chain_centres, default_text, dim_frame, dim_layout};
+    use solidcraft_engine::sketch::{DimFrame, chain_centres, default_text, dim_frame, dim_layout_reaching, dim_reach};
     let Some(rect) = app.viewport.rect else { return };
     if app.ui.shown_dims.is_empty() {
         return;
@@ -1832,7 +1861,7 @@ pub fn dims_overlay(app: &SolveApp, ctx: &egui::Context) {
             );
             let size = galley.size() + vec2(6.0, 2.0);
             let half = Vec2::new(f64::from(size.x) * 0.5 * px, f64::from(size.y) * 0.5 * px);
-            let lay = dim_layout(&frame, c.text.or_else(|| default_text(&frame, middle, px)), px, half);
+            let lay = dim_layout_reaching(&frame, c.text.or_else(|| default_text(&frame, middle, px)), px, half, dim_reach(sk, &c.kind));
             for line in &lay.lines {
                 painter.add(egui::Shape::line(line.iter().filter_map(|q| to(*q)).collect(), Stroke::new(1.0, col)));
             }
@@ -1934,6 +1963,12 @@ fn occurrence_origin(app: &SolveApp, occurrence: u64) -> Option<solidcraft_engin
     let parent = app.session.doc.component_transform(o.parent);
     let own = app.session.pending_moves.get(&occurrence).copied().unwrap_or(o.transform);
     Some(solidcraft_engine::doc::apply_point(&solidcraft_engine::doc::mat_mul(&parent, &own), solidcraft_engine::geom::Vec3::ZERO))
+}
+
+/// The names the Bodies folder lists at the top level, for tests.
+#[cfg(test)]
+pub(crate) fn body_rows(app: &SolveApp) -> Vec<String> {
+    entries(app, 0, "bodies").into_iter().map(|e| e.key).collect()
 }
 
 #[cfg(test)]

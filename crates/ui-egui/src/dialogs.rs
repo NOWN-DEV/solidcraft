@@ -42,6 +42,8 @@ pub enum Kind {
         /// Into a body: cut; additions: join when a solid exists, otherwise new.
         /// until the user picks one.
         auto_op: bool,
+        /// The direction from the picked side and the latched operation (#1257).
+        smart: crate::smart_extrude::Smart,
         /// The other side's distance (two sides).
         distance2: String,
         /// Taper angle (empty or zero: none).
@@ -106,6 +108,7 @@ pub enum Kind {
     /// Sweep a profile along a path of sketch curves.
     Sweep {
         operation: usize,
+        opts: crate::dialogs_sweep::SweepOpts,
     },
     /// A construction plane offset from a plane.
     OffsetPlane {
@@ -190,6 +193,9 @@ pub enum Kind {
     Measure {
         result: Option<Value>,
         of: Vec<Sel>,
+        /// The measure chosen in the panel (centre, min or max); `None` follows the result's
+        /// own default (centre where a round item gives one).
+        show: Option<Shown>,
     },
     /// Move bodies by a distance along X, Y and Z.
     /// Move/Copy (see `dialogs_move`): the move type, X/Y/Z distances (Point to Position: the
@@ -251,6 +257,7 @@ pub enum Kind {
     Sheet(crate::dialogs_sheet::Sm),
     /// Surface tools and Split Face (`dialogs_surface`).
     Surface(crate::dialogs_surface::Surf),
+    SaveMesh(crate::dialogs_save_mesh::SaveMesh),
     /// Plastic features (`dialogs_plastic`).
     Plastic(crate::dialogs_plastic::Pl),
     /// Appearance (`dialogs_appearance`).
@@ -314,6 +321,61 @@ pub struct Dialog {
     pub refused: Option<Refused>,
     /// Create Sketch opened by a sketch tool's shortcut: that tool starts once the sketch is open.
     pub then_start: Option<&'static str>,
+}
+
+/// OK computing off the window thread: the dialog's commands evaluated on a scratch copy of the
+/// session, which leaves the feature in the evaluation cache the session shares. Once that is
+/// in, OK runs them for real and finds the feature there; meanwhile the window stays live and
+/// the dialog says it is computing.
+pub struct Applying {
+    pub(crate) done: std::sync::mpsc::Receiver<()>,
+    /// When OK was pressed (ms).
+    pub(crate) started: f64,
+    /// The commands being computed.
+    pub(crate) cmds: Vec<(String, Value)>,
+}
+
+impl Applying {
+    /// The evaluation is in (or its worker ended).
+    fn finished(&self) -> bool {
+        !matches!(self.done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+    }
+}
+
+/// How long the desktop app's OK waits for its evaluation before it lets the window go on and
+/// shows that it is computing ([`SolveApp::apply_off_thread`]): a feature quicker than this
+/// applies at once, as it always did.
+pub const APPLY_AT_ONCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Start OK's evaluation off the window thread, for a feature dialog. `None` when OK should
+/// just run: not a feature, not asked for ([`SolveApp::apply_off_thread`]), no threads (the
+/// web), or done within the wait.
+#[cfg(not(target_arch = "wasm32"))]
+fn begin_applying(app: &SolveApp, d: &Dialog) -> Option<Applying> {
+    let wait = app.apply_off_thread?;
+    if !d.previews() {
+        return None;
+    }
+    let cmds = apply_commands(app, d).ok()?;
+    let scratch = app.session.scratch();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let computed = cmds.clone();
+    std::thread::Builder::new()
+        .name("apply".into())
+        .spawn(move || {
+            let _ = scratch.preview(&computed);
+            let _ = tx.send(());
+        })
+        .ok()?;
+    match rx.recv_timeout(wait) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Applying { done: rx, started: crate::now_ms(), cmds }),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn begin_applying(_app: &SolveApp, _d: &Dialog) -> Option<Applying> {
+    None
 }
 
 /// The commands a dialog's inputs make (or why they make none), its picks, and the design's
@@ -384,6 +446,7 @@ impl Dialog {
                     direction: 0,
                     operation: usize::from(has_bodies),
                     auto_op: true,
+                    smart: Default::default(),
                     distance2: "10 mm".into(),
                     taper: "0 deg".into(),
                     taper_present: false,
@@ -468,9 +531,10 @@ impl Dialog {
             "inspect.section" => {
                 Dialog::new(Kind::Section { offset: "0 mm".into(), flip: false }, vec![SelInput::new("Plane", PLANES | PLANAR_FACES, false)])
             }
-            "inspect.measure" => {
-                Dialog::new(Kind::Measure { result: None, of: Vec::new() }, vec![SelInput::new("Items", FACES | EDGES | selection::VERTICES, true)])
-            }
+            "inspect.measure" => Dialog::new(
+                Kind::Measure { result: None, of: Vec::new(), show: None },
+                vec![SelInput::new("Items", FACES | EDGES | selection::VERTICES | selection::CURVES | PROFILES, true)],
+            ),
             "solid.pattern.rectangular" => Dialog::new(
                 Kind::PatternRect { count: "3".into(), spacing: "20 mm".into(), count2: "1".into(), spacing2: "20 mm".into() },
                 vec![
@@ -485,8 +549,8 @@ impl Dialog {
             ),
             "solid.loft" => Dialog::new(Kind::Loft { operation: usize::from(has_bodies) }, vec![SelInput::new("Profiles", PROFILES, true)]),
             "solid.sweep" => Dialog::new(
-                Kind::Sweep { operation: usize::from(has_bodies) },
-                vec![SelInput::new("Profile", PROFILES, true), SelInput::new("Path", CURVES, true)],
+                Kind::Sweep { operation: usize::from(has_bodies), opts: crate::dialogs_sweep::SweepOpts::default() },
+                vec![SelInput::new("Profile", PROFILES, true), SelInput::new("Path", CURVES, true), crate::dialogs_sweep::direction_input()],
             ),
             "solid.move" => Dialog::new(crate::dialogs_move::kind(0), crate::dialogs_move::inputs(0)),
             "solid.hole" => Dialog::new(hole_defaults(), vec![SelInput::new("Face", HOLE_FACES, true)]),
@@ -544,6 +608,7 @@ impl Dialog {
                 let (kind, inputs) = crate::dialogs_assembly::start(app, id)
                     .or_else(|| crate::dialogs_sheet::start(app, id))
                     .or_else(|| crate::dialogs_surface::start(app, id))
+                    .or_else(|| crate::dialogs_save_mesh::start(app, id))
                     .or_else(|| crate::dialogs_plastic::start(app, id))
                     .or_else(|| crate::dialogs_appearance::start(app, id))
                     .or_else(|| crate::dialogs_motion::start(app, id))
@@ -1313,6 +1378,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Assembly(k) => k.title(),
         Kind::Sheet(k) => k.title(),
         Kind::Surface(k) => k.title(),
+        Kind::SaveMesh(_) => "SAVE AS MESH",
         Kind::Plastic(k) => k.title(),
         Kind::Appearance(_) => "APPEARANCE",
         Kind::Motion(k) => k.title(),
@@ -1572,7 +1638,7 @@ fn input_rows(d: &mut Dialog, ui: &mut egui::Ui, s: &Session) {
                 .stroke(stroke)
                 .min_size(vec2(0.0, 22.0))
                 .sense(egui::Sense::CLICK);
-            let chip = ui.add(b);
+            let chip = crate::frame::add_outlined(ui, b, stroke.width);
             publish_row(&chip);
             let tooltip = if custom_axis {
                 if let Kind::Revolve { axis: Some(axis), .. } = &d.kind {
@@ -1617,7 +1683,7 @@ fn input_rows(d: &mut Dialog, ui: &mut egui::Ui, s: &Session) {
 /// Width limits of a docked dialog: shrink-wrapped to its content within these.
 use crate::frame::{DIALOG_MAX_W, DIALOG_MIN_W, DIALOG_WIDE_MAX_W};
 /// Width of value fields and choice boxes in a dialog.
-const FIELD_W: f32 = 124.0;
+pub(crate) const FIELD_W: f32 = 124.0;
 
 /// Find the Boundary Fill cells again when the tool bodies changed (keeping the choices of
 /// cells that are still there).
@@ -1683,7 +1749,7 @@ pub(crate) fn fill_cells(st: &solidcraft_engine::doc::ModelState, tools: &[Strin
 /// Measure again when the picked items changed.
 fn update_measure(app: &SolveApp, d: &mut Dialog) {
     let items: Vec<Sel> = sels(d, 0).to_vec();
-    if let Kind::Measure { result, of } = &mut d.kind
+    if let Kind::Measure { result, of, .. } = &mut d.kind
         && *of != items
     {
         *result = if items.is_empty() { None } else { Some(app.session.measure_items(&items)) };
@@ -1695,8 +1761,39 @@ fn fmt_mm(app: &SolveApp, v: &Value) -> String {
     v.as_f64().map(|x| crate::prefs::show_mm(app, x, 1)).unwrap_or_default()
 }
 
+/// Which distance of a pair the Measure panel shows (and the canvas draws).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// Centre to centre, or from a round item's axis.
+    Centre,
+    /// Closest points.
+    Min,
+    /// Farthest points.
+    Max,
+}
+
+fn vec3_of(v: &Value) -> Option<Vec3> {
+    let a = v.as_array()?;
+    Some(Vec3::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?))
+}
+
+/// The distance shown for a measured pair: which one, its value and its two ends. The chosen
+/// one when the result has it, otherwise the result's default (centre, else the closest).
+pub(crate) fn shown_distance(r: &Value, show: Option<Shown>) -> Option<(Shown, f64, Vec3, Vec3)> {
+    let get = |which: Shown| -> Option<(Shown, f64, Vec3, Vec3)> {
+        let (d, from, to) = match which {
+            Shown::Centre => ("center_distance", "center_from", "center_to"),
+            Shown::Min => ("distance_mm", "from", "to"),
+            Shown::Max => ("max", "max_from", "max_to"),
+        };
+        Some((which, r.get(d)?.as_f64()?, vec3_of(r.get(from)?)?, vec3_of(r.get(to)?)?))
+    };
+    let default = if r.get("measure").and_then(Value::as_str) == Some("center") { Shown::Centre } else { Shown::Min };
+    show.and_then(get).or_else(|| get(default)).or_else(|| get(Shown::Min))
+}
+
 /// The measurement in the dialog.
-fn measure_rows(app: &SolveApp, ui: &mut egui::Ui, r: Option<&Value>) {
+fn measure_rows(app: &SolveApp, ui: &mut egui::Ui, r: Option<&Value>, show: &mut Option<Shown>) {
     let t = Tokens::get();
     let Some(r) = r else {
         ui.label("");
@@ -1710,53 +1807,127 @@ fn measure_rows(app: &SolveApp, ui: &mut egui::Ui, r: Option<&Value>) {
         ui.end_row();
         return;
     }
+    let mm = |v: &Value| fmt_mm(app, v);
     for (i, it) in r["items"].as_array().into_iter().flatten().enumerate() {
-        let what = match it["type"].as_str() {
-            Some("edge") => format!("Length  {}", fmt_mm(app, &it["length_mm"])),
-            Some("face") => format!("Area  {}", crate::prefs::show_mm(app, it["area_mm2"].as_f64().unwrap_or(0.0), 2)),
-            Some("vertex") => {
-                let p = &it["position"];
-                format!("At  {}, {}, {}", fmt_mm(app, &p[0]), fmt_mm(app, &p[1]), fmt_mm(app, &p[2]))
+        // Round items: Ø first, then R, then the length (circumference, or the arc's length
+        // and angle).
+        let mut lines: Vec<String> = Vec::new();
+        if it.get("diameter").is_some() {
+            lines.push(format!("Ø  {}", mm(&it["diameter"])));
+            lines.push(format!("R  {}", mm(&it["radius"])));
+            if it.get("circumference").is_some() {
+                lines.push(format!("{}  {}", tr("Circumference"), mm(&it["circumference"])));
+            } else if let Some(a) = it["angle_deg"].as_f64() {
+                lines.push(format!("{}  {}", tr("Arc length"), mm(&it["arc_length"])));
+                lines.push(format!("{}  {a:.2}°", crate::i18n::tr_label("Angle")));
             }
-            _ => String::new(),
-        };
-        ui.label(format!("Item {}", i + 1));
-        ui.label(what);
-        ui.end_row();
-    }
-    if r.get("distance_mm").is_some() {
-        ui.label(RichText::new(tr("Distance")).strong());
-        ui.label(RichText::new(fmt_mm(app, &r["distance_mm"])).strong());
-        ui.end_row();
-        let d = &r["delta"];
-        for (k, l) in ["ΔX", "ΔY", "ΔZ"].iter().enumerate() {
-            ui.label(*l);
-            ui.label(crate::prefs::show_mm(app, d[k].as_f64().unwrap_or(0.0).abs(), 1));
+        }
+        if let Some(sl) = it.get("slot") {
+            lines.push(format!("{}  {}", tr("Slot width"), mm(&sl["width"])));
+            lines.push(format!("{}  {}", tr("Centre to centre"), mm(&sl["center_distance"])));
+            lines.push(format!("{}  {}", tr("Overall length"), mm(&sl["overall_length"])));
+        }
+        let round = it.get("diameter").is_some();
+        match it["type"].as_str() {
+            Some("edge" | "sketch_curve") if !round => lines.push(format!("{}  {}", tr("Length"), mm(&it["length_mm"]))),
+            Some("face" | "profile") => {
+                lines.push(format!("{}  {}", tr("Area"), crate::prefs::show_mm(app, it["area_mm2"].as_f64().unwrap_or(0.0), 2)))
+            }
+            Some("vertex" | "sketch_point") => {
+                let p = &it["position"];
+                lines.push(format!("At  {}, {}, {}", mm(&p[0]), mm(&p[1]), mm(&p[2])));
+            }
+            _ => {}
+        }
+        for (k, line) in lines.into_iter().enumerate() {
+            ui.label(if k == 0 { format!("Item {}", i + 1) } else { String::new() });
+            ui.label(line);
             ui.end_row();
         }
     }
-    if let Some(a) = r["angle_deg"].as_f64() {
-        ui.label(RichText::new(tr("Angle")).strong());
+    if let Some((now, d, a, b)) = shown_distance(r, *show) {
+        if r.get("center_distance").is_some() {
+            // Centre, min and max all listed; the chosen one is drawn and broken into ΔX/Y/Z.
+            for (which, label, key) in
+                [(Shown::Centre, "Centre to centre", "center_distance"), (Shown::Min, "Min", "distance_mm"), (Shown::Max, "Max", "max")]
+            {
+                let Some(v) = r.get(key).filter(|v| v.is_number()) else { continue };
+                if ui.radio(now == which, tr(label)).clicked() {
+                    *show = Some(which);
+                }
+                let text = RichText::new(mm(v));
+                ui.label(if now == which { text.strong() } else { text });
+                ui.end_row();
+            }
+        } else {
+            ui.label(RichText::new(crate::i18n::tr_label("Distance")).strong());
+            ui.label(RichText::new(crate::prefs::show_mm(app, d, 1)).strong());
+            ui.end_row();
+        }
+        let delta = b - a;
+        for (l, v) in [("ΔX", delta.x), ("ΔY", delta.y), ("ΔZ", delta.z)] {
+            ui.label(l);
+            ui.label(crate::prefs::show_mm(app, v.abs(), 1));
+            ui.end_row();
+        }
+    }
+    if let Some(a) = r["angle_deg"].as_f64()
+        && r["items"].as_array().is_some_and(|v| v.len() == 2)
+    {
+        ui.label(RichText::new(crate::i18n::tr_label("Angle")).strong());
         ui.label(RichText::new(format!("{a:.3}°")).strong());
         ui.end_row();
     }
 }
 
-/// Keep an automatic extrude operation in step with the geometry.
+/// Smart Extrude (#1257, see [`crate::smart_extrude`]): a new pick sets the direction from the
+/// side it was picked from, and the automatic operation follows the geometry, latched per side.
 fn auto_operation(app: &SolveApp, d: &mut Dialog) {
+    let Kind::Extrude { smart, .. } = &d.kind else { return };
+    let picked = d.inputs.first().map(|i| i.items.as_slice()).unwrap_or_default();
+    if smart.picked != picked {
+        let new_first = smart.picked.first() != picked.first();
+        let picked = picked.to_vec();
+        let side_of_pick = if new_first && !smart.manual_dir { picked.first().and_then(|first| picked_side(app, d, first)) } else { None };
+        let Kind::Extrude { direction, smart, .. } = &mut d.kind else { return };
+        smart.picked = picked;
+        smart.latch = None;
+        if *direction < 2
+            && let Some(dir) = side_of_pick
+        {
+            *direction = dir;
+        }
+    }
+    let Kind::Extrude { direction, distance, .. } = &d.kind else { return };
+    let Ok(dist) = app.session.doc.eval(distance, solidcraft_engine::doc::expr::Kind::Length) else { return };
+    let side = crate::smart_extrude::side(dist, *direction);
     if !matches!(d.kind, Kind::Extrude { auto_op: true, .. }) {
         return;
     }
-    let Some(op) =
-        dialog_commands(app, d).ok().and_then(|c| c.into_iter().next()).and_then(|(_, p)| solidcraft_engine::auto_operation(&app.session, &p))
+    let Some(fresh) = dialog_commands(app, d)
+        .ok()
+        .and_then(|c| c.into_iter().next())
+        .and_then(|(_, p)| solidcraft_engine::auto_operation(&app.session, &p))
+        .and_then(|op| OPS.iter().position(|o| *o == op))
     else {
         return;
     };
-    if let Kind::Extrude { operation, .. } = &mut d.kind
-        && let Some(i) = OPS.iter().position(|o| *o == op)
-    {
-        *operation = i;
+    if let Kind::Extrude { operation, smart, .. } = &mut d.kind {
+        *operation = crate::smart_extrude::operation(fresh, *operation, side, &mut smart.latch);
     }
+}
+
+/// The one-side direction a new extrude takes for its first pick: toward the side of a sketch
+/// profile (or curve) the camera looks from; None for picks that keep their own way.
+fn picked_side(app: &SolveApp, d: &Dialog, first: &Sel) -> Option<usize> {
+    let normal = match first {
+        Sel::Profile { sketch, .. } => crate::canvas::profile_plane(app, *sketch)?.normal(),
+        Sel::SketchCurve { id } => app.session.world_state().sketches.iter().rev().find(|ss| ss.sketch.curve_index(id).is_some())?.plane.normal(),
+        Sel::Face { .. } => return Some(0),
+        _ => return None,
+    };
+    let (at, _) = crate::canvas::anchor(app, d)?;
+    Some(crate::smart_extrude::picked_direction(crate::smart_extrude::view_ray(&app.cam, at), normal, false))
 }
 
 /// Show the active dialog (if any), docked flush to an edge of the viewport just below the axis
@@ -1764,7 +1935,10 @@ fn auto_operation(app: &SolveApp, d: &mut Dialog) {
 /// Sketch Palette keeps the right there, and the dialog takes the left so both stay on screen.
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     app.viewport.dialog_rect = None;
-    let Some(mut d) = app.dialog.take() else { return };
+    let Some(mut d) = app.dialog.take() else {
+        crate::frame::reset_dock_offset(ctx);
+        return;
+    };
     // Edit Text lasts as long as its text: other design changes leave it open.
     if let Kind::Text(k) = &mut d.kind
         && !crate::sketch_text::refresh(app, k)
@@ -1808,7 +1982,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     } else {
         crate::frame::Side::Right
     };
-    let anchor = egui::pos2(side.anchor_x(vp), top);
+    // Dragged by its title band, the dialog keeps that offset from its docked place while it
+    // is open (#1335), kept inside the viewport.
+    let moved = crate::frame::dock_offset(ctx, title(&d.kind));
+    let docked = egui::pos2(side.anchor_x(vp), top);
+    let anchor = crate::frame::offset_anchor(docked, moved, vp, side);
     let mut keep = true;
     let mut ok = false;
     let mut applied = false;
@@ -1823,7 +2001,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let horizontal_frame = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
     // OK is offered once the inputs make a feature.
     let has_ok = !matches!(d.kind, Kind::Sketch | Kind::Params { .. } | Kind::Measure { .. });
-    let valid = !has_ok || !d.previews() || (built.unwrap_or_else(|| apply_commands(app, &d).is_ok()) && app.preview.error.is_none());
+    let valid = match &d.kind {
+        Kind::SaveMesh(_) => crate::dialogs_save_mesh::ready(&d.inputs),
+        _ => !has_ok || !d.previews() || (built.unwrap_or_else(|| apply_commands(app, &d).is_ok()) && app.preview.error.is_none()),
+    };
     let width = if wide { crate::frame::Width::Wide } else { crate::frame::Width::Normal };
     let wkey = egui::Id::new(("sc_dialog_w", wide));
     let response = crate::frame::docked_on(
@@ -1846,7 +2027,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         ui.set_max_width(if wide { DIALOG_WIDE_MAX_W } else { DIALOG_MAX_W } - margin);
         // Rows that end at the right edge line up with last frame's content width.
         let total = crate::frame::content_width(ui, wkey, min_w);
-        // Header: "−" folds the dialog, the command name, "»" at the right, on the title band.
+        // Header: "−" folds the dialog, the command name, "»" at the right, on the title band,
+        // which also moves the dialog.
+        let band_top = ui.cursor().min;
+        let band = egui::Rect::from_min_size(band_top, vec2(total, ui.spacing().interact_size.y + 2.0));
+        crate::frame::drag_dock(ui, band, title(&d.kind), moved, anchor - docked);
         crate::frame::heading(ui, crate::frame::Level::Title, total, |ui| {
             let total = total - 2.0 * crate::frame::HEADING_MARGIN;
             let fold = if d.collapsed { "+" } else { "−" };
@@ -1857,7 +2042,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             {
                 d.collapsed = !d.collapsed;
             }
-            ui.label(RichText::new(heading.as_str()).strong().size(12.5));
+            // Not selectable: a drag on the title moves the dialog.
+            ui.add(egui::Label::new(RichText::new(heading.as_str()).strong().size(12.5)).selectable(false));
             let chevron_width = ui.spacing().interact_size.x;
             crate::frame::right_aligned(ui, total, chevron_width, |ui| {
                 let chevron = if d.collapsed { "«" } else { "»" };
@@ -1881,6 +2067,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         let footer_height = ui.spacing().interact_size.y.max(24.0) + 6.0 + ui.spacing().item_spacing.y;
         let fields_height = (vp.bottom() - anchor.y - 8.0 - vertical_frame - ui.min_rect().height() - footer_height).max(1.0);
         egui::ScrollArea::vertical().id_salt("feature_fields").min_scrolled_height(fields_height).max_height(fields_height).show(ui, |ui| {
+            // While OK computes, its inputs hold: what is applied is what was asked.
+            if app.applying.is_some() {
+                ui.disable();
+            }
             // Configuration tables own their column widths and scrolling; the two-column form
             // grid would squeeze their row names and action buttons into a label-sized cell.
             if let Kind::Motion(k @ crate::dialogs_motion::Mo::Configurations { .. }) = &mut d.kind {
@@ -1936,6 +2126,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         direction,
                         operation,
                         auto_op,
+                        smart,
                         distance2,
                         taper,
                         taper_present,
@@ -1991,6 +2182,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         combo(ui, "ex_dir", &["One Side", "Two Sides", "Symmetric"], &mut pos);
                         if pos != order.iter().position(|o| o == direction).unwrap_or(0) {
                             *direction = order.get(pos).copied().unwrap_or(0);
+                            // Selecting Symmetric applies the current total-distance semantics.
+                            d.extra.insert("convention".into(), json!(solidcraft_engine::doc::ExtrudeConvention::TotalDistance));
+                            // An explicit direction ends the automatic choices (#1257).
+                            smart.manual_dir = true;
+                            *auto_op = false;
                         }
                         ui.end_row();
                         if *direction < 2 {
@@ -1998,6 +2194,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             let mut reverse = *direction == 1;
                             if ui.checkbox(&mut reverse, tr("Reverse Direction")).changed() {
                                 *direction = usize::from(reverse);
+                                // An explicit direction ends the automatic choices (#1257).
+                                smart.manual_dir = true;
+                                *auto_op = false;
                             }
                             ui.end_row();
                         }
@@ -2187,8 +2386,14 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             for (k, (t, r)) in mids.iter_mut().enumerate() {
                                 row_label(ui, "Mid Radius");
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::DragValue::new(t).speed(0.01).range(0.01..=0.99).fixed_decimals(2))
-                                        .on_hover_text(tr("Position along the edge, 0 at the start end, 1 at the other"));
+                                    ui.add(
+                                        egui::DragValue::new(t)
+                                            .speed(0.01)
+                                            .range(0.01..=0.99)
+                                            .fixed_decimals(2)
+                                            .custom_parser(crate::prefs::parse_number),
+                                    )
+                                    .on_hover_text(tr("Position along the edge, 0 at the start end, 1 at the other"));
                                     enter |= field(ui, r);
                                     if ui.small_button("×").on_hover_text(tr("Remove this point")).clicked() {
                                         remove = Some(k);
@@ -2262,7 +2467,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         d.extra.insert("combine".into(), json!(op == 1));
                         ui.end_row();
                     }
-                    Kind::Measure { result, .. } => measure_rows(app, ui, result.as_ref()),
+                    Kind::Measure { result, show, .. } => measure_rows(app, ui, result.as_ref(), show),
                     Kind::OffsetPlane { offset } => {
                         row_label(ui, "Distance");
                         enter |= field(ui, offset);
@@ -2427,7 +2632,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         combo(ui, "lf_op", &OP_LABELS, operation);
                         ui.end_row();
                     }
-                    Kind::Sweep { operation } => {
+                    Kind::Sweep { operation, opts } => {
+                        enter |= crate::dialogs_sweep::rows(ui, opts, "sw");
                         row_label(ui, "Operation");
                         combo(ui, "sw_op", &OP_LABELS, operation);
                         ui.end_row();
@@ -2566,6 +2772,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     Kind::Sheet(k) => enter |= crate::dialogs_sheet::rows(app, ui, k, &mut d.inputs),
                     Kind::Surface(k) => enter |= crate::dialogs_surface::rows(ui, k),
                     Kind::SketchModify(k) => enter |= crate::sketch_modify_ui::rows(ui, k),
+                    Kind::SaveMesh(k) => enter |= crate::dialogs_save_mesh::rows(app, ui, k),
                     Kind::Plastic(k) => enter |= crate::dialogs_plastic::rows(app, ui, k, &d.inputs),
                     Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
                     Kind::Motion(k) => enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs),
@@ -2616,11 +2823,20 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             // the automatic ids of OK and Cancel, and a click pressed in one frame and
             // released in the next would be lost (an animating preview toggles it often).
             let (sr, sresp) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
-            if app.preview.busy {
+            if let Some(job) = &app.applying {
+                egui::Spinner::new().size(14.0).paint_at(ui, sr);
+                let seconds = ((crate::now_ms() - job.started) / 1000.0).floor().max(0.0);
+                ui.label(RichText::new(crate::i18n::format("dialog.computing", &[("seconds", &format!("{seconds:.0}"))])).color(t.text_dim));
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            } else if app.preview.busy {
                 egui::Spinner::new().size(14.0).paint_at(ui, sr);
                 sresp.on_hover_text(tr("Updating the preview"));
             }
-            let raw_label = if matches!(d.kind, Kind::ConfirmDelete { .. }) { "Delete" } else { "OK" };
+            let raw_label = match &d.kind {
+                Kind::ConfirmDelete { .. } => "Delete",
+                Kind::SaveMesh(k) => crate::dialogs_save_mesh::button(k),
+                _ => "OK",
+            };
             let label = tr(raw_label);
             let raw_close = if matches!(d.kind, Kind::Params { .. } | Kind::Measure { .. }) { "Close" } else { "Cancel" };
             let close = tr(raw_close);
@@ -2636,7 +2852,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         .fill(if valid { t.accent } else { Color32::TRANSPARENT })
                         .wrap_mode(egui::TextWrapMode::Extend)
                         .min_size(vec2(ok_width, 24.0));
-                    let r = ui.add_enabled(valid, b);
+                    let r = ui.add_enabled(valid && app.applying.is_none(), b);
                     crate::scenario::publish_handle(&format!("dialog:{raw_label}"), r.rect.center());
                     if r.clicked() {
                         ok = true;
@@ -2661,7 +2877,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let enter_applies = !matches!(d.kind, Kind::Sketch | Kind::Params { .. } | Kind::Measure { .. } | Kind::ConfirmDelete { .. })
         && !matches!(&d.kind, Kind::Motion(k) if k.wide());
     let report_active = app.issue_report.draft.is_some();
-    if !report_active && enter_applies && (enter || canvas_enter || (enter_free && nothing_focused)) {
+    if !report_active && enter_applies && app.applying.is_none() && (enter || canvas_enter || (enter_free && nothing_focused)) {
         ok = true;
     }
     if !report_active && esc && !app.esc_handled {
@@ -2682,19 +2898,49 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             Err(error) => d.refuse(app, error),
         }
     }
-    if ok {
+    if ok && app.applying.is_none() {
         // Edit Text applies its own way: its live changes and OK are one undo step.
         let run = match &mut d.kind {
-            Kind::Text(k) => crate::sketch_text::apply(app, k),
-            _ => run_dialog(app, &d),
+            Kind::Text(k) => Some(crate::sketch_text::apply(app, k)),
+            _ => match begin_applying(app, &d) {
+                // Computing: the dialog stays, saying so, until it is in.
+                Some(job) => {
+                    app.applying = Some(job);
+                    None
+                }
+                None => Some(run_dialog(app, &d)),
+            },
         };
         match run {
-            Ok(()) => {
+            Some(Ok(())) => {
                 cancel = true;
                 applied = true;
             }
-            Err(e) => d.refuse(app, e),
+            Some(Err(e)) => d.refuse(app, e),
+            None => {}
         }
+    }
+    // OK's evaluation is in: run it, the feature taken from the cache. Inputs changed meanwhile
+    // (nothing should change them) are computed in turn, off the window thread too: run here,
+    // they would hold the window for the whole boolean.
+    if app.applying.as_ref().is_some_and(Applying::finished) && !cancel {
+        let computed = app.applying.take().map(|job| job.cmds);
+        let current = apply_commands(app, &d).ok();
+        let again = if current.is_some() && current != computed { begin_applying(app, &d) } else { None };
+        match again {
+            Some(job) => app.applying = Some(job),
+            None => match run_dialog(app, &d) {
+                Ok(()) => {
+                    cancel = true;
+                    applied = true;
+                }
+                Err(e) => d.refuse(app, e),
+            },
+        }
+    }
+    // Cancel while computing: the result goes (its worker runs on to its end).
+    if cancel && !applied {
+        app.applying = None;
     }
     if !keep || cancel {
         crate::dialogs_motion::closed(app, &mut d, applied);
@@ -2724,6 +2970,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 
 /// Close the dialog without applying it (Esc, Cancel). An edit puts the timeline marker back.
 pub fn cancel(app: &mut SolveApp) {
+    app.applying = None;
     if let Some(mut d) = app.dialog.take() {
         crate::dialogs_motion::closed(app, &mut d, false);
         if let Kind::Text(k) = &mut d.kind {
@@ -3031,9 +3278,11 @@ fn sels(d: &Dialog, i: usize) -> &[Sel] {
 }
 
 pub(crate) fn run_dialog(app: &mut SolveApp, d: &Dialog) -> Result<(), String> {
+    // Saving asks for a file name first; `Err("")` is the user backing out of that.
+    if let Kind::SaveMesh(k) = &d.kind {
+        return crate::dialogs_save_mesh::run(app, k, &d.inputs);
+    }
     let commands = apply_commands(app, d)?;
-    // The live preview may be computing these very commands: OK takes its result.
-    crate::preview::settle(app, &commands);
     if let Some((_, marker)) = d.editing {
         // Record the actual pre-edit timeline state in the command's undo snapshot.
         roll_marker(app, marker)?;
@@ -3043,7 +3292,7 @@ pub(crate) fn run_dialog(app: &mut SolveApp, d: &Dialog) -> Result<(), String> {
             Ok(reply) => {
                 // A drive that stopped short says where, and why.
                 if cmd == "joint.drive"
-                    && let Some(why) = crate::dialogs_assembly::drive_stop(&app.session, &reply)
+                    && let Some(why) = crate::dialogs_assembly::drive_stop(&reply)
                 {
                     app.set_status(why, false);
                 }
@@ -3240,8 +3489,10 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 out.push(("solid.extrude".to_string(), with(json!({"sketch": sketch, "profiles": idx}))));
             }
             // Each planar body face extrudes on its own.
-            for p in face_points(0) {
-                out.push(("solid.extrude".to_string(), with(json!({ "face": p }))));
+            for pick in sels(d, 0) {
+                if let Sel::Face { body, point, .. } = pick {
+                    out.push(("solid.extrude".to_string(), with(json!({"face": pt(*point), "face_body": body}))));
+                }
             }
             return Ok(out);
         }
@@ -3395,16 +3646,15 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let sections: Vec<Value> = sections.into_iter().map(|(sk, v)| json!({"sketch": sk, "profiles": v})).collect();
             ("solid.loft", json!({"sections": sections, "operation": OPS.get(*operation).copied().unwrap_or("new")}))
         }
-        Kind::Sweep { operation } => {
+        Kind::Sweep { operation, opts } => {
             need(0, "a profile")?;
             need(1, "the path")?;
             let (sketch, idx) = profiles();
             let path: Vec<String> = sels(d, 1).iter().filter_map(|x| if let Sel::SketchCurve { id } = x { Some(id.clone()) } else { None }).collect();
             let path_sketch = curves_sketch(app, &path, sketch.as_u64()).ok_or("the path curves must be in one sketch")?;
-            (
-                "solid.sweep",
-                json!({"sketch": sketch, "profiles": idx, "path_sketch": path_sketch, "path": path, "operation": OPS.get(*operation).copied().unwrap_or("new")}),
-            )
+            let mut p = json!({"sketch": sketch, "profiles": idx, "path_sketch": path_sketch, "path": path, "operation": OPS.get(*operation).copied().unwrap_or("new")});
+            crate::dialogs_sweep::params(app, opts, sels(d, 2).first(), &mut p)?;
+            ("solid.sweep", p)
         }
         Kind::OffsetPlane { offset } => {
             need(0, "a plane")?;
@@ -3724,6 +3974,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::Sheet(k) => return crate::dialogs_sheet::commands(app, k, &d.inputs, &d.extra),
         Kind::Surface(k) => return crate::dialogs_surface::commands(app, k, &d.inputs, &d.extra),
         Kind::SketchModify(k) => return crate::sketch_modify_ui::commands(app, k, &d.inputs, &d.extra),
+        Kind::SaveMesh(k) => return crate::dialogs_save_mesh::commands(k, &d.inputs),
         Kind::Plastic(k) => return crate::dialogs_plastic::commands(app, k, &d.inputs, &d.extra),
         Kind::Appearance(k) => return Ok(crate::dialogs_appearance::commands(k, &d.inputs)),
         Kind::Motion(k) => return crate::dialogs_motion::commands(app, k, &d.inputs),
@@ -4046,6 +4297,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                 },
                 operation: op_index(operation),
                 auto_op: false,
+                smart: crate::smart_extrude::Smart { manual_dir: true, ..Default::default() },
                 distance2: extent.distance2.clone().unwrap_or_else(|| "10 mm".into()),
                 taper: extent.taper.clone().unwrap_or_else(|| "0 deg".into()),
                 taper_present: extent.taper.is_some(),
@@ -4057,6 +4309,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                 wall_side: thin.as_ref().map_or(0, |t| WALL_SIDES.iter().position(|w| ThinSide::parse(w) == Some(t.side)).unwrap_or(0)),
                 wall2: thin.as_ref().and_then(|t| t.thickness2.clone()).unwrap_or_else(|| "1 mm".into()),
             };
+            d.extra.insert("convention".into(), json!(extent.convention));
             // Extent references belong to the extrude's authoring frame, including free
             // points. They are not body-local picks (a reference may be on another body).
             let frame = feature_frame(s, f.component);
@@ -4458,9 +4711,13 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
-        FeatureKind::Sweep { sketch, profiles, path, operation, targets, .. } => {
+        FeatureKind::Sweep { sketch, profiles, path, operation, targets, orientation, twist, scale, .. } => {
             let mut d = start("solid.sweep")?;
-            d.kind = Kind::Sweep { operation: op_index(operation) };
+            let (opts, direction) = crate::dialogs_sweep::SweepOpts::of(orientation, twist, scale, &feature_frame(s, f.component));
+            d.kind = Kind::Sweep { operation: op_index(operation), opts };
+            if let Some(inp) = d.inputs.get_mut(2) {
+                inp.items = direction.into_iter().collect();
+            }
             let items = st.sketch(*sketch).map(|ss| profile_indices(ss, profiles)).unwrap_or_default();
             if let Some(inp) = d.inputs.get_mut(0) {
                 inp.items = items.into_iter().map(|index| Sel::Profile { sketch: *sketch, index }).collect();
