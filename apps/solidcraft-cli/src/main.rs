@@ -1,7 +1,7 @@
 //! SolidCraft headless command line.
 //!
 //! ```text
-//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--results] [--json-out FILE] [--allow-errors]
+//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--results] [--timings | --profile] [--json-out FILE] [--allow-errors]
 //! solidcraft-cli eval <script.json|design.solidcraft|part.step> [--json-out FILE] (alias: inspect) measurements as JSON
 //! solidcraft-cli script <design.solidcraft> [--out script.json]     the design's history as a command script
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] [--display LEVEL [--edit NAME EXPR]] loading timings as JSON lines
@@ -37,9 +37,11 @@ use solidcraft_engine::Session;
 use solidcraft_engine::view::Guides;
 
 const USAGE: &str = "usage:
-  solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--json-out FILE] [--allow-errors]
+  solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--timings | --profile] [--json-out FILE] [--allow-errors]
   solidcraft-cli run --in <design.solidcraft|part.step> [--out FILE]...
-      (a timeline feature that fails fails the run and nothing is written; --allow-errors writes anyway)
+      (a timeline feature that fails fails the run and nothing is written; --allow-errors writes anyway;
+       --timings prints {timings: [{index, command, ms}], total_ms} for the script, with --results also its results;
+       --profile adds each command's profile {boolean_ms, tessellate_ms, other_ms})
   solidcraft-cli eval <script.json|design.solidcraft|part.step> [--json-out FILE]     (alias: inspect; or --in FILE)
       (--json-out FILE writes the JSON that run (with --results, else the measurement) and eval print to FILE instead of stdout,
        as plain UTF-8: a shell's > can re-encode it, e.g. Windows PowerShell adds a byte-order mark)
@@ -175,12 +177,15 @@ fn flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
     args.windows(2).filter(|w| w[0] == name).map(|w| w[1].as_str()).collect()
 }
 
+/// Options that take no value.
+const SWITCHES: [&str; 7] = ["--quiet", "--results", "--timings", "--profile", "--allow-errors", "--no-grid", "--no-axes"];
+
 /// The first argument that is not an option or an option's value.
 fn positional(args: &[String]) -> Option<&String> {
     let mut i = 0;
     while let Some(a) = args.get(i) {
         if a.starts_with("--") {
-            i += if matches!(a.as_str(), "--quiet" | "--results" | "--allow-errors" | "--no-grid" | "--no-axes") { 1 } else { 2 };
+            i += if SWITCHES.contains(&a.as_str()) { 1 } else { 2 };
             continue;
         }
         return Some(a);
@@ -224,15 +229,29 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     if path.is_none() && base.is_none() {
         return Err(USAGE.to_string());
     }
-    let (mut s, results) = if args.iter().any(|a| a == "--results") {
+    let has = |name: &str| args.iter().any(|a| a == name);
+    let (with_results, profile) = (has("--results"), has("--profile"));
+    let timed = profile || has("--timings");
+    let (mut s, results) = if with_results || timed {
         // Collect every command's result (scripts only), then process requested files too.
         let mut s = match base {
             Some(b) => load(b)?,
             None => Session::default(),
         };
-        let v = read_json(path.ok_or("--results needs a script")?)?;
-        let r = s.run_script(&v).map_err(|e| e.to_string())?;
-        (s, Some(Value::Array(r)))
+        let needs = ["--results", "--profile", "--timings"].into_iter().find(|f| has(f)).unwrap_or("--results");
+        let v = read_json(path.ok_or(format!("{needs} needs a script"))?)?;
+        let run = s.run_script_timed(&v, profile).map_err(|e| e.to_string())?;
+        let report = if timed {
+            let mut o = serde_json::Map::new();
+            if with_results {
+                o.insert("results".into(), Value::Array(run.results));
+            }
+            run.timings.add_to(&mut o);
+            Value::Object(o)
+        } else {
+            Value::Array(run.results)
+        };
+        (s, Some(report))
     } else {
         (open(base, path)?, None)
     };

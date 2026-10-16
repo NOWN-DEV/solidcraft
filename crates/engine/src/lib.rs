@@ -22,6 +22,7 @@ pub mod render_jobs;
 pub mod sample;
 mod slicer_icon;
 pub mod slicers;
+pub mod timings;
 pub mod view;
 
 use std::sync::Arc;
@@ -956,6 +957,13 @@ impl Session {
     /// Run a script: a JSON array of `{"command": id, "params": {...}}` (or an object with a
     /// `commands` array). Stops at the first error. Returns each command's result.
     pub fn run_script(&mut self, script: &Value) -> Result<Vec<Value>> {
+        self.run_script_timed(script, false).map(|r| r.results)
+    }
+
+    /// [`Session::run_script`], with each command's time and the run's total
+    /// ([`timings::Timings`]); with `profile`, each command's time split into kernel booleans,
+    /// tessellation and the rest.
+    pub fn run_script_timed(&mut self, script: &Value, profile: bool) -> Result<timings::ScriptRun> {
         let list = match script {
             Value::Array(a) => a.clone(),
             Value::Object(o) => {
@@ -966,7 +974,8 @@ impl Session {
         if list.len() > 100_000 {
             return Err(EngineError::Other("script too long".into()));
         }
-        let mut out = Vec::new();
+        let clock = timings::Clock::start();
+        let mut run = timings::ScriptRun::default();
         for (i, c) in list.iter().enumerate() {
             let id = c
                 .get("command")
@@ -974,10 +983,13 @@ impl Session {
                 .and_then(Value::as_str)
                 .ok_or_else(|| EngineError::Other(format!("script step {}: missing `command`", i + 1)))?;
             let p = c.get("params").cloned().unwrap_or(Value::Null);
-            let r = self.execute(id, &p).map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
-            out.push(r);
+            let (r, ms, split) = timings::time(profile, || self.execute(id, &p));
+            let r = r.map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
+            run.results.push(r);
+            run.timings.commands.push(timings::CommandTiming { index: i, command: id.to_string(), ms, profile: split });
         }
-        Ok(out)
+        run.timings.total_ms = clock.ms();
+        Ok(run)
     }
 }
 

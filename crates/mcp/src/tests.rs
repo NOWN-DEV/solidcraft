@@ -1479,3 +1479,68 @@ fn measure_items_gives_diameters_and_centre_distances() {
     assert!((two["min"].as_f64().unwrap() - 45.0).abs() < 1e-9 && (two["max"].as_f64().unwrap() - 55.0).abs() < 1e-9, "{two}");
     assert!(two["distance_mm"].is_number() && two["from"].is_array(), "{two}");
 }
+
+/// `batch` with `timings` reports each step's time and the batch's; `profile` splits each step
+/// into kernel booleans, tessellation and the rest; a failing step is timed too.
+#[test]
+fn batch_timings_and_profile() {
+    let mut s = server();
+    let steps = json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "body_name": "Block"}},
+        {"command": "solid.cylinder", "params": {"base": [20, 15, -5], "radius": 6, "height": 30, "body_name": "Pin"}},
+        {"command": "solid.combine", "params": {"target": "Block", "tools": ["Pin"], "operation": "cut"}},
+    ]);
+    let plain = tool(&mut s, "batch", json!({"commands": steps}));
+    assert!(plain.get("timings").is_none() && plain.get("total_ms").is_none(), "{plain}");
+    tool(&mut s, "new_design", json!({}));
+    let r = tool(&mut s, "batch", json!({"commands": steps, "timings": true}));
+    let rows = r["timings"].as_array().unwrap();
+    assert_eq!(rows.iter().map(|t| t["command"].as_str().unwrap()).collect::<Vec<_>>(), ["solid.box", "solid.cylinder", "solid.combine"]);
+    let sum: f64 = rows.iter().map(|t| t["ms"].as_f64().unwrap()).sum();
+    assert!(rows.iter().all(|t| t["ms"].as_f64().unwrap() >= 0.0 && t.get("profile").is_none()), "{r}");
+    assert!(sum <= r["total_ms"].as_f64().unwrap() + 1e-9, "{r}");
+    tool(&mut s, "new_design", json!({}));
+    let r = tool(&mut s, "batch", json!({"commands": steps, "profile": true}));
+    let cut = &r["timings"][2]["profile"];
+    assert!(cut["boolean_ms"].as_f64().unwrap() > 0.0 && cut["other_ms"].as_f64().unwrap() >= 0.0, "{r}");
+    let failing = json!([{"command": "solid.box", "params": {"length": 5, "width": 5, "height": 5}}, {"command": "no.such_command"}]);
+    let r = raw_tool(&mut s, "batch", json!({"commands": failing, "timings": true}));
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(body["timings"].as_array().map(Vec::len), Some(2), "{body}");
+    assert_eq!(body["timings"][1]["command"], "no.such_command", "{body}");
+}
+
+/// Bridged to an app, `timings` and `profile` go with `engine.batch` and the app's times come back.
+#[test]
+fn bridged_batch_timings_come_from_the_app() {
+    struct App {
+        sent: Option<Value>,
+    }
+    impl crate::backend::Backend for App {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            match method {
+                "engine.batch" => {
+                    self.sent = Some(params);
+                    Ok(
+                        json!({"completed": 1, "results": [{}], "undone": 0, "timings": [{"index": 0, "command": "solid.box", "ms": 2.5}], "total_ms": 2.6}),
+                    )
+                }
+                other => Err(format!("unknown method `{other}`")),
+            }
+        }
+        fn has_ui(&self) -> bool {
+            true
+        }
+        fn describe(&self) -> String {
+            "app".into()
+        }
+    }
+    let mut app = App { sent: None };
+    let r = crate::tools::call_tool(&mut app, "batch", &json!({"commands": [{"command": "solid.box"}], "profile": true}));
+    let body: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["timings"][0]["ms"], 2.5, "{body}");
+    assert_eq!(body["total_ms"], 2.6, "{body}");
+    let sent = app.sent.unwrap();
+    assert_eq!((sent["timings"].clone(), sent["profile"].clone()), (json!(true), json!(true)), "{sent}");
+}

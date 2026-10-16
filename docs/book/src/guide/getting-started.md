@@ -213,6 +213,21 @@ cargo run --release -p solidcraft-cli -- run examples/bracket.json --results --j
 cargo run --release -p solidcraft-cli -- eval examples/bracket.json --json-out measures.json
 ```
 
+To see which commands of a script take the time, `--timings` prints
+`{"timings": [{"index", "command", "ms"}, …], "total_ms": …}` instead: each command's wall time
+in milliseconds and the whole script's (the commands plus the moments between them; loading
+`--in` and writing `--out` files are not part of it). With `--results` the same object also
+carries `results`. `--profile` adds each command's `profile`,
+`{"boolean_ms", "tessellate_ms", "other_ms"}`: its time in kernel booleans, in tessellation
+(meshing bodies to measure, show or export them) and in everything else, such as sketch solving
+and rebuilding the timeline around those calls. The split counts the command's own thread: a
+tessellation inside a boolean is boolean time.
+
+```sh
+cargo run --release -p solidcraft-cli -- run part.json --profile --json-out profile.json
+jq -r '.timings | sort_by(-.ms) | .[:10][] | "\(.ms|floor) ms  \(.command)  booleans \(.profile.boolean_ms|floor) ms"' profile.json
+```
+
 A design's history turns into a script that rebuilds it, which makes a bug that only shows
 on one design a one-file reproduction:
 
