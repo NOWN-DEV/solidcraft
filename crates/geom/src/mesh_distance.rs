@@ -86,7 +86,7 @@ impl TriangleSet {
                 bound.set(d);
             }
         };
-        self.bvh.visit_pairs(&other.bvh, |x, y| box_gap(x, y) <= bound.get(), |i, j| found(i, j));
+        self.bvh.visit_pairs(&other.bvh, |x, y| box_gap(x, y) <= bound.get(), &mut found);
         best
     }
 

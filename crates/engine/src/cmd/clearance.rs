@@ -136,7 +136,7 @@ fn clearance(s: &mut Session, p: &Value) -> Result<Value> {
         match skip {
             SkipWithin::Nothing => true,
             SkipWithin::Occurrence => a.is_empty() || a != b,
-            SkipWithin::Component => a.first().is_none() || a.first() != b.first(),
+            SkipWithin::Component => a.is_empty() || a.first() != b.first(),
         }
     };
 
