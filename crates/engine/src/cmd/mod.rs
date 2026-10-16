@@ -54,6 +54,7 @@ mod mesh;
 mod metadata;
 pub(crate) mod motion;
 mod parts;
+pub use parts::PartLibrary;
 mod script;
 mod section;
 pub(crate) use measure_sel::measure_items;

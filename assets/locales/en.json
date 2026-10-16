@@ -606,6 +606,7 @@
   "cmd.parts_fastener": "Insert Fastener",
   "cmd.parts_insert": "Insert Part",
   "cmd.parts_library": "Standard Parts",
+  "cmd.parts_library_load": "Load Part Library",
   "cmd.parts_resize": "Change Part Size",
   "cmd.plastic_assign_rule": "Assign Plastic Rule",
   "cmd.plastic_boss": "Boss",
