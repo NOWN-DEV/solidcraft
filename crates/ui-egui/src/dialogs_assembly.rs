@@ -780,7 +780,7 @@ fn interference_rows(app: &SolveApp, ui: &mut egui::Ui, r: &Value) {
     }
     for h in &near {
         row_label(ui, &pair(h));
-        ui.label(RichText::new(crate::prefs::show_mm(app, h["distance_mm"].as_f64().unwrap_or(0.0), 3)).color(t.warning));
+        ui.label(RichText::new(crate::prefs::show_mm(app, h["distance_mm"].as_f64().unwrap_or(0.0), 1)).color(t.warning));
         ui.end_row();
     }
     // Each body's nearest neighbour.
@@ -793,7 +793,7 @@ fn interference_rows(app: &SolveApp, ui: &mut egui::Ui, r: &Value) {
     for (body, list) in &nearest {
         let Some(n) = list.get(0) else { continue };
         row_label(ui, &format!("{body} → {}", n["body"].as_str().unwrap_or("")));
-        ui.label(crate::prefs::show_mm(app, n["distance_mm"].as_f64().unwrap_or(0.0), 3));
+        ui.label(crate::prefs::show_mm(app, n["distance_mm"].as_f64().unwrap_or(0.0), 1));
         ui.end_row();
     }
     if hits.is_empty() && unchecked.is_empty() {
