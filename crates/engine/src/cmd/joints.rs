@@ -397,6 +397,40 @@ fn next_joint_id(s: &Session) -> u64 {
     s.doc.assembly.joints.iter().map(|j| j.id).max().unwrap_or(0) + 1
 }
 
+/// A joint origin as `joint.create` takes it (`{occurrence?, face | circle | point | frame}`),
+/// for commands that build joints themselves.
+pub(crate) fn origin(s: &Session, v: &Value, cmd: &str) -> Result<JointOrigin> {
+    origin_param(s, Some(v), cmd)
+}
+
+/// Add a rigid joint without solving: a command that adds many solves once at the end
+/// ([`resolve`]). The occurrences should already sit where the joint puts them.
+pub(crate) fn add_rigid_unsolved(s: &mut Session, a: JointOrigin, b: JointOrigin, offset: f64, name: String) -> Result<u64> {
+    if s.doc.assembly.joints.len() >= 10_000 {
+        return Err(EngineError::Other("too many joints".into()));
+    }
+    if a.occurrence == b.occurrence {
+        return Err(bad("joint.create", "a joint needs two different occurrences"));
+    }
+    let id = next_joint_id(s);
+    let n = JointKind::Rigid.dofs().len();
+    s.visibility.hidden_joints.retain(|h| *h != id);
+    s.doc_mut().assembly.joints.push(Joint {
+        id,
+        name,
+        kind: JointKind::Rigid,
+        a,
+        b,
+        values: vec![0.0; n],
+        limits: vec![None; n],
+        flip: false,
+        offset,
+        angle: 0.0,
+        suppressed: false,
+    });
+    Ok(id)
+}
+
 fn add_joint(s: &mut Session, mut j: Joint, p: &Value) -> Result<Value> {
     if s.doc.assembly.joints.len() >= 10_000 {
         return Err(EngineError::Other("too many joints".into()));

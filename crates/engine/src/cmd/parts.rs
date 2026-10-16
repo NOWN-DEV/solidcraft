@@ -748,8 +748,110 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// Insert a part (the `parts.insert` command's run), for commands that place several.
+pub(super) fn insert_part(s: &mut Session, p: &Value) -> Result<Value> {
+    insert(s, p)
+}
+
+/// A component that already holds `family` `size` at `length` (from the same library
+/// definition), to place again rather than build again.
+pub(super) fn existing_part(s: &Session, family: &str, size: &str, length: Option<f64>) -> Option<u64> {
+    let (name, def) = if builtin(family) {
+        (family.to_string(), None)
+    } else {
+        let (d, _) = file_family(s, family)?;
+        (d.name.clone(), Some(d))
+    };
+    let same_length = |a: Option<f64>| match (a, length) {
+        (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+        (None, None) => true,
+        _ => false,
+    };
+    s.doc
+        .parts
+        .iter()
+        .find(|(c, p)| p.family == name && p.size == size && same_length(p.length) && p.definition == def && s.doc.occurrence_of(**c).is_some())
+        .map(|(c, _)| *c)
+}
+
+/// A family's sizes and their nominal diameters (a washer's or bearing's: its bore).
+pub(super) fn sizes(s: &Session, family: &str) -> std::result::Result<Vec<(String, f64)>, String> {
+    let m = |n: &str| metric(n).map_or(0.0, |x| x.0);
+    Ok(match family {
+        "socket_head_cap_screw" => SHCS.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "hex_bolt" => HEX_BOLT.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "hex_nut" => HEX_NUT.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "washer" => WASHER.iter().map(|r| (r.0.to_string(), r.1)).collect(),
+        "set_screw" => SET_SCREW.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "dowel_pin" => DOWEL.iter().map(|d| (format!("{d}"), *d)).collect(),
+        "bearing" => BEARINGS.iter().map(|r| (r.0.to_string(), r.1)).collect(),
+        _ => {
+            let (def, _) = file_family(s, family).ok_or_else(|| format!("unknown part family `{family}` (parts.library lists them)"))?;
+            def.sizes.iter().map(|z| (z.size.clone(), z.d)).collect()
+        }
+    })
+}
+
+/// How thick a washer or nut of `family` `size` is.
+pub(super) fn thickness(s: &Session, family: &str, size: &str) -> std::result::Result<f64, String> {
+    match resolve(s, family, size, None, None)?.shape {
+        Shape::Ring { h, .. } => Ok(h),
+        Shape::Nut { m, .. } => Ok(m),
+        _ => Err(format!("`{family}` is not a washer or a nut")),
+    }
+}
+
+/// The thread pitch of a threaded size.
+pub(super) fn pitch(s: &Session, family: &str, size: &str) -> Option<f64> {
+    if builtin(family) {
+        return matches!(family, "socket_head_cap_screw" | "hex_bolt" | "hex_nut" | "set_screw").then(|| metric(size).map(|m| m.1)).flatten();
+    }
+    file_family(s, family).and_then(|(def, _)| def.size(size).and_then(|z| z.pitch))
+}
+
+/// A length of `family` `size` chosen by [`length_for`]: the grip range and article number the
+/// library lists for it.
+pub(super) struct Chosen {
+    pub length: f64,
+    pub grip: Option<[f64; 2]>,
+    pub article: Option<String>,
+}
+
+/// The length of `family` `size` for a stack `clamp` thick. By grip (`by_grip`), a library
+/// size's shortest length whose grip range holds `clamp`; where the lengths list no grips, or
+/// not by grip, the shortest length at least `clamp + extra` (room for a nut, or the thread a
+/// screw engages).
+pub(super) fn length_for(s: &Session, family: &str, size: &str, clamp: f64, extra: f64, by_grip: bool) -> std::result::Result<Chosen, String> {
+    let need = clamp + extra;
+    if builtin(family) {
+        if !matches!(family, "socket_head_cap_screw" | "hex_bolt" | "set_screw" | "dowel_pin") {
+            return Err(format!("`{family}` has no lengths"));
+        }
+        return LENGTHS
+            .iter()
+            .find(|l| **l >= need - 1e-9)
+            .map(|l| Chosen { length: *l, grip: None, article: None })
+            .ok_or_else(|| format!("{family} {size}: no standard length is {need:.3} mm or more"));
+    }
+    let (def, _) = file_family(s, family).ok_or_else(|| format!("unknown part family `{family}`"))?;
+    if !def.shape.has_lengths() {
+        return Err(format!("`{family}` has no lengths"));
+    }
+    let z = def.size(size).ok_or_else(|| format!("no size `{size}` in `{family}`"))?;
+    let chosen = |l: &solidcraft_doc::part_family::FastenerLength| Chosen { length: l.length, grip: l.grip, article: l.article.clone() };
+    if by_grip && z.lengths.iter().any(|l| l.grip.is_some()) {
+        return z.length_for_grip(clamp).map(chosen).ok_or_else(|| format!("no length of {family} {size} holds a grip of {clamp:.3} mm"));
+    }
+    z.lengths
+        .iter()
+        .filter(|l| l.length >= need - 1e-9)
+        .min_by(|a, b| a.length.total_cmp(&b.length))
+        .map(chosen)
+        .ok_or_else(|| format!("{family} {size}: no length is {need:.3} mm or more"))
+}
+
 /// A point on the cylindrical wall of the hole at `a`, a little in from the picked rim.
-fn hole_wall(s: &Session, a: Vec3) -> Option<Vec3> {
+pub(super) fn hole_wall(s: &Session, a: Vec3) -> Option<Vec3> {
     let st = s.model.state();
     let dirs = [Vec3::Z * -1.0, Vec3::Z, Vec3::X, Vec3::X * -1.0, Vec3::Y, Vec3::Y * -1.0];
     for step in [0.2, 0.5, 1.0, 2.0] {

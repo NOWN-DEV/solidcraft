@@ -438,9 +438,12 @@ fn circle_at(doc: &Document, st: &ModelState, o: &JointOrigin) -> Result<(Vec3, 
         .into_iter()
         .filter_map(|b| solidcraft_kernel::cylinder_face_at(&b.body, pick))
         .min_by(|a, b| {
+            // Off the wall, and past its ends: coaxial holes of two bodies have one radius, and
+            // the pick is on the wall of only one of them.
             let off = |c: &solidcraft_kernel::CylinderFace| {
                 let v = pick - c.axis_point;
-                ((v - c.axis * v.dot(c.axis)).len() - c.radius).abs()
+                let along = v.dot(c.axis);
+                ((v - c.axis * along).len() - c.radius).abs() + (c.start - along).max(along - c.end).max(0.0)
             };
             off(a).total_cmp(&off(b))
         })
