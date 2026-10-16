@@ -322,40 +322,30 @@ measuring their union. The same workflow is available through `component.propert
 `occurrence.properties`; see
 [placement and measurement details](https://github.com/bherbruck/solidcraft/blob/main/docs/assembly-properties.md).
 
-## Part properties and the bill of materials
+## Hole stacks
 
-A component definition carries its own **part properties**: a part number, a description and a
-revision, other tools' data under a reverse-DNS key (the same rules as the design's own
-properties), and free text properties such as a material grade or a finish. Every occurrence of
-the component shares them, Paste New copies them, and they are saved with the component.
-`component.metadata {component}` reads them and
-`component.metadata.set {component, part_number?, description?, revision?, values?, properties?}`
-changes them in one undo step (an empty value removes a field). The root component is the
-design itself: its properties are `document.metadata`'s. Standard parts (`parts.insert`) get a
-part number from their standard and size (`ISO 4762 M6x20`, or a bearing's designation) and a
-description; **Change Part Size** renumbers them, keeping a field you changed yourself.
+Parts held together by rivets, bolts or pins have holes that line up through two or more
+touching layers. **Find Hole Stacks** (`inspect.hole_stacks`) lists them:
 
-**Bill of Materials** (`assembly.bom`, on the **INSPECT** panel) counts the placed components:
+```json
+{"command": "inspect.hole_stacks", "params": {"diameters": [[4, 6.5]], "touching": 0.05}}
+```
 
-- `levels: "flat"` (the default) lists the parts at any depth, each counted through its
-  subassemblies: a part placed once in a subassembly that is placed twice counts 2. A
-  subassembly is listed through its parts, unless it has bodies of its own.
-- `levels: "top"` lists the direct children, a subassembly as one row.
-- `group_by: ["part_number"]` (the default) puts definitions with the same part number in one
-  row; a definition without a part number gets a row of its own. `["definition"]` gives every
-  definition its own row.
-- `group_children: true` keeps what is placed inside a part with a part number in that part's
-  row: a bolt with a washer and a nut placed inside it is one row, the washer and the nut listed
-  under it as `children` (items 1.1, 1.2…, with `each` per bolt and `count` in all) instead of
-  rows of their own. Bolts with different contents (one with a nut, one without) are different
-  rows. `total_occurrences` counts the children too, so it is the same either way.
-- `component` lists one subassembly's parts instead of the design's.
+Each stack has its `axis` (a unit vector pointing from `start` into the stack: down for a
+vertical stack, so `start` is on the top face), its `start` and `end` points on that axis,
+`grip_mm` (the clamped thickness from `start` to `end`) and its `layers`, outermost first:
+the `body`, the hole's diameter `d_mm` and its extent `t: [t0, t1]` in mm from `start`. A
+layer through an obround slot carries `slot: {length_mm, along}`, the slot's overall length
+and the direction of its length. Holes in no stack are listed under `lone` with their
+body, diameter, entry point `at`, axis and `depth_mm`.
 
-Rows are sorted by part number (rows without one come last) and hold `item`, `part_number`,
-`description`, `revision`, `count`, `definition` (the component names), `components` (their ids)
-and `properties`, with `total_occurrences` beside them. `path` writes them to a `.csv` file
-(the columns item, part_number, description, revision, count and definition, every field
-quoted; children follow their row) or a `.json` file. The window lists the same rows, switches
-between the levels and groupings and shows children under their part, edits a picked row's part
-number, description and revision, and exports them. Changing part properties changes no
-geometry, so it doesn't evaluate the model or re-seat joints again.
+Round holes count whether their wall is an exact cylinder or a B-spline (holes in refolded or
+imported parts). Holes are on one axis when their axes are at most `axis_tolerance` apart
+(default 0.1 mm), either way round; a round hole lines up with a slot when its axis passes
+through the slot's centre line. Slots that no round hole passes through line up when they
+share a centre line, and their stack's axis runs through the middle of the length they share.
+Layers belong to one stack when the gap between them is at most `touching` (default 0.05 mm).
+`bodies` limits the search to some bodies, `diameters` to holes and slot widths in the given
+ranges, and `slots: false` leaves slots out. Standard parts already placed (a washer's hole)
+are left out unless named in `bodies`. The command only reads the design.
+
