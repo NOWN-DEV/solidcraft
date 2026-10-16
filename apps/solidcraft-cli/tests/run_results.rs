@@ -179,3 +179,36 @@ fn unknown_command_suggests_the_closest_id() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("did you mean `doc.open`?"), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn timings_report_each_command_and_the_total() {
+    let dir = Scratch::new();
+    let script = dir.0.join("three.json");
+    let steps = json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "body_name": "Block"}},
+        {"command": "solid.cylinder", "params": {"base": [20, 15, -5], "radius": 6, "height": 30, "body_name": "Pin"}},
+        {"command": "solid.combine", "params": {"target": "Block", "tools": ["Pin"], "operation": "cut"}},
+    ]);
+    std::fs::write(&script, steps.to_string()).unwrap();
+    let timed = json_output(cli().arg("run").arg(&script).arg("--timings").output().unwrap());
+    let rows = timed["timings"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{timed}");
+    assert!(timed.get("results").is_none(), "results only with --results: {timed}");
+    let total = timed["total_ms"].as_f64().unwrap();
+    let sum: f64 = rows.iter().map(|r| r["ms"].as_f64().unwrap()).sum();
+    assert!(rows.iter().all(|r| r["ms"].as_f64().unwrap() >= 0.0 && r.get("profile").is_none()), "{timed}");
+    assert!(sum <= total + 1e-9, "{sum} > {total}");
+    assert_eq!(rows[2]["command"], "solid.combine");
+
+    let profiled = json_output(cli().arg("run").arg(&script).arg("--results").arg("--profile").output().unwrap());
+    assert_eq!(profiled["results"].as_array().unwrap().len(), 3, "{profiled}");
+    let cut = &profiled["timings"][2]["profile"];
+    for k in ["boolean_ms", "tessellate_ms", "other_ms"] {
+        assert!(cut[k].as_f64().unwrap() >= 0.0, "{profiled}");
+    }
+    assert!(cut["boolean_ms"].as_f64().unwrap() > 0.0, "{profiled}");
+
+    // Without --timings, --results stays a plain array.
+    let plain = json_output(cli().arg("run").arg(&script).arg("--results").output().unwrap());
+    assert_eq!(plain.as_array().unwrap().len(), 3);
+}

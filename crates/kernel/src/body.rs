@@ -1032,7 +1032,7 @@ impl Body {
     /// Like [`Body::tessellate`]; with `refine`, triangles that cut through curved faces are
     /// split until within `tol` of the surface (for measuring).
     pub fn tessellate_with(&self, tol: f64, refine: bool) -> Result<Mesh> {
-        self.tessellate_within(tol, f64::INFINITY, refine)
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.tessellate_within(tol, f64::INFINITY, refine))
     }
 
     /// [`Body::tessellate_with`] in which no facet turns more than `angle` radians either
@@ -1138,13 +1138,13 @@ impl Body {
     /// triangulation in its own parameters, with each edge sampled once (chord tolerance
     /// `tol`, mm) so faces meet exactly.
     pub fn display_plan(&self, tol: f64) -> Result<solidcraft_geom::tess::TessPlan> {
-        self.plan_within(tol, None)
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.plan_within(tol, None))
     }
 
     /// Like [`Body::display_plan`], and no facet turns more than `angle` radians (see
     /// [`Body::display_mesh_angular`]).
     pub fn display_plan_angular(&self, tol: f64, angle: f64) -> Result<solidcraft_geom::tess::TessPlan> {
-        self.plan_within(tol, Some(angle))
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.plan_within(tol, Some(angle)))
     }
 
     fn plan_within(&self, tol: f64, angle: Option<f64>) -> Result<solidcraft_geom::tess::TessPlan> {
@@ -1266,6 +1266,10 @@ impl Body {
     /// body's [`Body::display_plan`] (shared edge nodes, structured grids), or the way
     /// [`Body::tessellate`] meshes when no plan can be made.
     pub fn display_mesh(&self, tol: f64) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.display_mesh_timed(tol))
+    }
+
+    fn display_mesh_timed(&self, tol: f64) -> Result<Mesh> {
         if self.is_mesh() {
             return self.flagged(self.tessellate(tol)?);
         }
@@ -1285,6 +1289,10 @@ impl Body {
     /// sagitta of a small radius on a large body (a sheet-metal bend, a small hole), which the
     /// tolerance alone leaves as one flat facet.
     pub fn display_mesh_angular(&self, tol: f64, angle: f64) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.display_mesh_angular_timed(tol, angle))
+    }
+
+    fn display_mesh_angular_timed(&self, tol: f64, angle: f64) -> Result<Mesh> {
         if self.is_mesh() {
             return self.flagged(self.tessellate(tol)?);
         }
@@ -1300,12 +1308,16 @@ impl Body {
     /// The display mesh of a plan made from this body ([`Body::display_plan`],
     /// [`Body::display_plan_angular`]): evaluated on the CPU, with its edges flagged.
     pub fn display_mesh_of(&self, plan: &solidcraft_geom::tess::TessPlan) -> Result<Mesh> {
-        self.flagged(plan.evaluate())
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.flagged(plan.evaluate()))
     }
 
     /// The reference mesher's angular display mesh: what [`Body::display_mesh_angular`] falls
     /// back to when no plan can be made.
     pub fn reference_display_mesh_angular(&self, tol: f64, angle: f64) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Phase::Tessellate, || self.reference_display_mesh_angular_timed(tol, angle))
+    }
+
+    fn reference_display_mesh_angular_timed(&self, tol: f64, angle: f64) -> Result<Mesh> {
         if let Some((shared, t)) = self.display_of.as_deref()
             && let Some(placed) =
                 shared.mesh.get_or_init(|| shared.original.reference_display_mesh_angular(tol, angle).ok()).as_ref().and_then(|m| placed_mesh(m, t))

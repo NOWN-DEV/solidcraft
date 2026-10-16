@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Value, json};
 use solidcraft_engine::io::vfs;
+use solidcraft_engine::timings::{self, Clock, CommandTiming, Timings};
 
 use crate::backend::Backend;
 
@@ -110,6 +111,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     },
                     "rollback": {"type": "boolean", "description": "Undo completed steps when one fails (default true)"},
                     "verbose": {"type": "boolean", "description": "false: a compact reply. Feature steps leave out the full body list (created_bodies, changed_bodies and removed_bodies stay), sketch steps the ids they repeat outside `created` (default true)"},
+                    "timings": {"type": "boolean", "description": "true: the reply adds timings ([{index, command, ms}] for every step run, the failing one too) and total_ms (default false)"},
+                    "profile": {"type": "boolean", "description": "true: timings, each with profile {boolean_ms, tessellate_ms, other_ms}: the step's time in kernel booleans, tessellation and the rest. Measured where the steps run; absent when the app was sent the steps one by one (default false)"},
                 }),
                 &["commands"],
             ),
@@ -496,13 +499,19 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     }
     let rollback = a.get("rollback").and_then(Value::as_bool).unwrap_or(true);
     let verbose = a.get("verbose").and_then(Value::as_bool).unwrap_or(true);
+    let profile = a.get("profile").and_then(Value::as_bool).unwrap_or(false);
+    let timed = profile || a.get("timings").and_then(Value::as_bool).unwrap_or(false);
     // An app that runs batches itself answers the whole batch in one request, so one frame
     // (#743). One too long for a control line goes step by step: the app would refuse it unrun.
     // The margin covers the envelope and the `allow_paths` the backend adds.
-    let params = json!({"commands": steps, "rollback": rollback});
+    let mut params = json!({"commands": steps, "rollback": rollback});
+    if timed {
+        params["timings"] = json!(true);
+        params["profile"] = json!(profile);
+    }
     if params.to_string().len() + 64 * 1024 <= solidcraft_engine::MAX_LINE {
         match b.call("engine.batch", params) {
-            Ok(r) => return batch_reply(&r, rollback, verbose),
+            Ok(r) => return batch_reply(&r, rollback, verbose, timed),
             // Older apps and the headless session, or the app wants the steps one by one.
             Err(e) if e.starts_with("unknown method") || e.starts_with("engine.batch unavailable") => {}
             // Never sent: no app to send it to.
@@ -516,52 +525,70 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     }
     let start = if rollback { Undo::begin(b) } else { Undo::None };
     let mut results = Vec::with_capacity(steps.len());
+    // A kernel profile is only this process's: an app sent the steps one by one runs them in its own.
+    let profile = profile && !b.has_ui();
+    let clock = Clock::start();
+    let mut timings = Timings::default();
     for (i, step) in steps.iter().enumerate() {
         let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str);
-        let r = match command {
+        let (r, ms, split) = timings::time(profile, || match command {
             Some(id) => exec(b, id, step.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({}))),
             None => Err("missing `command`".to_string()),
-        };
+        });
+        timings.commands.push(CommandTiming { index: i, command: command.unwrap_or_default().to_string(), ms, profile: split });
+        timings.total_ms = clock.ms();
         match r {
             Ok(v) => results.push(if verbose { v } else { compact(v) }),
             Err(e) => {
                 let undone = start.rollback(b, i);
-                return text_result(
-                    &json!({
-                        "ok": false,
-                        "completed": i,
-                        "failed": {"index": i, "command": command, "error": e},
-                        "rolled_back": rollback,
-                        "undone": undone,
-                        "results": results,
-                    }),
-                    true,
-                );
+                let mut reply = json!({
+                    "ok": false,
+                    "completed": i,
+                    "failed": {"index": i, "command": command, "error": e},
+                    "rolled_back": rollback,
+                    "undone": undone,
+                    "results": results,
+                });
+                if timed && let Some(o) = reply.as_object_mut() {
+                    timings.add_to(o);
+                }
+                return text_result(&reply, true);
             }
         }
     }
     start.finish(b);
-    text_result(&json!({"ok": true, "completed": results.len(), "results": results}), false)
+    let mut reply = json!({"ok": true, "completed": results.len(), "results": results});
+    if timed && let Some(o) = reply.as_object_mut() {
+        timings.add_to(o);
+    }
+    text_result(&reply, false)
 }
 
 /// The `batch` reply from the app's `engine.batch` answer, shaped as the per-step path shapes it.
-fn batch_reply(r: &Value, rollback: bool, verbose: bool) -> Value {
+fn batch_reply(r: &Value, rollback: bool, verbose: bool, timed: bool) -> Value {
     let results: Vec<Value> =
         r["results"].as_array().cloned().unwrap_or_default().into_iter().map(|v| if verbose { v } else { compact(v) }).collect();
-    match r.get("failed").filter(|f| !f.is_null()) {
-        None => text_result(&json!({"ok": true, "completed": results.len(), "results": results}), false),
-        Some(failed) => text_result(
-            &json!({
-                "ok": false,
-                "completed": r["completed"],
-                "failed": failed,
-                "rolled_back": rollback,
-                "undone": r["undone"],
-                "results": results,
-            }),
-            true,
-        ),
+    let failed = r.get("failed").filter(|f| !f.is_null());
+    let mut reply = match failed {
+        None => json!({"ok": true, "completed": results.len(), "results": results}),
+        Some(failed) => json!({
+            "ok": false,
+            "completed": r["completed"],
+            "failed": failed,
+            "rolled_back": rollback,
+            "undone": r["undone"],
+            "results": results,
+        }),
+    };
+    // The app's own timings, measured where it ran the steps.
+    if timed && let Some(o) = reply.as_object_mut() {
+        for k in ["timings", "total_ms"] {
+            if let Some(v) = r.get(k) {
+                o.insert(k.into(), v.clone());
+            }
+        }
     }
+    text_result(&reply, failed.is_some())
 }
 
 /// A command's result without what the design already had (`execute` or `batch` with `verbose: false`): a

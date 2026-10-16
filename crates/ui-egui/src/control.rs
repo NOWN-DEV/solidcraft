@@ -6,7 +6,8 @@
 //! - `engine.batch {commands: [...], rollback?}`: the steps in one request, each as
 //!   `engine.execute` runs it; stops at the first failure and goes back to the checkpoint
 //!   (per-step results, `failed`, `undone`). Refused (`engine.batch unavailable: …`) while the
-//!   agent cursor is shown or when a step loads a file
+//!   agent cursor is shown or when a step loads a file. `timings: true` adds each step's `ms`
+//!   and the batch's `total_ms`; `profile: true` also splits each step's time (docs/mcp.md)
 //! - `engine.commands`: every command with tab, panel, params and enablement
 //! - `document.inspect {measure?}`: the design (parameters, timeline, bodies, sketches)
 //! - `ui.inspect`: UI state, viewport rect, camera, tool and dialog
@@ -44,6 +45,7 @@ use std::sync::mpsc::Sender;
 use serde_json::{Value, json};
 use solidcraft_engine::io::vfs;
 use solidcraft_engine::render::StandardView;
+use solidcraft_engine::timings;
 
 use crate::SolveApp;
 
@@ -121,7 +123,7 @@ const MAX_BATCH: usize = 10_000;
 /// bypass.
 const LOADS_A_FILE: [&str; 3] = ["doc.open", "file.insert_step", "file.insert_mesh"];
 
-/// `engine.batch {commands, rollback?}`: the steps in one request, so in one frame (#743). Each
+/// `engine.batch {commands, rollback?, timings?, profile?}`: the steps in one request, so in one frame (#743). Each
 /// step runs as `engine.execute` runs it; the first failure stops the batch and, with
 /// `rollback` (the default), the design goes back to its checkpoint. Step failures are part of
 /// the reply; refusals (`engine.batch unavailable: …`) come before anything runs, so the client
@@ -138,26 +140,38 @@ fn batch(app: &mut SolveApp, p: &Value) -> Outcome {
         return err(format!("engine.batch unavailable: step {i} ({c}) loads a file"));
     }
     let rollback = p.get("rollback").and_then(Value::as_bool).unwrap_or(true);
+    let profile = p.get("profile").and_then(Value::as_bool).unwrap_or(false);
+    let timed = profile || p.get("timings").and_then(Value::as_bool).unwrap_or(false);
     let checkpoint = if rollback { app.run("edit.checkpoint", json!({})).ok().and_then(|v| v["checkpoint"].as_u64()) } else { None };
     let mut results = Vec::with_capacity(steps.len());
+    let clock = timings::Clock::start();
+    let mut times = timings::Timings::default();
+    let with_times = |mut reply: Value, times: &timings::Timings| {
+        if timed && let Some(o) = reply.as_object_mut() {
+            times.add_to(o);
+        }
+        ok(reply)
+    };
     for (i, step) in steps.iter().enumerate() {
-        let r = match command(step) {
+        let (r, ms, split) = timings::time(profile, || match command(step) {
             Some(id) => execute(app, id, step.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}))),
             None => Err("missing `command`".to_string()),
-        };
+        });
+        times.commands.push(timings::CommandTiming { index: i, command: command(step).unwrap_or_default().to_string(), ms, profile: split });
+        times.total_ms = clock.ms();
         match r {
             Ok(v) => results.push(v),
             Err(e) => {
                 let restored = checkpoint.is_some_and(|id| app.run("edit.restore_checkpoint", json!({"checkpoint": id})).is_ok());
                 let failed = json!({"index": i, "command": command(step), "error": e});
-                return ok(json!({"completed": i, "results": results, "failed": failed, "undone": if restored { i } else { 0 }}));
+                return with_times(json!({"completed": i, "results": results, "failed": failed, "undone": if restored { i } else { 0 }}), &times);
             }
         }
     }
     if let Some(id) = checkpoint {
         let _ = app.run("edit.restore_checkpoint", json!({"checkpoint": id, "forget": true}));
     }
-    ok(json!({"completed": results.len(), "results": results, "undone": 0}))
+    with_times(json!({"completed": results.len(), "results": results, "undone": 0}), &times)
 }
 
 /// A request from an MCP server carries the folders its agent may use (`allow_paths`); every
@@ -1105,6 +1119,25 @@ mod tests {
         assert!(v["result"].get("failed").is_none(), "{v}");
         assert!(frames <= 2, "a batch of 80 steps took {frames} frames");
         assert_eq!(inspect(&mut h)["sketches"].as_array().map(Vec::len), Some(40));
+    }
+
+    #[test]
+    fn engine_batch_times_each_step_when_asked() {
+        let mut h = crate::scenario::Harness::new();
+        let steps = json!([
+            {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "body_name": "Block"}},
+            {"command": "solid.cylinder", "params": {"base": [20, 15, -5], "radius": 6, "height": 30, "body_name": "Pin"}},
+            {"command": "solid.combine", "params": {"target": "Block", "tools": ["Pin"], "operation": "cut"}},
+        ]);
+        let v = batch(&mut h, json!({"commands": steps, "profile": true}));
+        let r = &v["result"];
+        assert_eq!(r["completed"], 3, "{v}");
+        let rows = r["timings"].as_array().unwrap();
+        let sum: f64 = rows.iter().map(|t| t["ms"].as_f64().unwrap()).sum();
+        assert!(sum <= r["total_ms"].as_f64().unwrap() + 1e-9, "{v}");
+        assert!(rows[2]["profile"]["boolean_ms"].as_f64().unwrap() > 0.0, "{v}");
+        let plain = batch(&mut h, json!({"commands": [{"command": "solid.sphere", "params": {"radius": 3, "center": [80, 0, 0]}}]}));
+        assert!(plain["result"].get("timings").is_none(), "{plain}");
     }
 
     #[test]

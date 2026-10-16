@@ -4129,6 +4129,7 @@ dependencies = [
  "solidcraft-render",
  "solidcraft-sketch",
  "thiserror 2.0.21",
+ "web-time",
 ]
 
 [[package]]
@@ -4193,6 +4194,7 @@ dependencies = [
  "truck-shapeops",
  "truck-stepio",
  "truck-topology",
+ "web-time",
 ]
 
 [[package]]
