@@ -148,8 +148,14 @@ impl<'a> DistanceShape<'a> {
             if sides.iter().any(|w| w.dot(inward) < 0.0) {
                 continue;
             }
+            // `p` straight along the edge (past its end, on the line through it) says nothing
+            // about which side it is on: another edge meeting there decides.
+            let off = across(p);
+            if off.len() <= tiny {
+                continue;
+            }
             decided = true;
-            if across(p).dot(inward) >= 0.0 {
+            if off.dot(inward) >= 0.0 {
                 return true;
             }
         }
@@ -297,9 +303,10 @@ pub fn body_distance(a: &DistanceShape, b: &DistanceShape, limit: f64) -> Result
         }
         Ok(best)
     })?;
-    // The exact minimum lies within the chords of the mesh's; an answer past that went astray.
+    // The exact minimum lies within the chords of the mesh's; an answer outside that went astray.
+    let chords = a.chord + b.chord + 1e-9 * a.body.size().max(b.body.size()).max(1.0);
     Ok(Some(match best {
-        Some(e) if e.distance <= m.distance + a.chord + b.chord + 1e-9 * a.body.size().max(b.body.size()).max(1.0) => e,
+        Some(e) if e.distance <= m.distance + chords && e.distance >= m.distance - chords => e,
         _ => mesh,
     }))
 }

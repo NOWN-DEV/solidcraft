@@ -228,3 +228,26 @@ fn a_malformed_shared_part_is_not_measured() {
     assert!(!super::plausible(1239.0, Vec3::new(5.0, 5.0, 0.5), bbox));
     assert!(!super::plausible(f64::NAN, Vec3::new(5.0, 5.0, 0.5), bbox));
 }
+
+/// Two plates 0.2 mm apart, the upper one set 10 mm in from the lower one's corner, and two set
+/// side by side with a 0.2 mm gap: 0.2, not 0 (a point past a corner, on the line of one of its
+/// edges, was taken for a point of the face). Gaps under twice the meshes' chord went wrong.
+#[test]
+fn a_small_gap_past_a_corner_is_not_contact() {
+    let mut s = Session::default();
+    let plate = |s: &mut Session, name: &str, size: [f64; 3], corner: [f64; 3]| {
+        run(s, "solid.box", json!({"length": size[0], "width": size[1], "height": size[2], "corner": corner, "operation": "new", "body_name": name}));
+    };
+    plate(&mut s, "A", [100.0, 100.0, 2.0], [0.0, 0.0, 0.0]);
+    plate(&mut s, "B", [100.0, 100.0, 2.0], [10.0, 10.0, 2.2]);
+    plate(&mut s, "C", [100.0, 100.0, 2.0], [0.0, 0.0, 10.0]);
+    plate(&mut s, "D", [100.0, 100.0, 2.0], [100.2, 0.0, 10.0]);
+    // 3 mm apart in x and 0.2 in z, along their long sides: √(3² + 0.2²).
+    plate(&mut s, "E", [1000.0, 100.0, 2.0], [0.0, 300.0, 0.0]);
+    plate(&mut s, "F", [1000.0, 100.0, 2.0], [1003.0, 300.0, 2.2]);
+    for (a, b, want) in [("A", "B", 0.2), ("C", "D", 0.2), ("E", "F", (9.0f64 + 0.04).sqrt())] {
+        let r = run(&mut s, "inspect.clearance", json!({"bodies": [a], "against": [b], "clearance": 5, "nearest": 4}));
+        assert!((f(&r["near"][0]["distance_mm"]) - want).abs() < 1e-9, "{a} {b}: {r}");
+        assert!((f(&r["nearest"][a][0]["distance_mm"]) - want).abs() < 1e-9, "{a} {b}: {r}");
+    }
+}
