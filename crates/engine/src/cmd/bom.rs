@@ -2,7 +2,8 @@
 //! `component.metadata.set` read and change a component definition's part number, description,
 //! revision and free properties (shared by every occurrence, saved with the component);
 //! `assembly.bom` counts the placed components of the design, or of one component, and lists
-//! them as rows, optionally written to a CSV or JSON file.
+//! them as rows, optionally written to a CSV or JSON file. With `group_children`, a part with a
+//! part number keeps the parts placed inside it (a bolt's washers and nut) in its own row.
 
 use std::collections::BTreeMap;
 
@@ -27,9 +28,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("assembly.bom", "Bill of Materials", bom).at("SOLID", "INSPECT").icon("bom").noundo().params(
         "component?: id or name (default the design); levels?: flat (default: every part at any depth, counted through its \
          subassemblies) | top (the component's direct children, subassemblies as one row each); group_by?: [\"part_number\"] \
-         (default; components without a part number get a row per definition) | [\"definition\"]; path?: write a .csv or .json \
-         file; format?: csv|json (default from the path) → rows: [{item, part_number, description, revision, count, definition, \
-         components, properties}] sorted by part number, total_occurrences",
+         (default; components without a part number get a row per definition) | [\"definition\"]; group_children?: true (a component \
+         with a part number is one row, the parts placed inside it listed under it as children: [{item, part_number, description, \
+         revision, each, count, definition}], not as rows of their own); path?: write a .csv or .json file (children as items 1.1, \
+         1.2…); format?: csv|json (default from the path) → rows: [{item, part_number, description, revision, count, definition, \
+         components, properties, children?}] sorted by part number, total_occurrences (children included)",
     ),
 ];
 
@@ -173,9 +176,20 @@ struct Row {
     components: Vec<u64>,
     names: Vec<String>,
     properties: BTreeMap<String, String>,
+    /// With `group_children`: what is placed inside one of this row's parts, and how often.
+    kit: BTreeMap<u64, u64>,
 }
 
-fn options(p: &Value, cmd: &str) -> Result<(Levels, Group)> {
+/// What the bill of materials lists and how.
+#[derive(Clone, Copy)]
+struct Options {
+    levels: Levels,
+    group: Group,
+    /// A part with a part number keeps its sub-parts in its row.
+    fold: bool,
+}
+
+fn options(p: &Value, cmd: &str) -> Result<Options> {
     let levels = match p.get("levels") {
         None | Some(Value::Null) => Levels::Flat,
         Some(Value::String(l)) if l == "flat" => Levels::Flat,
@@ -191,7 +205,17 @@ fn options(p: &Value, cmd: &str) -> Result<(Levels, Group)> {
         },
         Some(_) => return Err(bad(cmd, "`group_by` is [\"part_number\"] or [\"definition\"]")),
     };
-    Ok((levels, group))
+    let fold = match p.get("group_children") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad(cmd, "`group_children` is true or false")),
+    };
+    Ok(Options { levels, group, fold })
+}
+
+/// A component with a part number: with `group_children`, one row however much is inside it.
+fn numbered(s: &Session, id: u64) -> bool {
+    s.doc.components.iter().any(|c| c.id == id && c.metadata.part_number().is_some_and(|n| !n.is_empty()))
 }
 
 fn group_key(g: &str, cmd: &str) -> Result<Group> {
@@ -203,8 +227,9 @@ fn group_key(g: &str, cmd: &str) -> Result<Group> {
 }
 
 /// How many times each component is placed below `root`: in `Top`, its direct children; in
-/// `Flat`, every placement at any depth (a part in a subassembly placed twice counts twice).
-fn counts(s: &Session, root: u64, levels: Levels, cmd: &str) -> Result<BTreeMap<u64, u64>> {
+/// `Flat`, every placement at any depth (a part in a subassembly placed twice counts twice),
+/// not below a numbered part when `fold`.
+fn counts(s: &Session, root: u64, levels: Levels, fold: bool, cmd: &str) -> Result<BTreeMap<u64, u64>> {
     let mut children: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for o in &s.doc.occurrences {
         children.entry(o.parent).or_default().push(o.component);
@@ -219,29 +244,45 @@ fn counts(s: &Session, root: u64, levels: Levels, cmd: &str) -> Result<BTreeMap<
                 return Err(bad(cmd, format!("the assembly is deeper than {MAX_DEPTH} levels or has more than {MAX_PLACEMENTS} placements")));
             }
             *out.entry(*child).or_default() += 1;
-            if levels == Levels::Flat {
+            if levels == Levels::Flat && !(fold && numbered(s, *child)) {
                 stack.push((*child, depth + 1));
             }
         }
     }
     if levels == Levels::Flat {
-        // Parts only: a subassembly is listed through its parts, unless it has bodies of its own.
+        // Parts only: a subassembly is listed through its parts, unless it has bodies of its own
+        // (or, folding, a part number).
         let st = s.model.state();
-        out.retain(|c, _| !children.contains_key(c) || st.bodies.iter().any(|b| s.doc.model_body_component(b) == *c));
+        out.retain(|c, _| !children.contains_key(c) || (fold && numbered(s, *c)) || st.bodies.iter().any(|b| s.doc.model_body_component(b) == *c));
     }
     Ok(out)
 }
 
-fn rows(s: &Session, counts: &BTreeMap<u64, u64>, group: Group) -> Vec<Row> {
-    let mut grouped: BTreeMap<(String, u64), Row> = BTreeMap::new();
+/// How a kit reads when rows are compared: its parts by part number (else definition) and count.
+fn kit_key(s: &Session, kit: &BTreeMap<u64, u64>) -> String {
+    let mut parts: Vec<String> = kit
+        .iter()
+        .map(|(id, n)| {
+            let pn = s.doc.components.iter().find(|c| c.id == *id).and_then(|c| c.metadata.part_number()).unwrap_or_default();
+            if pn.is_empty() { format!("#{id}×{n}") } else { format!("{pn}×{n}") }
+        })
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+fn rows(s: &Session, counts: &BTreeMap<u64, u64>, group: Group, kits: &BTreeMap<u64, BTreeMap<u64, u64>>) -> Vec<Row> {
+    let mut grouped: BTreeMap<(String, String, u64), Row> = BTreeMap::new();
     for (id, n) in counts {
         let Some(c) = s.doc.components.iter().find(|c| c.id == *id) else { continue };
         let m = &c.metadata;
         let part_number = m.part_number().unwrap_or_default().to_string();
-        // Without a part number a definition is its own row.
+        let kit = kits.get(id).cloned().unwrap_or_default();
+        // Without a part number a definition is its own row; parts with different contents
+        // (a bolt with or without its nut) are different rows.
         let k = match group {
-            Group::PartNumber if !part_number.is_empty() => (part_number.clone(), 0),
-            _ => (String::new(), *id),
+            Group::PartNumber if !part_number.is_empty() => (part_number.clone(), kit_key(s, &kit), 0),
+            _ => (String::new(), String::new(), *id),
         };
         let row = grouped.entry(k).or_insert_with(|| Row {
             part_number: part_number.clone(),
@@ -251,6 +292,7 @@ fn rows(s: &Session, counts: &BTreeMap<u64, u64>, group: Group) -> Vec<Row> {
             components: Vec::new(),
             names: Vec::new(),
             properties: BTreeMap::new(),
+            kit,
         });
         row.count += n;
         row.components.push(*id);
@@ -284,7 +326,8 @@ fn quote(s: &str) -> String {
 fn csv(rows: &[Value]) -> String {
     let mut out = ["item", "part_number", "description", "revision", "count", "definition"].map(quote).join(",");
     out.push('\n');
-    for r in rows {
+    let lines = rows.iter().flat_map(|r| std::iter::once(r).chain(r["children"].as_array().into_iter().flatten()));
+    for r in lines {
         let text = |k: &str| match &r[k] {
             Value::String(t) => t.clone(),
             Value::Null => String::new(),
@@ -300,21 +343,47 @@ fn csv(rows: &[Value]) -> String {
 fn bom(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "assembly.bom";
     let root = if p.get("component").is_some_and(|v| !v.is_null()) { component_id(s, p, cmd)? } else { 0 };
-    let (levels, group) = options(p, cmd)?;
-    let counts = counts(s, root, levels, cmd)?;
-    let rows: Vec<Value> = rows(s, &counts, group)
+    let o = options(p, cmd)?;
+    let counts = counts(s, root, o.levels, o.fold, cmd)?;
+    // Folding: what one of each numbered part holds, as parts at any depth.
+    let mut kits: BTreeMap<u64, BTreeMap<u64, u64>> = BTreeMap::new();
+    if o.fold {
+        for id in counts.keys().filter(|id| numbered(s, **id)) {
+            let kit = self::counts(s, *id, Levels::Flat, false, cmd)?;
+            if !kit.is_empty() {
+                kits.insert(*id, kit);
+            }
+        }
+    }
+    let mut total: u64 = 0;
+    let rows: Vec<Value> = rows(s, &counts, o.group, &kits)
         .into_iter()
         .enumerate()
         .map(|(i, r)| {
-            json!({"item": i + 1, "part_number": r.part_number, "description": r.description, "revision": r.revision,
-                "count": r.count, "definition": r.names.join("; "), "components": r.components, "properties": r.properties})
+            total += r.count;
+            let mut v = json!({"item": i + 1, "part_number": r.part_number, "description": r.description, "revision": r.revision,
+                "count": r.count, "definition": r.names.join("; "), "components": r.components, "properties": r.properties});
+            if !r.kit.is_empty() {
+                let children: Vec<Value> = self::rows(s, &r.kit, Group::PartNumber, &BTreeMap::new())
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, c)| {
+                        let count = c.count.saturating_mul(r.count);
+                        total += count;
+                        json!({"item": format!("{}.{}", i + 1, j + 1), "part_number": c.part_number, "description": c.description,
+                            "revision": c.revision, "each": c.count, "count": count, "definition": c.names.join("; ")})
+                    })
+                    .collect();
+                v["children"] = Value::Array(children);
+            }
+            v
         })
         .collect();
-    let total: u64 = rows.iter().filter_map(|r| r["count"].as_u64()).sum();
     let mut out = Map::new();
     out.insert("component".into(), json!(root));
-    out.insert("levels".into(), json!(if levels == Levels::Top { "top" } else { "flat" }));
-    out.insert("group_by".into(), json!([if group == Group::Definition { "definition" } else { "part_number" }]));
+    out.insert("levels".into(), json!(if o.levels == Levels::Top { "top" } else { "flat" }));
+    out.insert("group_by".into(), json!([if o.group == Group::Definition { "definition" } else { "part_number" }]));
+    out.insert("group_children".into(), json!(o.fold));
     if let Some(path) = str_(p, "path") {
         let format = match str_(p, "format").map(str::to_ascii_lowercase) {
             Some(f) => f,

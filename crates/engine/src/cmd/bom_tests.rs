@@ -202,3 +202,66 @@ fn hostile_part_properties_are_refused_without_a_change() {
     run(&mut s, "document.metadata.set", json!({"key": "part_number", "value": "ASM-1"}));
     assert_eq!(run(&mut s, "component.metadata", json!({"component": 0}))["part_number"], "ASM-1");
 }
+
+/// Two hex bolts, each with a washer and a nut placed inside it, and a third bolt alone.
+fn bolts() -> Session {
+    let mut s = Session::default();
+    for x in [0, 30] {
+        let bolt = run(&mut s, "parts.insert", json!({"family": "hex_bolt", "size": "M6", "length": 30, "point": [x, 0, 0], "direction": [0, 0, 1]}));
+        run(&mut s, "component.activate", json!({"component": bolt["component"]}));
+        run(&mut s, "parts.insert", json!({"family": "washer", "size": "M6", "point": [x, 0, -2], "direction": [0, 0, -1]}));
+        run(&mut s, "parts.insert", json!({"family": "hex_nut", "size": "M6", "point": [x, 0, -4], "direction": [0, 0, -1]}));
+        run(&mut s, "component.activate", json!({"component": 0}));
+    }
+    run(&mut s, "parts.insert", json!({"family": "hex_bolt", "size": "M6", "length": 30, "point": [60, 0, 0], "direction": [0, 0, 1]}));
+    s
+}
+
+#[test]
+fn group_children_keeps_a_bolts_washer_and_nut_in_its_row() {
+    let mut s = bolts();
+    let plain = run(&mut s, "assembly.bom", json!({}));
+    let numbers: Vec<(String, u64)> = summary(&plain).into_iter().map(|(pn, _, n)| (pn, n)).collect();
+    assert_eq!(numbers, [("ISO 4017 M6x30".into(), 3), ("ISO 4032 M6".into(), 2), ("ISO 7089 M6".into(), 2)], "{plain}");
+
+    let r = run(&mut s, "assembly.bom", json!({"group_children": true}));
+    let rows = r["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "the bolts with a nut and the bolt alone: {r}");
+    let kit = &rows[0];
+    assert_eq!((kit["part_number"].as_str(), kit["count"].as_u64()), (Some("ISO 4017 M6x30"), Some(2)), "{r}");
+    let children: Vec<(&str, &str, u64, u64)> = kit["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["item"].as_str().unwrap(), c["part_number"].as_str().unwrap(), c["each"].as_u64().unwrap(), c["count"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(children, [("1.1", "ISO 4032 M6", 1, 2), ("1.2", "ISO 7089 M6", 1, 2)]);
+    assert_eq!((rows[1]["count"].as_u64(), rows[1].get("children")), (Some(1), None));
+    assert_eq!(r["total_occurrences"], plain["total_occurrences"], "the same parts, folded");
+
+    let dir = scratch("kit");
+    let path = dir.join("bom.csv");
+    run(&mut s, "assembly.bom", json!({"group_children": true, "path": path.to_str().unwrap()}));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let items: Vec<&str> = text.lines().skip(1).map(|l| l.split(',').next().unwrap()).collect();
+    assert_eq!(items, ["\"1\"", "\"1.1\"", "\"1.2\"", "\"2\""], "{text}");
+    assert!(s.execute("assembly.bom", &json!({"group_children": "yes"})).is_err());
+}
+
+#[test]
+fn changing_part_properties_does_not_evaluate_the_model_again() {
+    let mut s = bolts();
+    s.evaluations = 0;
+    run(&mut s, "component.metadata.set", json!({"component": 1, "description": "Bolt", "properties": {"finish": "zinc"}}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.evaluations, 0, "part properties change no geometry");
+    assert_eq!(run(&mut s, "component.metadata", json!({"component": 1}))["description"], "Bolt");
+    // A geometric edit after it finds every other feature's earlier result.
+    let first = run(&mut s, "assembly.bom", json!({}))["rows"][1]["components"][0].clone();
+    run(&mut s, "parts.resize", json!({"component": first, "size": "M8"}));
+    run(&mut s, "parts.resize", json!({"component": first, "size": "M6"}));
+    // Anything else still evaluates.
+    run(&mut s, "occurrence.copy", json!({"component": 1, "translate": [0, 40, 0]}));
+    assert!(s.evaluations > 0);
+}

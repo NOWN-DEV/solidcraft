@@ -2506,6 +2506,23 @@ impl Document {
         *self == normalized
     }
 
+    /// Only components' part properties (metadata and free properties) changed: nothing to
+    /// evaluate. The same whole-Document proof as [`Document::differs_only_in_render`].
+    pub fn differs_only_in_part_properties(&self, previous: &Document) -> bool {
+        if self.components.len() != previous.components.len()
+            || self.components.iter().zip(&previous.components).any(|(a, b)| a.id != b.id)
+            || self.components == previous.components
+        {
+            return false;
+        }
+        let mut normalized = previous.clone();
+        for (n, c) in normalized.components.iter_mut().zip(&self.components) {
+            n.metadata = c.metadata.clone();
+            n.properties = c.properties.clone();
+        }
+        *self == normalized
+    }
+
     /// The colour a body is shown and exported in (sRGB as 0–1 fractions): its appearance,
     /// else its component's, else its material's look, else the colour it was imported with.
     /// (Faces may have their own: `face_looks`.)

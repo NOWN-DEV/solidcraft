@@ -211,11 +211,18 @@ description; **Change Part Size** renumbers them, keeping a field you changed yo
 - `group_by: ["part_number"]` (the default) puts definitions with the same part number in one
   row; a definition without a part number gets a row of its own. `["definition"]` gives every
   definition its own row.
+- `group_children: true` keeps what is placed inside a part with a part number in that part's
+  row: a bolt with a washer and a nut placed inside it is one row, the washer and the nut listed
+  under it as `children` (items 1.1, 1.2…, with `each` per bolt and `count` in all) instead of
+  rows of their own. Bolts with different contents (one with a nut, one without) are different
+  rows. `total_occurrences` counts the children too, so it is the same either way.
 - `component` lists one subassembly's parts instead of the design's.
 
 Rows are sorted by part number (rows without one come last) and hold `item`, `part_number`,
 `description`, `revision`, `count`, `definition` (the component names), `components` (their ids)
 and `properties`, with `total_occurrences` beside them. `path` writes them to a `.csv` file
 (the columns item, part_number, description, revision, count and definition, every field
-quoted) or a `.json` file. The window lists the same rows, switches between the levels and
-groupings, edits a picked row's part number, description and revision, and exports them.
+quoted; children follow their row) or a `.json` file. The window lists the same rows, switches
+between the levels and groupings and shows children under their part, edits a picked row's part
+number, description and revision, and exports them. Changing part properties changes no
+geometry, so it doesn't evaluate the model or re-seat joints again.
