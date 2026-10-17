@@ -418,3 +418,33 @@ fn a_stack_on_a_tilted_axis_takes_a_bolt_and_nut_on_either_face() {
         run(&mut s, "edit.undo", json!({}));
     }
 }
+
+#[test]
+fn a_hole_in_a_body_placed_by_an_offset_is_seated_on() {
+    // The upper plate is built 50 above and moved into a component of its own with an offset
+    // that brings it down onto the lower one, as a part of an imported assembly is placed in
+    // its product: its geometry stays where it was built. The seat on its hole is found where
+    // the plate is, and the bolt sits on it.
+    let lib = Library::bolts();
+    let mut s = Session::default();
+    run(&mut s, "parts.library.load", json!({"path": lib.path()}));
+    plate(&mut s, "Lower", json!(0), json!(3), json!(3), 5.5);
+    plate(&mut s, "Upper", json!(53), json!(4), json!(57), 5.5);
+    let holder = run(&mut s, "component.create", json!({"name": "Holder"}))["component"].as_u64().unwrap_or(0);
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    std::sync::Arc::make_mut(&mut s.doc).body_components.insert("Upper".into(), holder);
+    std::sync::Arc::make_mut(&mut s.doc)
+        .body_offsets
+        .insert("Upper".into(), solidcraft_doc::rigid(Vec3::new(0.0, 0.0, -50.0), Vec3::ZERO, Vec3::Z, 0.0));
+    s.refresh();
+    let r = run(&mut s, "parts.fasten", json!({"family": "hex_bolt_grip"}));
+    let placed = r["placed"].as_array().cloned().unwrap_or_default();
+    assert_eq!((placed.len(), r["unfilled"].clone()), (1, json!([])), "{r}");
+    let p = &placed[0];
+    assert_eq!((p["size"].as_str(), p["head_side"].as_str()), (Some("M5"), Some("start")), "{p}");
+    // On the upper plate's top face (z 7), the shank down the hole, after the joints are solved.
+    run(&mut s, "joint.solve", json!({}));
+    let (lo, hi) = bbox(&s, occ(&p["occurrence"]));
+    assert!(near(hi.z, 7.0 + 3.5) && near(lo.z, 7.0 - 14.0), "{lo:?} {hi:?}");
+    assert!(near((lo.x + hi.x) / 2.0, 20.0) && near((lo.y + hi.y) / 2.0, 15.0), "{lo:?} {hi:?}");
+}

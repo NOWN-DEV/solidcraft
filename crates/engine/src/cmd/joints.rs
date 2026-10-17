@@ -293,19 +293,7 @@ fn origin_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<JointOrigin
     let snap = match what {
         "face" | "circle" => {
             let pick = local(world);
-            // A circle's name is its cylindrical wall's (a rim pick also touches the end face).
-            let named_at = if what == "circle" {
-                s.model
-                    .state()
-                    .bodies
-                    .iter()
-                    .filter_map(|b| cylinder_wall_point(&b.body, pick))
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map_or(pick, |(at, _)| at)
-            } else {
-                pick
-            };
-            let face = solidcraft_doc::naming::face_names_at(&s.model.state(), &[named_at]).into_iter().next().filter(|n| !n.is_empty());
+            let face = face_name_at(s, occurrence, pick, what == "circle");
             if what == "face" { Snap::FaceCenter { pick, face } } else { Snap::CircleCenter { pick, face } }
         }
         "point" => Snap::Point { point: local(world), z: v.get("z").and_then(vec3).map(local_dir) },
@@ -335,7 +323,7 @@ fn circle_centre(s: &Session, occurrence: u64, pick: Vec3) -> Option<Snap> {
         .bodies
         .iter()
         .filter(|b| s.doc.model_body_component(b) == component)
-        .find_map(|b| solidcraft_doc::kernel::cylinder_end_at(&b.body, pick))?;
+        .find_map(|b| solidcraft_doc::joints::cylinder_end_at(&s.doc, b, pick))?;
     let along = (pick - c.axis_point).dot(c.axis);
     let (at, dir) = if (along - c.start).abs() <= (c.end - along).abs() { (c.start, -1.0) } else { (c.end, 1.0) };
     Some(Snap::Point { point: c.axis_point + c.axis * at, z: Some(c.axis * dir) })
@@ -1276,6 +1264,38 @@ mod reach_tests;
 #[cfg(test)]
 #[path = "joints_tests.rs"]
 mod tests;
+
+/// The name of the face a joint origin picks at `pick` (the occurrence's component's
+/// coordinates): a face of that component's bodies, looked up where each body's geometry is (a
+/// body moved in from another component keeps its own coordinates, placed by its offset); a
+/// circle's is its cylindrical wall's (a rim pick also touches the end face). Else, as before,
+/// the face of any body there.
+fn face_name_at(s: &Session, occurrence: u64, pick: Vec3, circle: bool) -> Option<String> {
+    let st = s.model.state();
+    let component = if occurrence == 0 { 0 } else { s.doc.occurrences.iter().find(|o| o.id == occurrence).map_or(0, |o| o.component) };
+    let bodies: Vec<_> = st.bodies.iter().filter(|b| !b.body.is_mesh() && s.doc.model_body_component(b) == component).collect();
+    // The pick in a body's own coordinates.
+    let own = |b: &solidcraft_doc::ModelBody, p: Vec3| match s.doc.model_body_offset(b) {
+        Some(m) => solidcraft_doc::mat_inverse(m).map(|inv| solidcraft_doc::apply_point(&inv, p)),
+        None => Some(p),
+    };
+    let wall = if circle {
+        bodies
+            .iter()
+            .filter_map(|b| {
+                let q = own(b, pick)?;
+                cylinder_wall_point(&b.body, q).map(|(at, off)| (*b, at, off))
+            })
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+    } else {
+        None
+    };
+    let named = match wall {
+        Some((b, at, _)) => solidcraft_doc::naming::face_name_at_body(b, at),
+        None => bodies.iter().find_map(|b| solidcraft_doc::naming::face_name_at_body(b, own(b, pick)?)),
+    };
+    named.or_else(|| solidcraft_doc::naming::face_names_at(&st, &[pick]).into_iter().next().filter(|n| !n.is_empty()))
+}
 
 /// A point in the middle of the cylindrical face at `pick` (on its wall, halfway along).
 fn cylinder_wall_point(b: &solidcraft_doc::kernel::Body, pick: Vec3) -> Option<(Vec3, f64)> {

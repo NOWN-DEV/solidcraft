@@ -656,7 +656,7 @@ const KEEP_SURFACES: usize = 256;
 fn surfaces(b: &Body) -> Option<Surfaces> {
     let size = b.size();
     let compute = || -> Option<Surfaces> {
-        let mesh = b.tessellate((size * 1e-3).max(1e-3)).ok()?;
+        let mesh = b.tessellate(mesh_tol(size)).ok()?;
         let surfs = classify_faces(b, &mesh, b.face_count(), (size * 1e-4).max(1e-6));
         Some(std::sync::Arc::new((mesh, surfs)))
     };
@@ -682,21 +682,48 @@ pub fn cylinder_face_at(b: &Body, p: Vec3) -> Option<CylinderFace> {
     let size = b.size();
     let cached = surfaces(b)?;
     let (mesh, surfs) = (&cached.0, &cached.1);
-    // The face of the triangle nearest the point.
-    let mut best: Option<(f64, u32)> = None;
+    // Each face's distance from the point (its nearest triangle).
+    let mut near: HashMap<u32, f64> = HashMap::new();
     for (t, f) in mesh.triangles.iter().zip(&mesh.tri_face) {
         let Some([a, bb, c]) = mesh.tri(t) else { continue };
-        let d = ((a + bb + c) / 3.0).dist(p).min(a.dist(p)).min(bb.dist(p)).min(c.dist(p));
-        if best.is_none_or(|(bd, _)| d < bd) {
-            best = Some((d, *f));
-        }
+        let d = crate::boolean_guard::point_triangle_dist(p, a, bb, c);
+        near.entry(*f).and_modify(|x| *x = x.min(d)).or_insert(d);
     }
-    let (d, face) = best?;
-    if d > size * 0.05 {
+    let nearest = near.values().copied().fold(f64::INFINITY, f64::min);
+    if nearest > size * 0.05 {
         return None;
     }
-    let Surf::Cylinder { axis, p: ap, r } = *surfs.get(face as usize)? else { return None };
-    Some(cylinder_extent(mesh, face, axis, ap, r))
+    // The facets of a curved face lie off it by up to the mesh's tolerance, so the triangle
+    // nearest a point on a hole's wall can be one of the face round its rim (they share the
+    // rim's points; in a thin plate of a large body, whose mesh is coarse, the wall is a few
+    // long facets). Of the faces within that tolerance of the nearest, the point lies on the
+    // one whose own surface it is nearest (a cylinder: within its extent).
+    let tol = mesh_tol(size);
+    let mut best: Option<(f64, u32, Option<CylinderFace>)> = None;
+    let mut faces: Vec<(u32, f64)> = near.into_iter().filter(|(_, d)| *d <= nearest + tol).collect();
+    faces.sort_by_key(|(f, _)| *f);
+    for (face, d) in faces {
+        let (off, cyl) = match surfs.get(face as usize) {
+            Some(Surf::Plane { n, d: k }) => (d.min((n.dot(p) - k).abs()), None),
+            Some(Surf::Cylinder { axis, p: ap, r }) => {
+                let c = cylinder_extent(mesh, face, *axis, *ap, *r);
+                let v = p - c.axis_point;
+                let along = v.dot(c.axis);
+                let surface = ((v - c.axis * along).len() - c.radius).abs() + (c.start - along).max(along - c.end).max(0.0);
+                (d.min(surface), Some(c))
+            }
+            _ => (d, None),
+        };
+        if best.as_ref().is_none_or(|(bo, ..)| off < *bo) {
+            best = Some((off, face, cyl));
+        }
+    }
+    best?.2
+}
+
+/// The chord tolerance the cylinder lookups mesh a body of this size at.
+fn mesh_tol(size: f64) -> f64 {
+    (size * 1e-3).max(1e-3)
 }
 
 /// The cylindrical face one of whose end circles is centred at `p` (a circle given by its
