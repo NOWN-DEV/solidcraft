@@ -235,6 +235,33 @@ fn stacks_a_fastener_cannot_fill_are_reported() {
 }
 
 #[test]
+fn a_hole_whose_wall_has_a_seam_where_the_seat_would_go_is_filled() {
+    // Two plates in their own components, each with a hole cut by a cylinder: the cylinder's
+    // wall is two faces, and on a straight or tilted axis the first point tried can sit on the
+    // seam between them.
+    let tilted = [0.6749092308122732, 0.0, -0.7379007590214186];
+    for (axis, base) in [([0.0, 0.0, 1.0], [0.0, 0.0, -7.0]), (tilted, [-6.749092308122732, 0.0, 10.379007590214187])] {
+        let mut s = Session::default();
+        for (name, z) in [("A", 0), ("B", 3)] {
+            run(&mut s, "component.create", json!({"name": name}));
+            run(
+                &mut s,
+                "solid.box",
+                json!({"length": 200, "width": 200, "height": 3, "corner": [-100, -100, z], "operation": "new", "body_name": format!("Plate{name}")}),
+            );
+            run(
+                &mut s,
+                "solid.cylinder",
+                json!({"radius": 3, "height": 20, "base": base, "axis": axis, "operation": "cut", "targets": [format!("Plate{name}")]}),
+            );
+            run(&mut s, "component.activate", json!({"component": "root"}));
+        }
+        let r = run(&mut s, "parts.fasten", json!({"family": "hex_bolt", "nut": true, "diameters": [[0, 12]]}));
+        assert_eq!((r["placed"].as_array().map_or(0, Vec::len), r["unfilled"].clone()), (1, json!([])), "{axis:?}: {r}");
+    }
+}
+
+#[test]
 fn the_head_can_go_on_the_end_face_or_a_body_or_per_stack() {
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 2, "corner": [0, 0, 0], "operation": "new", "body_name": "Lower"}));

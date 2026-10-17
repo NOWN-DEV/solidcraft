@@ -43,6 +43,29 @@ pub fn hole_walls(b: &Body, mesh: &Mesh) -> Vec<HoleWall> {
     if b.mesh.is_some() || nf == 0 || nf > MAX_FACES {
         return Vec::new();
     }
+    let key = std::sync::Arc::downgrade(&b.solid);
+    if let Ok(cache) = WALLS.lock()
+        && let Some((_, hit)) = cache.iter().find(|(k, _)| k.ptr_eq(&key))
+    {
+        return hit.clone();
+    }
+    let walls = find(b, mesh, nf);
+    if let Ok(mut cache) = WALLS.lock() {
+        cache.retain(|(k, _)| k.strong_count() > 0);
+        cache.insert(0, (key, walls.clone()));
+        cache.truncate(KEEP_WALLS);
+    }
+    walls
+}
+
+/// The walls of the last bodies looked at, by solid: finding the stacks again (to fill them, or
+/// after a part is placed) does not classify every body's faces again.
+static WALLS: std::sync::Mutex<Vec<(std::sync::Weak<crate::body::Solid>, Vec<HoleWall>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Bodies whose walls are kept.
+const KEEP_WALLS: usize = 1024;
+
+fn find(b: &Body, mesh: &Mesh, nf: usize) -> Vec<HoleWall> {
     let tol = (b.size() * 1e-4).max(1e-6);
     let surfs = classify_faces(b, mesh, nf, tol);
     // Group the faces that lie on one cylinder.

@@ -222,6 +222,9 @@ pub struct Session {
     pub revision: u64,
     /// Project a face's edges into a sketch created on it (Fusion's default; `sketch.auto_project`).
     pub auto_project: bool,
+    /// Leave the joints unsolved when the model is refreshed, while a command that builds
+    /// several parts solves them once at the end (`parts.fasten`).
+    pub(crate) defer_joints: bool,
     /// The component new sketches and features go into (0 = the root).
     pub active_component: u64,
     /// The placement used when authoring shared component geometry.
@@ -363,6 +366,7 @@ impl Session {
             log: Vec::new(),
             revision: 1,
             auto_project: true,
+            defer_joints: false,
             active_component: 0,
             active_occurrence_path: None,
             pending_moves: Default::default(),
@@ -582,7 +586,7 @@ impl Session {
         self.revision += 1;
         self.prune_occurrence_state();
         // Joints follow the geometry their origins snap to.
-        if !self.doc.assembly.joints.is_empty() {
+        if !self.defer_joints && !self.doc.assembly.joints.is_empty() {
             cmd::joints::resolve(self);
         }
         if let Some(id) = self.active_sketch
@@ -694,6 +698,10 @@ impl Session {
             None => (spec.run)(self, params).map(|v| (v, None)),
         }));
         drop(scope);
+        if outermost {
+            // A command that deferred the joints and panicked leaves them solved again.
+            self.defer_joints = false;
+        }
         let r = match r {
             Ok(r) => r,
             Err(p) => {
@@ -835,6 +843,7 @@ impl Session {
             log: Vec::new(),
             revision: self.revision,
             auto_project: self.auto_project,
+            defer_joints: false,
             active_component: self.active_component,
             active_occurrence_path: self.active_occurrence_path.clone(),
             pending_moves: self.pending_moves.clone(),

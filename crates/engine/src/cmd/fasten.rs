@@ -359,17 +359,39 @@ fn host(s: &Session, body: &str, at: Vec3) -> Option<u64> {
 
 /// The face of `layer` at `at`, found before anything is placed in the stack (so a part already
 /// in the hole is not taken for its wall). The joint takes the hole by a point on its wall just
-/// in from the face, on the stack's own axis, whatever way the axis points.
+/// in from the face, on the stack's own axis, whatever way the axis points; where that point
+/// gives no origin on this face, other points round the hole are tried.
 fn face(s: &Session, at: Vec3, out: Vec3, layer: &Layer, cmd: &str) -> std::result::Result<Face, String> {
     if layer.slot.is_some() {
         return Ok(Face { at, out, hole: None });
     }
     let inset = ((layer.t1 - layer.t0) * 0.25).clamp(1e-3, 0.5);
-    let wall = at + across(out) * (layer.d / 2.0) - out * inset;
-    let occ = host(s, &layer.body, wall).ok_or_else(|| format!("no body `{}` to seat on", layer.body))?;
-    let origin = joints::origin(s, &json!({"occurrence": occ, "circle": wall}), cmd)
-        .map_err(|e| format!("no hole wall of `{}` to seat on at {:?}: {e}", layer.body, super::hole_stacks::round3(wall)))?;
-    Ok(Face { at, out, hole: Some(origin) })
+    let (u, v) = (across(out), out.cross(across(out)));
+    // Off the face by less than a quarter of the layer (the stack's axis is the layers' mean).
+    let near = ((layer.t1 - layer.t0) * 0.25).max(0.15);
+    let mut why = String::new();
+    // The point a quarter turn round from the first may lie on the seam between two faces of
+    // the wall (a cut cylinder's halves), or the wall's name may also fit the coaxial wall of a
+    // touching body: an origin that does not come out on this face is passed over.
+    for k in 0..8 {
+        let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
+        let wall = at + (u * a.cos() + v * a.sin()) * (layer.d / 2.0) - out * inset;
+        let Some(occ) = host(s, &layer.body, wall) else {
+            return Err(format!("no body `{}` to seat on", layer.body));
+        };
+        let found = joints::origin(s, &json!({"occurrence": occ, "circle": wall}), cmd).map_err(|e| e.to_string()).and_then(|origin| {
+            let frame = solidcraft_doc::joints::resolve_origin(&s.doc, &s.model.state(), &origin).map_err(|e| e.to_string())?;
+            let world =
+                solidcraft_doc::apply_point(&solidcraft_doc::joints::occurrence_world(&s.doc, occ), Vec3::new(frame[3][0], frame[3][1], frame[3][2]));
+            if world.dist(at) <= near { Ok(origin) } else { Err(format!("the wall there seats at {:?}", super::hole_stacks::round3(world))) }
+        });
+        match found {
+            Ok(origin) => return Ok(Face { at, out, hole: Some(origin) }),
+            Err(e) if why.is_empty() => why = format!("no hole wall of `{}` to seat on at {:?}: {e}", layer.body, super::hole_stacks::round3(wall)),
+            Err(_) => {}
+        }
+    }
+    Err(why)
 }
 
 /// Its placement with +z along `out` at `at`.
@@ -450,7 +472,11 @@ fn fasten(s: &mut Session, p: &Value) -> Result<Value> {
     // The commands it runs push their own undo steps: drop them, so the whole fill (or a
     // failed one, which leaves the design as it was) is the one step `Session::execute` keeps.
     let depth = s.undo.len();
+    // The parts it builds would solve every joint of the design on each of their commands:
+    // the joints are solved once, at the end.
+    let deferred = std::mem::replace(&mut s.defer_joints, true);
     let r = fill(s, p);
+    s.defer_joints = deferred;
     s.undo.truncate(depth);
     r
 }
@@ -536,9 +562,6 @@ fn fill(s: &mut Session, p: &Value) -> Result<Value> {
             v["washers"] = json!(washers);
         }
         placed.push(v);
-    }
-    if !f.dry_run && !placed.is_empty() {
-        joints::resolve(s);
     }
     let mut out = json!({"placed": placed, "unfilled": unfilled});
     if f.dry_run {
