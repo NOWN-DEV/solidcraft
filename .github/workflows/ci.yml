@@ -12,6 +12,8 @@ name: CI
 
 on:
   pull_request:
+  # The merge queue: each queued group runs the full suite before it lands on main.
+  merge_group:
   push:
     branches: [main]
   schedule:
@@ -51,7 +53,7 @@ jobs:
 
   changes:
     name: Select checks
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     outputs:
       native: ${{ steps.paths.outputs.native }}
       kernel: ${{ steps.paths.outputs.kernel }}
@@ -103,7 +105,7 @@ jobs:
 
   checks:
     name: Format and repository checks
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,7 +134,12 @@ jobs:
     name: Native Linux Clippy
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    # Main and merge-queue runs use the self-hosted runner (warm build cache); pull requests
+    # stay on GitHub's runners, and the runner itself refuses pull-request jobs.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
+    env:
+      # Outside the checkout, so `git clean` keeps the warm build between runs.
+      CARGO_TARGET_DIR: ${{ github.event_name == 'pull_request' && 'target' || '/home/ci-runner/cargo-target/clippy' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -156,9 +163,13 @@ jobs:
     name: Build tests
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    # Main and merge-queue runs use the self-hosted runner (warm build cache); pull requests
+    # stay on GitHub's runners, and the runner itself refuses pull-request jobs.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     timeout-minutes: 45
     env:
+      # Outside the checkout, so `git clean` keeps the warm build between runs.
+      CARGO_TARGET_DIR: ${{ github.event_name == 'pull_request' && 'target' || '/home/ci-runner/cargo-target/build-tests' }}
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -198,7 +209,7 @@ jobs:
   tests:
     name: Native Linux tests (${{ matrix.shard }}/4)
     needs: [changes, build-tests]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -213,6 +224,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install a software Vulkan driver (lavapipe)
+        # Preinstalled on the self-hosted runner, which has no sudo.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
@@ -352,9 +365,13 @@ jobs:
     name: Doc tests
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    # Main and merge-queue runs use the self-hosted runner (warm build cache); pull requests
+    # stay on GitHub's runners, and the runner itself refuses pull-request jobs.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     timeout-minutes: 45
     env:
+      # Outside the checkout, so `git clean` keeps the warm build between runs.
+      CARGO_TARGET_DIR: ${{ github.event_name == 'pull_request' && 'target' || '/home/ci-runner/cargo-target/doc-tests' }}
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -376,7 +393,7 @@ jobs:
     name: Reference tests
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
@@ -463,7 +480,7 @@ jobs:
   ci:
     needs: [changes, checks, clippy, build-tests, tests, doc-tests, oracle, windows-fxc, windows-startup]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'self-hosted-fast' }}
     steps:
       - name: Verify required checks
         env:
