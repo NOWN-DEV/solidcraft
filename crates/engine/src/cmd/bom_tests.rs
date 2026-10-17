@@ -265,3 +265,13 @@ fn changing_part_properties_does_not_evaluate_the_model_again() {
     run(&mut s, "occurrence.copy", json!({"component": 1, "translate": [0, 40, 0]}));
     assert!(s.evaluations > 0);
 }
+
+#[test]
+fn body_owners_match_each_bodys_component() {
+    for s in [assembly(), bolts()] {
+        let st = s.model.state();
+        let each: std::collections::HashSet<u64> = st.bodies.iter().map(|b| s.doc.model_body_component(b)).collect();
+        assert_eq!(s.doc.body_owners(&st), each);
+        assert!(each.len() > 1);
+    }
+}

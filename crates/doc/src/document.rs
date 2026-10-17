@@ -2621,6 +2621,23 @@ impl Document {
         if body.transferred || body.source_name.is_some() { body.component } else { self.legacy_body_component(&body.name, body.feature) }
     }
 
+    /// The components that own a body in `state` ([`Document::model_body_component`] of each),
+    /// in one pass: the timeline is looked up once, not once per body.
+    pub fn body_owners(&self, state: &crate::ModelState) -> std::collections::HashSet<u64> {
+        let features: std::collections::HashMap<u64, u64> = self.features.iter().rev().map(|f| (f.id, f.component)).collect();
+        state
+            .bodies
+            .iter()
+            .map(|b| {
+                if b.transferred || b.source_name.is_some() {
+                    b.component
+                } else {
+                    self.body_components.get(&b.name).copied().unwrap_or_else(|| features.get(&b.feature).copied().unwrap_or(0))
+                }
+            })
+            .collect()
+    }
+
     /// Recorded transfers already converted geometry into the new local frame.
     pub fn model_body_offset(&self, body: &crate::ModelBody) -> Option<&crate::Mat> {
         if body.transferred { None } else { self.body_offsets.get(&body.name) }

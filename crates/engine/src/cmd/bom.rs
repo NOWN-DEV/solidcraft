@@ -5,7 +5,7 @@
 //! them as rows, optionally written to a CSV or JSON file. With `group_children`, a part with a
 //! part number keeps the parts placed inside it (a bolt's washers and nut) in its own row.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{Map, Value, json};
 use solidcraft_doc::metadata::{DESCRIPTION, MAX_KEYS, MAX_TEXT_BYTES, PART_NUMBER, REVISION, WELL_KNOWN};
@@ -213,9 +213,25 @@ fn options(p: &Value, cmd: &str) -> Result<Options> {
     Ok(Options { levels, group, fold })
 }
 
-/// A component with a part number: with `group_children`, one row however much is inside it.
-fn numbered(s: &Session, id: u64) -> bool {
-    s.doc.components.iter().any(|c| c.id == id && c.metadata.part_number().is_some_and(|n| !n.is_empty()))
+/// The design's structure, looked up once per bill of materials.
+struct Index {
+    /// What each component places (by its id; 0 is the root).
+    children: BTreeMap<u64, Vec<u64>>,
+    /// Components with bodies of their own.
+    owners: HashSet<u64>,
+    /// Components with a part number: with `group_children`, one row however much is inside.
+    numbered: HashSet<u64>,
+}
+
+impl Index {
+    fn new(s: &Session) -> Index {
+        let mut children: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for o in &s.doc.occurrences {
+            children.entry(o.parent).or_default().push(o.component);
+        }
+        let numbered = s.doc.components.iter().filter(|c| c.metadata.part_number().is_some_and(|n| !n.is_empty())).map(|c| c.id).collect();
+        Index { children, owners: s.doc.body_owners(&s.model.state()), numbered }
+    }
 }
 
 fn group_key(g: &str, cmd: &str) -> Result<Group> {
@@ -229,22 +245,18 @@ fn group_key(g: &str, cmd: &str) -> Result<Group> {
 /// How many times each component is placed below `root`: in `Top`, its direct children; in
 /// `Flat`, every placement at any depth (a part in a subassembly placed twice counts twice),
 /// not below a numbered part when `fold`.
-fn counts(s: &Session, root: u64, levels: Levels, fold: bool, cmd: &str) -> Result<BTreeMap<u64, u64>> {
-    let mut children: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for o in &s.doc.occurrences {
-        children.entry(o.parent).or_default().push(o.component);
-    }
+fn counts(ix: &Index, root: u64, levels: Levels, fold: bool, cmd: &str) -> Result<BTreeMap<u64, u64>> {
     let mut out: BTreeMap<u64, u64> = BTreeMap::new();
     let mut placed = 0usize;
     let mut stack: Vec<(u64, usize)> = vec![(root, 0)];
     while let Some((comp, depth)) = stack.pop() {
-        for child in children.get(&comp).into_iter().flatten() {
+        for child in ix.children.get(&comp).into_iter().flatten() {
             placed += 1;
             if depth >= MAX_DEPTH || placed > MAX_PLACEMENTS {
                 return Err(bad(cmd, format!("the assembly is deeper than {MAX_DEPTH} levels or has more than {MAX_PLACEMENTS} placements")));
             }
             *out.entry(*child).or_default() += 1;
-            if levels == Levels::Flat && !(fold && numbered(s, *child)) {
+            if levels == Levels::Flat && !(fold && ix.numbered.contains(child)) {
                 stack.push((*child, depth + 1));
             }
         }
@@ -252,8 +264,7 @@ fn counts(s: &Session, root: u64, levels: Levels, fold: bool, cmd: &str) -> Resu
     if levels == Levels::Flat {
         // Parts only: a subassembly is listed through its parts, unless it has bodies of its own
         // (or, folding, a part number).
-        let st = s.model.state();
-        out.retain(|c, _| !children.contains_key(c) || (fold && numbered(s, *c)) || st.bodies.iter().any(|b| s.doc.model_body_component(b) == *c));
+        out.retain(|c, _| !ix.children.contains_key(c) || (fold && ix.numbered.contains(c)) || ix.owners.contains(c));
     }
     Ok(out)
 }
@@ -344,12 +355,13 @@ fn bom(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "assembly.bom";
     let root = if p.get("component").is_some_and(|v| !v.is_null()) { component_id(s, p, cmd)? } else { 0 };
     let o = options(p, cmd)?;
-    let counts = counts(s, root, o.levels, o.fold, cmd)?;
+    let ix = Index::new(s);
+    let counts = counts(&ix, root, o.levels, o.fold, cmd)?;
     // Folding: what one of each numbered part holds, as parts at any depth.
     let mut kits: BTreeMap<u64, BTreeMap<u64, u64>> = BTreeMap::new();
     if o.fold {
-        for id in counts.keys().filter(|id| numbered(s, **id)) {
-            let kit = self::counts(s, *id, Levels::Flat, false, cmd)?;
+        for id in counts.keys().filter(|id| ix.numbered.contains(id)) {
+            let kit = self::counts(&ix, *id, Levels::Flat, false, cmd)?;
             if !kit.is_empty() {
                 kits.insert(*id, kit);
             }
