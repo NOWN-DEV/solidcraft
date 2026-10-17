@@ -298,7 +298,14 @@ fn measure_pair(
                             ));
                             return out;
                         }
-                        Ok(m) => out.overlap = Some((m.volume, m.area, m.bbox, m.centroid)),
+                        Ok(m) => {
+                            let (wa, wb) = (ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body));
+                            if let Some(reason) = union_disagrees(wa, wb, m.volume, region.center()) {
+                                out.unchecked = Some(reason);
+                                return out;
+                            }
+                            out.overlap = Some((m.volume, m.area, m.bbox, m.centroid));
+                        }
                         Err(e) => {
                             out.unchecked = Some(e.to_string());
                             return out;
@@ -373,6 +380,22 @@ fn measure_near_origin(body: &solidcraft_kernel::Body, at: solidcraft_geom::Vec3
     m.centroid += at;
     m.bbox = Aabb3 { min: m.bbox.min + at, max: m.bbox.max + at };
     Ok(m)
+}
+
+/// Does the shared volume of `a` and `b` disagree with the one their union implies,
+/// vol(a) + vol(b) − vol(a ∪ b), by more than 1 %? The intersection can come out well formed and
+/// still wrong (a mirrored pair read three times its volume). `None` when they agree, or when the
+/// union gives no answer to compare with.
+fn union_disagrees(a: &solidcraft_kernel::Body, b: &solidcraft_kernel::Body, shared: f64, at: solidcraft_geom::Vec3) -> Option<String> {
+    let (union, report) = solidcraft_kernel::capture_boolean_diagnostics(|| solidcraft_kernel::boolean(a, b, solidcraft_kernel::BoolOp::Union));
+    let union = union.ok().flatten().filter(|_| report.unverified().is_none())?;
+    let volume = |x: &solidcraft_kernel::Body| measure_near_origin(x, at).ok().map(|m| m.volume).filter(|v| v.is_finite());
+    let (va, vb, vu) = (volume(a)?, volume(b)?, volume(&union)?);
+    let implied = va + vb - vu;
+    // The bodies' own volumes carry their measuring error into the difference.
+    let allowed = 0.01 * shared.max(implied.abs()) + 1e-5 * (va + vb);
+    ((implied - shared).abs() > allowed)
+        .then(|| format!("the shared part measures {shared:.4} mm³ but the bodies and their union imply {implied:.4} mm³, so neither is reported"))
 }
 
 /// Is a measured shared part well formed? A part whose shell came out inside out or open can

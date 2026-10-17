@@ -251,3 +251,15 @@ fn a_small_gap_past_a_corner_is_not_contact() {
         assert!((f(&r["nearest"][a][0]["distance_mm"]) - want).abs() < 1e-9, "{a} {b}: {r}");
     }
 }
+
+/// The shared volume is checked against the bodies and their union: two 10 mm cubes sharing a
+/// 1 mm³ corner agree at 1, and a shared part read as 3 mm³ (as a mirrored pair once was) does not.
+#[test]
+fn a_shared_volume_the_union_contradicts_is_caught() {
+    use solidcraft_geom::Vec3;
+    let a = solidcraft_kernel::box_solid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 10.0, 10.0)).unwrap_or_else(|e| panic!("{e}"));
+    let b = solidcraft_kernel::box_solid(Vec3::new(9.0, 9.0, 9.0), Vec3::new(19.0, 19.0, 19.0)).unwrap_or_else(|e| panic!("{e}"));
+    let at = Vec3::new(9.5, 9.5, 9.5);
+    assert_eq!(super::union_disagrees(&a, &b, 1.0, at), None);
+    assert!(super::union_disagrees(&a, &b, 3.0, at).is_some());
+}
