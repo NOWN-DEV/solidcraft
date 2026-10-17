@@ -127,6 +127,11 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     if pairs.is_empty() {
         return None;
     }
+    // A pin's face flush against the other body (a rivet's head on the sheet) touches it over
+    // an area, which the boolean cannot always take: it is pulled back off it by a little.
+    // Only material outside the other body goes, so the overlap is the same.
+    let (fa, fb) = (flush(a, b, same), flush(b, a, same));
+    let back = pairs.iter().map(|p| p.step).fold(f64::INFINITY, f64::min) * 0.05;
     // A pin's faces move together: one step for each of them (the pin's walls do not repeat
     // across pairs unless one pin is near two holes, which the check below then answers).
     let shared_at = |k: f64| -> Option<(f64, Option<Body>)> {
@@ -135,7 +140,12 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
             if mine.is_empty() {
                 return Some(body.clone());
             }
-            let shift = |i: usize, _| mine.iter().find(|p| p.pin.faces.contains(&i)).map(|p| p.step * k).unwrap_or(0.0);
+            let flush = if in_a { &fa } else { &fb };
+            let shift = |i: usize, _| match mine.iter().find(|p| p.pin.faces.contains(&i)) {
+                Some(p) => p.step * k,
+                None if flush.contains(&i) => -back,
+                None => 0.0,
+            };
             let m = crate::offset::offset_body(body, shift).ok()?;
             m.validity().is_empty().then_some(m)
         };
@@ -213,6 +223,25 @@ fn near(pin: &Wall, hole: &Wall, same: f64) -> Option<(Vec3, f64)> {
     }
     let toward = across.normalized().unwrap_or_else(|| pin.axis.any_perp());
     Some((toward, offset))
+}
+
+/// The planar faces of `x` on a plane of `y`'s facing the other way: where the two may touch
+/// flat.
+fn flush(x: &Body, y: &Body, same: f64) -> Vec<usize> {
+    let planes = |b: &Body| -> Vec<(usize, Vec3, Vec3)> {
+        (0..b.face_count())
+            .filter_map(|i| match crate::face_surface(b, i)? {
+                FaceSurface::Plane { normal, point } => Some((i, normal, point)),
+                _ => None,
+            })
+            .collect()
+    };
+    let theirs = planes(y);
+    planes(x)
+        .into_iter()
+        .filter(|(_, n, p)| theirs.iter().any(|(_, m, q)| n.dot(*m) < -1.0 + 1e-9 && (*q - *p).dot(*n).abs() <= same))
+        .map(|(i, _, _)| i)
+        .collect()
 }
 
 /// The body's cylindrical faces, each as a wall of its own with no side or extent yet.
@@ -463,5 +492,34 @@ mod tests {
         let (v0, v1) = (crate::measure(&bush).unwrap().volume, crate::measure(&split).unwrap().volume);
         assert!((v0 - v1).abs() < 1e-6 * v0, "{v0} {v1}");
         assert!(crate::step_in::split::split_seams(&outer).is_none());
+    }
+
+    /// Two rivets with their heads flush on both faces of a sheet, each a hair off its hole,
+    /// read back from STEP: the heads touch the sheet flat, which the boolean cannot always
+    /// take, so they are pulled back off it first. Each rivet shares its own crescent.
+    #[test]
+    fn two_rivets_flush_on_a_sheet_after_a_step_round_trip() {
+        let rivet = |x: f64| {
+            let shank = crate::cylinder(Vec3::new(x, 0.0, -1.0), Vec3::Z, 2.0, 3.5).unwrap();
+            let under = crate::cylinder(Vec3::new(x, 0.0, -1.0), Vec3::Z, 3.5, 1.0).unwrap();
+            let over = crate::cylinder(Vec3::new(x, 0.0, 1.5), Vec3::Z, 3.5, 1.0).unwrap();
+            let r = crate::boolean(&shank, &under, BoolOp::Union).unwrap().unwrap();
+            crate::boolean(&r, &over, BoolOp::Union).unwrap().unwrap()
+        };
+        let mut sheet = crate::box_solid(Vec3::new(-20.0, -10.0, 0.0), Vec3::new(20.0, 10.0, 1.5)).unwrap();
+        for x in [-4.0, 4.0] {
+            let drill = crate::cylinder(Vec3::new(x, 0.0, -1.0), Vec3::Z, 2.0, 4.0).unwrap();
+            sheet = crate::boolean(&sheet, &drill, BoolOp::Cut).unwrap().unwrap();
+        }
+        let back = |b: &Body| crate::step_import(&crate::step_export(&[b], "round trip").unwrap()).unwrap().bodies.remove(0).body;
+        let sheet = back(&sheet);
+        for (x, e) in [(-4.0, 0.004), (4.0, 0.006)] {
+            let r = back(&rivet(x + e));
+            let want = 1.5 * crescent(2.0, 2.0, e).area;
+            for (p, q) in [(&sheet, &r), (&r, &sheet)] {
+                let o = coaxial_overlap(p, q).unwrap();
+                assert!((o.volume - want).abs() < 1e-6 * want, "{o:?} {want}");
+            }
+        }
     }
 }
