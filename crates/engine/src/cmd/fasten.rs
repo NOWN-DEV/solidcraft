@@ -25,8 +25,9 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("parts.fasten", "Fill H
      two pitches with a nut) | \"thread\" (a screw into a tapped far layer: sized to pass the other layers, the shortest length at least their grip plus engagement?: mm, \
      default 1.5 × d); head_side?: start | end | {body} (default start: the head on the stack's start face; {body}: on the face of that body's layer); \
      washer?: true | family | {family, size?}; washer_side?: head | nut | both (default both with a nut, else head); \
-     nut?: true | family | {family, size?} (on the far face; true: the built-in hex_nut and washer); dry_run?: bool (only work out what goes where) \
-     → placed: [{component, occurrence, joint, stack, head_side, size, length_mm, grip_mm, grip_range?, article?, part, washers?: [occurrence], nut?: occurrence}], \
+     nut?: true | family | {family, size?} (on the far face; true: the built-in hex_nut and washer); \
+     drawn?: \"set\" | \"unset\" (blind rivets; default set: the shank as long as the grip, with its formed tail beyond the far face); dry_run?: bool (only work out what goes where) \
+     → placed: [{component, occurrence, joint, stack, head_side, size, length_mm, grip_mm, grip_range?, article?, drawn?, part, washers?: [occurrence], nut?: occurrence}], \
      unfilled: [{stack, reason}]. Each distinct part is one component, placed as occurrences. One undo step",
 )];
 
@@ -190,6 +191,8 @@ struct Fill {
     /// A washer under the head, and one under the nut.
     washer: (Option<Companion>, Option<Companion>),
     nut: Option<Companion>,
+    /// Blind rivets drawn set on their stack's grip.
+    set: bool,
     dry_run: bool,
 }
 
@@ -239,16 +242,26 @@ impl Fill {
             None | Some(Value::Null) => false,
             Some(_) => bool_(p, "dry_run").ok_or_else(|| bad(cmd, "`dry_run` must be true or false"))?,
         };
-        Ok(Self { family, size, rule, head_side, washer, nut, dry_run })
+        let rivet = parts::blind_rivet(s, &family);
+        let set = match str_(p, "drawn") {
+            None => rivet,
+            Some("unset") => false,
+            Some("set") if rivet => true,
+            Some("set") => return Err(bad(cmd, "`drawn: set` is for blind rivets")),
+            Some(d) => return Err(bad(cmd, format!("`drawn` must be set or unset, not `{d}`"))),
+        };
+        Ok(Self { family, size, rule, head_side, washer, nut, set, dry_run })
     }
 }
 
-/// A part to place: family, size and length (none for a nut or washer).
+/// A part to place: family, size and length (none for a nut or washer), and the grip a blind
+/// rivet is drawn set on.
 #[derive(Clone, Debug, PartialEq)]
 struct Part {
     family: String,
     size: String,
     length: Option<f64>,
+    set: Option<f64>,
 }
 
 /// What to place in one stack, worked out before anything is built.
@@ -260,6 +273,8 @@ struct Plan {
     head_washer: Option<(Part, f64)>,
     nut_washer: Option<(Part, f64)>,
     nut: Option<(Part, f64)>,
+    /// The grip a blind rivet is drawn set on (the stack's and its washers').
+    set: Option<f64>,
 }
 
 /// Size and length for a stack whose head goes on `head` (the far layer is `far`).
@@ -299,7 +314,7 @@ fn plan(s: &Session, st: &Stack, far: &Layer, f: &Fill) -> std::result::Result<P
                 Some(c) => {
                     let z = c.size.clone().unwrap_or_else(|| name.clone());
                     let h = parts::thickness(s, &c.family, &z)?;
-                    Ok(Some((Part { family: c.family.clone(), size: z, length: None }, h)))
+                    Ok(Some((Part { family: c.family.clone(), size: z, length: None, set: None }, h)))
                 }
             }
         };
@@ -320,7 +335,17 @@ fn plan(s: &Session, st: &Stack, far: &Layer, f: &Fill) -> std::result::Result<P
         };
         match parts::length_for(s, family, name, clamp, extra, matches!(f.rule, Rule::Grip)) {
             Ok(c) => {
-                return Ok(Plan { size: name.clone(), length: c.length, grip: c.grip, article: c.article, head_washer: hw, nut_washer: nw, nut: n });
+                let set = f.set.then(|| super::hole_stacks::round(clamp));
+                return Ok(Plan {
+                    size: name.clone(),
+                    length: c.length,
+                    grip: c.grip,
+                    article: c.article,
+                    head_washer: hw,
+                    nut_washer: nw,
+                    nut: n,
+                    set,
+                });
             }
             Err(e) => why = e,
         }
@@ -426,12 +451,16 @@ impl Built {
         let i = match self.parts.iter().position(|(p, ..)| p == part) {
             Some(i) => i,
             None => {
-                let (comp, fresh) = match parts::existing_part(s, &part.family, &part.size, part.length) {
+                let (comp, fresh) = match parts::existing_part(s, &part.family, &part.size, part.length, part.set) {
                     Some(c) => (c, None),
                     None => {
                         let mut p = json!({"family": part.family, "size": part.size});
                         if let Some(l) = part.length {
                             p["length"] = json!(l);
+                        }
+                        if let Some(g) = part.set {
+                            p["drawn"] = json!("set");
+                            p["grip"] = json!(g);
                         }
                         let r = parts::insert_part(s, &p)?;
                         (r["component"].as_u64().unwrap_or(0), r["occurrence"].as_u64())
@@ -533,6 +562,9 @@ fn fill(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(a) = &plan.article {
             v["article"] = json!(a);
         }
+        if plan.set.is_some() {
+            v["drawn"] = json!("set");
+        }
         if f.dry_run {
             placed.push(v);
             continue;
@@ -543,7 +575,7 @@ fn fill(s: &mut Session, p: &Value) -> Result<Value> {
             washers.push(built.place(s, w, &job.head, 0.0)?.0);
             under_head = *h;
         }
-        let fastener = Part { family: f.family.clone(), size: plan.size.clone(), length: Some(plan.length) };
+        let fastener = Part { family: f.family.clone(), size: plan.size.clone(), length: Some(plan.length), set: plan.set };
         let (occ, joint) = built.place(s, &fastener, &job.head, under_head)?;
         let mut under_nut = 0.0;
         if let Some((w, h)) = &plan.nut_washer {

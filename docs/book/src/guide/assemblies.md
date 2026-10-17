@@ -273,10 +273,15 @@ narrowest hole and has a length for its grip.
 - **Head side.** The head goes on the stack's `start` face; `head_side: "end"` puts it on the
   other one and `{"body": "Base"}` on the face of that body's layer. A stack in `stacks` can
   carry its own: `{"index": 3, "head_side": "end"}`, or `head_side` in a stack object.
+- **Set rivets.** A library family of blind rivets is drawn set: the shank ends at the far face
+  of the stack and the tail it forms (a disc 1.5 × the diameter across) sits beyond it, so the
+  rivet does not reach into what lies behind the stack. `drawn: "unset"` draws the full length.
+  Rivets set on different grips are different parts. `parts.insert` takes `drawn: "set"` with the
+  `grip` as well.
 - **Dry run.** `dry_run: true` returns what would go where (size, length, grip, article) and
   places nothing.
 
-Each distinct part (family, size and length) is one component, built once and placed as an
+Each distinct part (family, size, length and, for a set rivet, grip) is one component, built once and placed as an
 occurrence in every stack that takes it, held by a rigid joint on the hole it sits on, so it
 follows the hole when the design changes; the joints are solved once, when all are placed. A
 stack through a slot on the head's side is placed without a joint. The result lists `placed`

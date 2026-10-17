@@ -44,11 +44,25 @@ fn occ(v: &Value) -> u64 {
 struct Library(std::path::PathBuf);
 
 impl Library {
-    fn bolts() -> Self {
+    fn new(lib: &Value) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path =
             solidcraft_io::vfs::temp_dir().join(format!("solidcraft-fasten-{}-{}.json", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::write(&path, lib.to_string()).unwrap_or_else(|e| panic!("{e}"));
+        Library(path)
+    }
+
+    /// Blind rivets 4.8 across, 8, 10 and 12 long for grips 1–3.5, 3.5–5.5 and 5.5–7.5.
+    fn rivets() -> Self {
+        let lengths = json!([{"length": 8, "grip": [1, 3.5]}, {"length": 10, "grip": [3.5, 5.5]}, {"length": 12, "grip": [5.5, 7.5]}]);
+        Self::new(&json!({"format": "solidcraft-parts/1", "id": "example.rivets", "name": "Example rivets", "families": [
+            {"kind": "fastener_family", "name": "rivet_grip", "label": "Rivet", "shape": "blind_rivet",
+             "sizes": [{"size": "4.8", "d": 4.8, "head": {"d": 9.6, "h": 1.5, "style": "dome"}, "lengths": lengths}]}
+        ]}))
+    }
+
+    fn bolts() -> Self {
         let size = |size: &str, d: f64, head: f64| {
             json!({"size": size, "d": d, "head": {"d": head, "h": d * 0.7, "style": "hex"},
                    "lengths": [{"length": 10, "grip": [0, 5]}, {"length": 14, "grip": [5, 9], "article": format!("EX-{size}-14")}, {"length": 18, "grip": [9, 13]}]})
@@ -57,9 +71,9 @@ impl Library {
             {"kind": "fastener_family", "name": "hex_bolt_grip", "label": "Bolt", "shape": "bolt",
              "sizes": [size("M4", 4.0, 7.0), size("M5", 5.0, 8.0), size("M6", 6.0, 10.0)]}
         ]});
-        std::fs::write(&path, lib.to_string()).unwrap_or_else(|e| panic!("{e}"));
-        Library(path)
+        Self::new(&lib)
     }
+
     fn path(&self) -> String {
         self.0.to_string_lossy().into_owned()
     }
@@ -103,6 +117,45 @@ fn an_m5_bolt_is_chosen_by_the_hole_and_the_grip() {
     // Undo takes all of it away.
     run(&mut s, "edit.undo", json!({}));
     assert!(s.doc.parts.is_empty());
+}
+
+#[test]
+fn a_placed_blind_rivet_is_drawn_set_on_its_grip() {
+    let lib = Library::rivets();
+    let mut s = Session::default();
+    run(&mut s, "parts.library.load", json!({"path": lib.path()}));
+    run(&mut s, "solid.box", json!({"length": 60, "width": 30, "height": 3, "corner": [0, 0, 0], "operation": "new", "body_name": "Lower"}));
+    run(&mut s, "solid.box", json!({"length": 60, "width": 30, "height": 4, "corner": [0, 0, 3], "operation": "new", "body_name": "Upper"}));
+    run(&mut s, "solid.hole", json!({"position": [15, 15, 7], "diameter": 5.0}));
+    // A second stack where the upper plate is thinned to 2.
+    run(&mut s, "solid.box", json!({"length": 20, "width": 30, "height": 2, "corner": [35, 0, 5], "operation": "cut", "targets": ["Upper"]}));
+    run(&mut s, "solid.hole", json!({"position": [45, 15, 5], "diameter": 5.0}));
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_grip"}));
+    let placed = r["placed"].as_array().cloned().unwrap_or_default();
+    assert_eq!((placed.len(), r["unfilled"].clone()), (2, json!([])), "{r}");
+    // Grip 7 takes the 12 long rivet, grip 5 the 10; each is drawn set: its shank ends at the far
+    // face, with a tail 1.5 d across and d / 2 high beyond it (unset, the shank would reach 12
+    // or 10 below the head).
+    for (p, top, grip, length) in [(&placed[0], 7.0, 7.0, 12.0), (&placed[1], 5.0, 5.0, 10.0)] {
+        assert_eq!((p["length_mm"].as_f64(), p["drawn"].as_str()), (Some(length), Some("set")), "{p}");
+        let (lo, hi) = bbox(&s, occ(&p["occurrence"]));
+        assert!(near(hi.z, top + 1.5) && near(lo.z, top - grip - 2.4), "{p}: {lo:?} {hi:?}");
+        let c = s.doc.occurrences.iter().find(|o| o.id == occ(&p["occurrence"])).map_or(0, |o| o.component);
+        assert_eq!(s.doc.parts.get(&c).and_then(|x| x.set), Some(grip), "{p}");
+    }
+    assert_ne!(placed[0]["component"], placed[1]["component"], "set on different grips, different parts");
+    // Asked for unset, the shank runs its full length.
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_grip", "drawn": "unset", "stack": 0}));
+    let (lo, _) = bbox(&s, occ(&r["placed"][0]["occurrence"]));
+    assert!(near(lo.z, 7.0 - 12.0) && r["placed"][0]["drawn"].is_null(), "{r} {lo:?}");
+    // A set rivet stays set when resized, on the grip given.
+    let c = placed[0]["component"].clone();
+    run(&mut s, "parts.resize", json!({"component": c, "grip": 6}));
+    assert_eq!(s.doc.parts.get(&c.as_u64().unwrap_or(0)).map(|x| (x.length, x.set)), Some((Some(12.0), Some(6.0))));
+    for bad in [json!({"family": "hex_bolt", "drawn": "set"}), json!({"family": "rivet_grip", "drawn": "closed"})] {
+        assert!(s.execute("parts.fasten", &bad).is_err(), "{bad}");
+    }
+    assert!(s.execute("parts.insert", &json!({"family": "rivet_grip", "size": "4.8", "drawn": "set"})).is_err(), "set needs a grip");
 }
 
 #[test]

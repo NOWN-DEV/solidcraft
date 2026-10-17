@@ -650,8 +650,8 @@ type Surfaces = std::sync::Arc<(Mesh, Vec<Surf>)>;
 /// cylinder again on every joint solve, and seating many parts finds many on one body.
 static SURFACES: std::sync::Mutex<Vec<(std::sync::Weak<crate::body::Solid>, Surfaces)>> = std::sync::Mutex::new(Vec::new());
 
-/// Bodies whose surfaces are kept.
-const KEEP_SURFACES: usize = 32;
+/// Bodies whose surfaces are kept (an assembly of a few hundred parts is looked up again and again).
+const KEEP_SURFACES: usize = 256;
 
 fn surfaces(b: &Body) -> Option<Surfaces> {
     let size = b.size();

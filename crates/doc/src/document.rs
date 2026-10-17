@@ -2261,6 +2261,10 @@ pub struct StandardPart {
     /// list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub article: Option<String>,
+    /// A blind rivet drawn set: the grip it closes on. Its shank is that long, with the tail it
+    /// forms beyond (none: drawn unset, the shank its full length).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<f64>,
 }
 
 /// A component whose contents come from another design file (Insert Design): where that file
