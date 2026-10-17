@@ -1735,13 +1735,21 @@ pub struct SketchPoints {
 
 /// A component: a node of the design tree that owns sketches, features and bodies. The root
 /// (id 0) is the design itself and is not stored.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Component {
     pub id: u64,
     pub name: String,
     /// Parent component (0 = the root).
     #[serde(default)]
     pub parent: u64,
+    /// The definition's part properties (part number, description, revision…) and other tools'
+    /// data, under the same rules as the design's own `metadata`. Every occurrence shares them;
+    /// the bill of materials reads them.
+    #[serde(default, skip_serializing_if = "crate::Metadata::is_empty")]
+    pub metadata: crate::Metadata,
+    /// Free text properties of the definition (material grade, finish, supplier…), by name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// One loft section: profiles of a sketch.
@@ -2621,7 +2629,7 @@ impl Document {
                 format!("Component{k}")
             }
         };
-        self.components.push(Component { id, name, parent });
+        self.components.push(Component { id, name, parent, ..Default::default() });
         self.add_occurrence(id, parent, crate::IDENTITY)?;
         Ok(id)
     }

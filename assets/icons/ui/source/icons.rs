@@ -1357,6 +1357,14 @@ pub(crate) fn paint_with(p: &Painter, r: Rect, name: &str, ink: Color32, fill: C
             pen.poly(&[(9.0, 10.0), (14.0, 10.0), (14.0, 16.0), (9.0, 16.0)], ic.interference, ic.interference);
             pen.closed(&[(9.0, 10.0), (21.0, 10.0), (21.0, 20.0), (9.0, 20.0)], ink);
         }
+        // Bill of materials: a list sheet, a count column in the accent.
+        "bom" => {
+            pen.poly(&[(4.0, 3.0), (20.0, 3.0), (20.0, 21.0), (4.0, 21.0)], pen.fill, ink);
+            for y in [8.0, 12.5, 17.0] {
+                pen.line(&[(7.0, y), (13.0, y)], ink);
+                pen.line(&[(15.5, y), (17.5, y)], a);
+            }
+        }
         // Sheet metal: thin plates (fill), the made or changed part in the accent.
         "flange" => {
             pen.poly(&[(2.0, 17.0), (12.0, 13.0), (18.0, 16.0), (8.0, 20.0)], pen.fill, ink);
