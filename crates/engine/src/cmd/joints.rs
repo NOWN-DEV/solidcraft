@@ -295,7 +295,13 @@ fn origin_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<JointOrigin
             let pick = local(world);
             // A circle's name is its cylindrical wall's (a rim pick also touches the end face).
             let named_at = if what == "circle" {
-                s.model.state().bodies.iter().filter_map(|b| cylinder_wall_point(&b.body, pick)).next().unwrap_or(pick)
+                s.model
+                    .state()
+                    .bodies
+                    .iter()
+                    .filter_map(|b| cylinder_wall_point(&b.body, pick))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map_or(pick, |(at, _)| at)
             } else {
                 pick
             };
@@ -1272,10 +1278,13 @@ mod reach_tests;
 mod tests;
 
 /// A point in the middle of the cylindrical face at `pick` (on its wall, halfway along).
-fn cylinder_wall_point(b: &solidcraft_doc::kernel::Body, pick: Vec3) -> Option<Vec3> {
+fn cylinder_wall_point(b: &solidcraft_doc::kernel::Body, pick: Vec3) -> Option<(Vec3, f64)> {
     let c = solidcraft_doc::kernel::cylinder_face_at(b, pick)?;
     let v = pick - c.axis_point;
     let along = v.dot(c.axis);
-    let radial = (v - c.axis * along).normalized()?;
-    Some(c.axis_point + c.axis * ((c.start + c.end) / 2.0) + radial * c.radius)
+    let radial = v - c.axis * along;
+    // How far the pick is off this wall: coaxial holes of touching bodies share a radius, and
+    // the pick lies on the wall of only one of them.
+    let off = (radial.len() - c.radius).abs() + (c.start - along).max(along - c.end).max(0.0);
+    Some((c.axis_point + c.axis * ((c.start + c.end) / 2.0) + radial.normalized()? * c.radius, off))
 }

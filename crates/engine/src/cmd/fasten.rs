@@ -384,39 +384,44 @@ fn host(s: &Session, body: &str, at: Vec3) -> Option<u64> {
 
 /// The face of `layer` at `at`, found before anything is placed in the stack (so a part already
 /// in the hole is not taken for its wall). The joint takes the hole by a point on its wall just
-/// in from the face, on the stack's own axis, whatever way the axis points; where that point
-/// gives no origin on this face, other points round the hole are tried.
+/// in from the face, on the stack's own axis, whatever way the axis points. Where that point
+/// gives no origin (it lies on the seam between the two faces of a cut cylinder), or one off
+/// this face along the axis, a few other points round the hole are tried; failing those, the
+/// first origin found is kept.
 fn face(s: &Session, at: Vec3, out: Vec3, layer: &Layer, cmd: &str) -> std::result::Result<Face, String> {
     if layer.slot.is_some() {
         return Ok(Face { at, out, hole: None });
     }
     let inset = ((layer.t1 - layer.t0) * 0.25).clamp(1e-3, 0.5);
     let (u, v) = (across(out), out.cross(across(out)));
-    // Off the face by less than a quarter of the layer (the stack's axis is the layers' mean).
+    // Along the axis, within a quarter of the layer of the face (holes in one stack may sit a
+    // little apart across it, so only the distance along it counts).
     let near = ((layer.t1 - layer.t0) * 0.25).max(0.15);
-    let mut why = String::new();
-    // The point a quarter turn round from the first may lie on the seam between two faces of
-    // the wall (a cut cylinder's halves), or the wall's name may also fit the coaxial wall of a
-    // touching body: an origin that does not come out on this face is passed over.
-    for k in 0..8 {
-        let a = f64::from(k) * std::f64::consts::FRAC_PI_4;
+    let (mut why, mut first) = (String::new(), None);
+    for k in [0.0, 1.0, 3.0, 5.0, 7.0] {
+        let a = k * std::f64::consts::FRAC_PI_4;
         let wall = at + (u * a.cos() + v * a.sin()) * (layer.d / 2.0) - out * inset;
         let Some(occ) = host(s, &layer.body, wall) else {
             return Err(format!("no body `{}` to seat on", layer.body));
         };
-        let found = joints::origin(s, &json!({"occurrence": occ, "circle": wall}), cmd).map_err(|e| e.to_string()).and_then(|origin| {
-            let frame = solidcraft_doc::joints::resolve_origin(&s.doc, &s.model.state(), &origin).map_err(|e| e.to_string())?;
-            let world =
-                solidcraft_doc::apply_point(&solidcraft_doc::joints::occurrence_world(&s.doc, occ), Vec3::new(frame[3][0], frame[3][1], frame[3][2]));
-            if world.dist(at) <= near { Ok(origin) } else { Err(format!("the wall there seats at {:?}", super::hole_stacks::round3(world))) }
-        });
-        match found {
-            Ok(origin) => return Ok(Face { at, out, hole: Some(origin) }),
+        match joints::origin(s, &json!({"occurrence": occ, "circle": wall}), cmd) {
+            Ok(origin) => {
+                let seat = solidcraft_doc::joints::resolve_origin(&s.doc, &s.model.state(), &origin).ok().map(|f| {
+                    solidcraft_doc::apply_point(
+                        &solidcraft_doc::joints::occurrence_world(&s.doc, origin.occurrence),
+                        Vec3::new(f[3][0], f[3][1], f[3][2]),
+                    )
+                });
+                if seat.is_some_and(|q| (q - at).dot(out).abs() <= near) {
+                    return Ok(Face { at, out, hole: Some(origin) });
+                }
+                first.get_or_insert(origin);
+            }
             Err(e) if why.is_empty() => why = format!("no hole wall of `{}` to seat on at {:?}: {e}", layer.body, super::hole_stacks::round3(wall)),
             Err(_) => {}
         }
     }
-    Err(why)
+    first.map(|origin| Face { at, out, hole: Some(origin) }).ok_or(why)
 }
 
 /// Its placement with +z along `out` at `at`.

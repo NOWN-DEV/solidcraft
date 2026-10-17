@@ -159,6 +159,39 @@ fn a_placed_blind_rivet_is_drawn_set_on_its_grip() {
 }
 
 #[test]
+fn a_rivet_through_sheets_whose_holes_sit_a_little_apart_is_seated_on_the_top_face() {
+    // Three 1.5 mm sheets, each its own part, with 5 mm holes up to 0.35 off one another.
+    let lib = Library::rivets();
+    let mut s = Session::default();
+    run(&mut s, "parts.library.load", json!({"path": lib.path()}));
+    for (i, (dx, dy)) in [(0.0, 0.0), (0.3, 0.0), (0.1, 0.35)].into_iter().enumerate() {
+        let z = 1.5 * i as f64;
+        run(&mut s, "component.create", json!({"name": format!("Sheet{i}")}));
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 400, "width": 30, "height": 1.5, "corner": [0, 0, z], "operation": "new", "body_name": format!("S{i}")}),
+        );
+        for x in [20.0, 200.0] {
+            run(
+                &mut s,
+                "solid.cylinder",
+                json!({"radius": 2.5, "height": 1.5, "base": [x + dx, 15.0 + dy, z], "axis": [0, 0, 1], "operation": "cut", "targets": [format!("S{i}")]}),
+            );
+        }
+        run(&mut s, "component.activate", json!({"component": "root"}));
+    }
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_grip", "axis_tolerance": 0.5}));
+    let placed = r["placed"].as_array().cloned().unwrap_or_default();
+    assert_eq!((placed.len(), r["unfilled"].clone()), (2, json!([])), "{r}");
+    for p in &placed {
+        // Grip 4.5: the 8 long rivet, its head on the top sheet, set with its tail under the bottom one.
+        let (lo, hi) = bbox(&s, occ(&p["occurrence"]));
+        assert!(near(hi.z, 4.5 + 1.5) && near(lo.z, -2.4), "{p}: {lo:?} {hi:?}");
+    }
+}
+
+#[test]
 fn a_built_in_bolt_gets_washers_and_a_nut_and_room_for_them() {
     let mut s = Session::default();
     plate(&mut s, "Lower", json!(0), json!(2), json!(2), 6.4);
