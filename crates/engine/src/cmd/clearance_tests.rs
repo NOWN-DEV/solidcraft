@@ -191,3 +191,40 @@ fn bad_parameters_are_refused() {
     assert_eq!(r["pairs_checked"], 0, "{r}");
     assert_eq!(r["nearest"]["A"].as_array().map(Vec::len), Some(0), "{r}");
 }
+
+/// A pin sunk 0.01 mm into a plate 1.7 m long: the shared ring holds π (4.43² − 2.5²) × 0.01 mm³
+/// wherever the plate stands, as on a plate of 100 mm (the boolean of the whole plate gave 0.31).
+#[test]
+fn a_thin_overlap_with_a_large_plate_is_measured_in_full() {
+    let ring = std::f64::consts::PI * (4.43f64.powi(2) - 2.5f64.powi(2)) * 0.01;
+    for (length, far) in [(100.0, false), (1700.0, false), (1700.0, true)] {
+        let mut s = Session::default();
+        let corner = [-length / 2.0, -length / 4.0, 0.0];
+        run(&mut s, "solid.box", json!({"length": length, "width": length / 2.0, "height": 5, "corner": corner, "body_name": "Plate"}));
+        run(&mut s, "solid.cylinder", json!({"radius": 2.5, "height": 9, "base": [0, 0, -2], "operation": "cut", "targets": ["Plate"]}));
+        run(&mut s, "solid.cylinder", json!({"radius": 2.4, "height": 7, "base": [0, 0, -1.99], "operation": "new", "body_name": "Pin"}));
+        run(&mut s, "solid.cylinder", json!({"radius": 4.43, "height": 2, "base": [0, 0, 4.99], "operation": "join", "targets": ["Pin"]}));
+        let shift = if far { [-326.3, 13.5, 1278.3] } else { [0.0; 3] };
+        if far {
+            run(&mut s, "solid.move", json!({"bodies": ["Plate", "Pin"], "translate": shift}));
+        }
+        let r = run(&mut s, "inspect.clearance", json!({"min_volume": 1e-4}));
+        let o = &r["overlaps"][0];
+        assert!((f(&o["volume_mm3"]) - ring).abs() < 1e-3 * ring, "{length} {far}: {r}");
+        // The ring's centre is on the axis, 0.005 below the plate's face.
+        assert!((f(&o["center"][2]) - (4.995 + shift[2])).abs() < 1e-4, "{length} {far}: {r}");
+        assert!((f(&o["center"][0]) - shift[0]).abs() < 1e-4, "{length} {far}: {r}");
+    }
+}
+
+/// A shared part whose centre lies outside its own box, or which holds more than its box, is
+/// malformed: the pair is reported unchecked rather than with that volume.
+#[test]
+fn a_malformed_shared_part_is_not_measured() {
+    use solidcraft_geom::{Aabb3, Vec3};
+    let bbox = Aabb3 { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(10.0, 10.0, 1.0) };
+    assert!(super::plausible(50.0, Vec3::new(5.0, 5.0, 0.5), bbox));
+    assert!(!super::plausible(50.0, Vec3::new(5.0, 5.0, 3.0), bbox));
+    assert!(!super::plausible(1239.0, Vec3::new(5.0, 5.0, 0.5), bbox));
+    assert!(!super::plausible(f64::NAN, Vec3::new(5.0, 5.0, 0.5), bbox));
+}

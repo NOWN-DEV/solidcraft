@@ -274,8 +274,11 @@ fn measure_pair(
     let touching = mesh.is_some_and(|m| m.distance <= slack);
     if touching || holds(ba, bb) || holds(bb, ba) {
         // A pair whose shared part can't be worked out is reported, not passed as clear.
-        let (shared, report) =
-            solidcraft_kernel::capture_boolean_diagnostics(|| solidcraft_kernel::boolean(&ba.body, &bb.body, solidcraft_kernel::BoolOp::Intersect));
+        let region = shared_region(a, b);
+        let (ca, cb) = (clipped(&ba.body, region), clipped(&bb.body, region));
+        let (shared, report) = solidcraft_kernel::capture_boolean_diagnostics(|| {
+            solidcraft_kernel::boolean(ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body), solidcraft_kernel::BoolOp::Intersect)
+        });
         match shared {
             Err(e) => {
                 out.unchecked = Some(e.to_string());
@@ -287,7 +290,14 @@ fn measure_pair(
                     return out;
                 }
                 if let Some(o) = shared {
-                    match solidcraft_kernel::measure(&o) {
+                    match measure_near_origin(&o, region.center()) {
+                        Ok(m) if !plausible(m.volume, m.centroid, m.bbox) => {
+                            out.unchecked = Some(format!(
+                                "the shared part came out malformed ({:.4} mm³ with its centre outside its own box), so it is not measured",
+                                m.volume
+                            ));
+                            return out;
+                        }
                         Ok(m) => out.overlap = Some((m.volume, m.area, m.bbox, m.centroid)),
                         Err(e) => {
                             out.unchecked = Some(e.to_string());
@@ -321,6 +331,58 @@ fn measure_pair(
         Err(e) => out.unchecked = Some(e.to_string()),
     }
     out
+}
+
+/// The box where two bodies may share volume: where their boxes meet, grown by a margin so that
+/// a cut there stays clear of both bodies' faces.
+fn shared_region(a: &DistanceShape, b: &DistanceShape) -> Aabb3 {
+    let (x, y) = (a.bounds(), b.bounds());
+    let min = x.min.max(y.min);
+    let max = x.max.min(y.max);
+    if x.is_empty() || y.is_empty() || !(min.x <= max.x && min.y <= max.y && min.z <= max.z) {
+        return Aabb3::EMPTY;
+    }
+    let grow = 1.0 + 0.05 * min.dist(max);
+    let g = solidcraft_geom::Vec3::new(grow, grow, grow);
+    Aabb3 { min: min - g, max: max + g }
+}
+
+/// `body` cut down to `region` when the body is much larger than it. The boolean works to a
+/// tolerance that grows with the bodies' size: a 0.01 mm overlap against a plate 1.7 m long
+/// comes out a quarter too small, and thinner ones not at all. Cut to the region first, the
+/// body is small and its faces there are the same faces. `None`: use the whole body.
+fn clipped(body: &solidcraft_kernel::Body, region: Aabb3) -> Option<solidcraft_kernel::Body> {
+    if region.is_empty() || body.size() <= 4.0 * region.diagonal() {
+        return None;
+    }
+    let cut = solidcraft_kernel::box_solid(region.min, region.max).ok()?;
+    let (r, report) = solidcraft_kernel::capture_boolean_diagnostics(|| solidcraft_kernel::boolean(body, &cut, solidcraft_kernel::BoolOp::Intersect));
+    match r {
+        Ok(Some(c)) if report.unverified().is_none() => Some(c),
+        _ => None,
+    }
+}
+
+/// [`solidcraft_kernel::measure`] of `body` moved by `-at` and back: far from the origin, the
+/// centre of a thin part loses its precision (its moments are large numbers that nearly cancel).
+fn measure_near_origin(body: &solidcraft_kernel::Body, at: solidcraft_geom::Vec3) -> solidcraft_kernel::Result<solidcraft_kernel::BodyMeasure> {
+    let Ok(moved) = solidcraft_kernel::transform(body, -at, solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::Z, 0.0) else {
+        return solidcraft_kernel::measure(body);
+    };
+    let mut m = solidcraft_kernel::measure(&moved)?;
+    m.centroid += at;
+    m.bbox = Aabb3 { min: m.bbox.min + at, max: m.bbox.max + at };
+    Ok(m)
+}
+
+/// Is a measured shared part well formed? A part whose shell came out inside out or open can
+/// carry a volume with its centre outside its own box, or more volume than its box holds.
+fn plausible(volume: f64, centre: solidcraft_geom::Vec3, bbox: Aabb3) -> bool {
+    let slack = 1e-6 * bbox.diagonal().max(1.0);
+    let (lo, hi) = (bbox.min, bbox.max);
+    let inside = [(centre.x, lo.x, hi.x), (centre.y, lo.y, hi.y), (centre.z, lo.z, hi.z)].iter().all(|&(c, l, h)| c >= l - slack && c <= h + slack);
+    let s = bbox.size();
+    volume.is_finite() && volume >= 0.0 && inside && volume <= s.x * s.y * s.z + slack
 }
 
 /// Each subject's `count` nearest bodies, nearest first: pairs are measured in the order of their
