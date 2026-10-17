@@ -59,6 +59,8 @@ mod issue_1080_tests;
 #[cfg(test)]
 mod issue_1510_tests;
 #[cfg(test)]
+mod issue_2005_tests;
+#[cfg(test)]
 mod issue_324_tests;
 #[cfg(test)]
 mod issue_616_tests;
@@ -148,6 +150,7 @@ pub use build::{
     PathSeg, box_solid, canonical_revolve_axis, cylinder, extrude, extrude_tapered, extrude_tapered_between, loft, path_polyline, revolve,
     revolve_whole, sphere, sweep, sweep_with, torus,
 };
+pub use clearance::{Clearance, Occupancy};
 pub use coaxial_overlap::{CoaxialOverlap, coaxial_overlap};
 pub use continuity::{
     ContinuityReport, ContinuityTolerances, EdgePick, MAX_SAMPLES, MIN_SAMPLES, SeamReport, SeamVerdict, SeamWorst, pick_edges, seam_diagnostics,
