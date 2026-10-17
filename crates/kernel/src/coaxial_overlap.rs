@@ -74,7 +74,8 @@ pub fn coaxial_overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     if a.is_mesh() || b.is_mesh() {
         return None;
     }
-    crate::guard("near-coaxial overlap", || Ok(overlap(a, b))).ok().flatten()
+    // The boolean that takes the core can fail in one order of the bodies and not the other.
+    crate::guard("near-coaxial overlap", || Ok(overlap(a, b).or_else(|| overlap(b, a)))).ok().flatten()
 }
 
 fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
@@ -248,7 +249,9 @@ fn walls(b: &Body, cylinders: Vec<Wall>, same: f64) -> Option<Vec<Wall>> {
         let wall = Wall { faces: vec![face], origin, axis, radius, boss, spans: vec![(lo, hi)] };
         match out.iter_mut().find(|w| w.boss == boss && on_one_cylinder(w, &wall, same)) {
             Some(w) => {
-                let s = (origin - w.origin).dot(w.axis) * if axis.dot(w.axis) < 0.0 { -1.0 } else { 1.0 };
+                // Where the face's origin lies along the wall's axis; a face whose axis runs the
+                // other way measures its span backwards from there.
+                let s = (origin - w.origin).dot(w.axis);
                 let (a, b) = if axis.dot(w.axis) < 0.0 { (-hi, -lo) } else { (lo, hi) };
                 w.faces.push(face);
                 w.spans.push((a + s, b + s));

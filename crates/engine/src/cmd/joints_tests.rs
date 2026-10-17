@@ -1500,3 +1500,22 @@ fn interference_of_a_headed_pin_a_hair_off_a_bush_of_its_heads_radius() {
     assert!((got - want).abs() < 1e-6 * want, "{got} against {want}: {i}");
     assert!(i["interferences"][0]["near_coaxial"].is_object(), "{i}");
 }
+
+/// A headed pin made before the plate it sits in, a hair off the plate's hole: the crescent
+/// whichever body comes first.
+#[test]
+fn interference_of_a_headed_pin_made_before_its_plate() {
+    let crescent = |r: f64, e: f64| std::f64::consts::PI * r * r - (2.0 * r * r * (e / (2.0 * r)).acos() - e / 2.0 * (4.0 * r * r - e * e).sqrt());
+    let offset = 5.6e-4;
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 12, "base": [offset, 0, -2.35], "operation": "new", "body_name": "Pin"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 5.25, "height": 3, "base": [offset, 0, -5.35], "operation": "join", "targets": ["Pin"]}));
+    run(&mut s, "solid.box", json!({"length": 60, "width": 60, "height": 2, "corner": [-30, -30, -2.35], "body_name": "Plate"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 9, "base": [0, 0, -6], "operation": "cut", "targets": ["Plate"]}));
+    let i = run(&mut s, "inspect.interference", json!({"bodies": ["Pin", "Plate"]}));
+    assert_eq!(i["unchecked"].as_array().map(Vec::len), Some(0), "{i}");
+    assert_eq!(i["count"], 1, "{i}");
+    let want = 2.0 * crescent(3.0, offset);
+    let got = i["interferences"][0]["volume_mm3"].as_f64().unwrap_or(0.0);
+    assert!((got - want).abs() < 1e-6 * want, "{got} against {want}: {i}");
+}
