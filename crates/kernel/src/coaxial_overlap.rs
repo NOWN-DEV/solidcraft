@@ -91,6 +91,14 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     if !ca.iter().any(|x| cb.iter().any(|y| close(x, y))) {
         return None;
     }
+    // A wall that runs once round along a seam edge (as STEP files have them) is cut in two
+    // first: the boolean cannot always intersect it whole.
+    let (sa, sb) = (crate::step_in::split::split_seams(a), crate::step_in::split::split_seams(b));
+    let (ca, cb) = match (&sa, &sb) {
+        (None, None) => (ca, cb),
+        _ => (sa.as_ref().map_or(ca, cylinders), sb.as_ref().map_or(cb, cylinders)),
+    };
+    let (a, b) = (sa.as_ref().unwrap_or(a), sb.as_ref().unwrap_or(b));
     let (wa, wb) = (walls(a, ca, same)?, walls(b, cb, same)?);
     let mut pairs = Vec::new();
     for x in &wa {
@@ -425,5 +433,35 @@ mod tests {
         // Pins on the very axis, or far off it, aren't asked about.
         assert!(coaxial_overlap(&plate, &plate_and_pin(3.0, 0.0).1).is_none());
         assert!(coaxial_overlap(&plate, &plate_and_pin(3.0, 0.5).1).is_none());
+    }
+
+    /// A bush and a headed screw whose shank ends inside the bore, both written to STEP and
+    /// read back: their cylinders come back as one face each that runs once round along a seam
+    /// edge, which the boolean cannot intersect where the shank's end meets the bore. The
+    /// walls are cut in two first and the answer is the one of the bodies as built.
+    #[test]
+    fn a_screw_in_a_bush_after_a_step_round_trip() {
+        let e = 0.01;
+        let outer = crate::cylinder(Vec3::ZERO, Vec3::Z, 5.0, 10.0).unwrap();
+        let bore = crate::cylinder(Vec3::new(0.0, 0.0, -1.0), Vec3::Z, 3.0, 12.0).unwrap();
+        let bush = crate::boolean(&outer, &bore, BoolOp::Cut).unwrap().unwrap();
+        let shank = crate::cylinder(Vec3::new(e, 0.0, -2.0), Vec3::Z, 3.0, 8.0).unwrap();
+        let head = crate::cylinder(Vec3::new(e, 0.0, -5.0), Vec3::Z, 5.25, 3.0).unwrap();
+        let screw = crate::boolean(&shank, &head, BoolOp::Union).unwrap().unwrap();
+        let back = |b: &Body| crate::step_import(&crate::step_export(&[b], "round trip").unwrap()).unwrap().bodies.remove(0).body;
+        let (bush, screw) = (back(&bush), back(&screw));
+        // The shank shares a crescent with the bush over the 6 mm it reaches into the bore.
+        let want = 6.0 * crescent(3.0, 3.0, e).area;
+        for (x, y) in [(&bush, &screw), (&screw, &bush)] {
+            let o = coaxial_overlap(x, y).unwrap();
+            assert!((o.volume - want).abs() < 1e-6 * want, "{o:?} {want}");
+            assert!((o.length - 6.0).abs() < 1e-6, "{o:?}");
+        }
+        // Cut in two, each wall is a face more and the body keeps its volume.
+        let split = crate::step_in::split::split_seams(&bush).unwrap();
+        assert_eq!(split.face_count(), bush.face_count() + 2);
+        let (v0, v1) = (crate::measure(&bush).unwrap().volume, crate::measure(&split).unwrap().volume);
+        assert!((v0 - v1).abs() < 1e-6 * v0, "{v0} {v1}");
+        assert!(crate::step_in::split::split_seams(&outer).is_none());
     }
 }
