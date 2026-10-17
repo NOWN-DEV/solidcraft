@@ -100,8 +100,10 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
             let (pin, hole, pin_in_a) = match (x.boss, y.boss) {
                 (true, false) => (x, y, true),
                 (false, true) => (y, x, false),
-                // Two pins or two holes on nearly one cylinder: not this case.
-                _ if near(x, y, same).is_some() => return None,
+                // Two pins or two holes on nearly one cylinder, side by side along it: not this
+                // case. Apart along the axis (a screw's head beside a bush of its radius), they
+                // don't meet.
+                _ if near(x, y, same).is_some() && total(&intersect(&union(&x.spans), &union(&project(y, x)))) > same => return None,
                 _ => continue,
             };
             let Some((toward, offset)) = near(pin, hole, same) else { continue };
