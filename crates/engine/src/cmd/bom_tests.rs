@@ -163,6 +163,9 @@ fn standard_parts_carry_a_part_number_that_follows_a_resize() {
         rows,
         [("608".into(), "Deep groove ball bearing (envelope) 608".into(), 1), ("ISO 4762 M6x20".into(), "Socket head cap screw M6x20".into(), 2)]
     );
+    let screws = r["rows"].as_array().unwrap().iter().find(|r| r["count"] == 2).cloned().unwrap();
+    assert_eq!(screws["definition"], "SHCS M6x20", "equal names are named once");
+    assert_eq!(screws["components"].as_array().map(Vec::len), Some(2));
     // A resize renumbers the part; a description someone wrote stays theirs.
     let comp = a["component"].as_u64().unwrap();
     run(&mut s, "component.metadata.set", json!({"component": comp, "description": "Cap screw, A2"}));

@@ -254,7 +254,9 @@ fn rows(s: &Session, counts: &BTreeMap<u64, u64>, group: Group) -> Vec<Row> {
         });
         row.count += n;
         row.components.push(*id);
-        row.names.push(c.name.clone());
+        if !row.names.contains(&c.name) {
+            row.names.push(c.name.clone());
+        }
         if row.description.is_empty() {
             row.description = m.description().unwrap_or_default().to_string();
         }
