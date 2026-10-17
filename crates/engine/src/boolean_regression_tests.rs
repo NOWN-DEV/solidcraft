@@ -409,6 +409,7 @@ fn ring_notch() -> f64 {
         }
     };
     (0..=n).map(|i| weight(i) * along(-0.45 + i as f64 * h)).sum::<f64>() * h / 3.0
+}
 
 /// The wedge of #1617: a side profile in (y, z) extruded 138 mm along x, its back face leaning
 /// by `lean` (the tangent of its angle), with the issue's rounds. The last one runs along the
