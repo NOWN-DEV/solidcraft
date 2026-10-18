@@ -28,6 +28,14 @@ made. Contact sets stop motion where bodies would pass through each other,
 **Motion Study** keys joint values along a timeline, and **Interference** shows overlapping
 volumes in red, lists the pairs closer than its **Clearance** and each body's nearest neighbour.
 
+A joint's offset, angle and values can be typed as expressions over the design's parameters
+(`"offset": "gap + 2"`, `"values": ["travel"]`). The joint keeps them and works them out again
+whenever the design changes, so a part seated `gap` above a panel moves with `gap`. Renaming a
+parameter carries into the joints that use it, and deleting one they use is refused. If an
+expression stops working out (say a parameter becomes an angle), the joint is left out of the
+solve and `joint.solve` gives the reason, instead of placing the part from old numbers. Typing a
+plain number, or driving the value, drops that expression.
+
 The check behind it, `inspect.clearance`, does all of that in one call for any number of bodies,
 which suits scripts and agents checking a whole assembly:
 
