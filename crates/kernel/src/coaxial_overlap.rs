@@ -151,7 +151,10 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
         };
         let (ma, mb) = (moved(a, true)?, moved(b, false)?);
         let (r, report) = crate::capture_boolean_diagnostics(|| crate::ops::boolean(&ma, &mb, BoolOp::Intersect));
-        if report.unverified().is_some() || report.warning().is_some() {
+        // The core is the answer and must be exact. The wider pins only check the band, to
+        // 2 % of what it gains: a tool nudged by a hair of the step there is as good.
+        let nudge = if k > 0.0 { pairs.iter().map(|p| p.step).fold(f64::INFINITY, f64::min) * 1e-2 } else { 0.0 };
+        if report.unverified().is_some() || !altered_by_at_most(&report, nudge, size) {
             return None;
         }
         match r.ok()? {
@@ -205,6 +208,17 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     let offset = pairs.iter().map(|p| p.offset).fold(0.0, f64::max);
     let length = pairs.iter().map(|p| total(&p.shared)).sum();
     Some(CoaxialOverlap { volume: volume.max(0.0), area, centroid, bbox, offset, length })
+}
+
+/// Whether every retry of a boolean that can change its result moved the tool by at most
+/// `limit` (a rotation counted at the bodies' `size` from its pivot): none for a `limit` of 0.
+fn altered_by_at_most(report: &crate::BooleanDiagnostics, limit: f64, size: f64) -> bool {
+    !report.truncated
+        && report
+            .events
+            .iter()
+            .filter(|e| e.strategy.alters_result())
+            .all(|e| e.strategy == crate::BooleanStrategy::ToolNudge && limit > 0.0 && e.translation_mm + e.rotation_rad * size <= limit)
 }
 
 /// The pin's offset to the hole, when the two are nearly on one cylinder but not on the same
