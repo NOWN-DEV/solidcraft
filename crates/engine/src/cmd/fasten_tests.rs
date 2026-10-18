@@ -594,3 +594,101 @@ fn a_refresh_seats_a_part_again_on_a_face_that_moved_along_its_hole() {
     let r = run(&mut s, "parts.fasten", fill);
     assert_eq!(r["kept"][0]["reseated"].as_bool(), Some(false), "seated where it belongs: {r}");
 }
+
+#[test]
+fn a_fill_after_a_full_undo_history_is_one_step_and_keeps_the_history() {
+    let lib = Library::bolts();
+    let mut s = Session::default();
+    run(&mut s, "parts.library.load", json!({"path": lib.path()}));
+    plate(&mut s, "Lower", json!(0), json!(3), json!(3), 5.5);
+    plate(&mut s, "Upper", json!(3), json!(4), json!(7), 5.5);
+    // Fill the undo history to its limit (200 steps).
+    for i in 0..200 {
+        run(&mut s, "parameters.add", json!({"name": format!("p{i}"), "expression": "1 mm"}));
+    }
+    let depth = s.undo.len();
+    let second = s.undo.get(1).map(|x| x.doc.clone());
+    let occurrences = s.doc.occurrences.len();
+    let r = run(&mut s, "parts.fasten", json!({"family": "hex_bolt_grip"}));
+    assert_eq!(r["placed"].as_array().map(Vec::len), Some(1), "{r}");
+    // One step for the whole fill; the nested steps pushed none of the user's steps out.
+    assert_eq!(s.undo.len(), depth);
+    let first = s.undo.first().map(|x| x.doc.clone());
+    assert!(first.zip(second).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b)), "only the oldest step makes room for the fill");
+    // Undo once: the fill is gone at once, nothing half built left.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.doc.parts.is_empty() && s.doc.occurrences.len() == occurrences, "{:?}", s.doc.occurrences.len());
+    assert!(s.doc.param("p199").is_some());
+    // Undo again: the user's own last step.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.doc.param("p199").is_none() && s.doc.param("p198").is_some());
+    // Redo twice brings the fill back.
+    run(&mut s, "edit.redo", json!({}));
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.parts.len(), 1);
+}
+
+#[test]
+fn a_stack_with_a_countersunk_top_plate_is_sized_by_its_whole_grip() {
+    let lib = Library::bolts();
+    let mut s = Session::default();
+    run(&mut s, "parts.library.load", json!({"path": lib.path()}));
+    run(&mut s, "parameters.add", json!({"name": "hx", "expression": "20 mm"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 3, "corner": [0, 0, 0], "operation": "new", "body_name": "Lower"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 4, "corner": [0, 0, 3], "operation": "new", "body_name": "Upper"}));
+    // Ø5.5 through both, a Ø9.5 x 90° countersink (2 mm deep) on top.
+    run(&mut s, "solid.hole", json!({"position": ["hx", 15, 7], "diameter": 5.5, "depth": 7}));
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"position": ["hx", 15, 7], "diameter": 5.5, "depth": 4, "type": "countersink", "cs_diameter": 9.5, "cs_angle": "90 deg"}),
+    );
+    // The countersink (2 mm deep) counts in the grip: 7 mm, so M5 x 14 (5–9).
+    let r = run(&mut s, "parts.fasten", json!({"family": "hex_bolt_grip"}));
+    let p = &r["placed"][0];
+    assert_eq!((r["unfilled"].clone(), p["size"].as_str(), p["length_mm"].as_f64()), (json!([]), Some("M5"), Some(14.0)), "{r}");
+    assert!(near(p["grip_mm"].as_f64().unwrap_or(0.0), 7.0), "{r}");
+    // Seated on the top face over the countersink, jointed to the hole's wall below it.
+    let (lo, hi) = bbox(&s, occ(&p["occurrence"]));
+    assert!(near(hi.z, 7.0 + 3.5) && near(lo.z, 7.0 - 14.0), "{lo:?} {hi:?}");
+    // The joint keeps it there when the hole moves.
+    run(&mut s, "parameters.change", json!({"name": "hx", "expression": "26 mm"}));
+    let (lo, hi) = bbox(&s, occ(&p["occurrence"]));
+    assert!(near((lo.x + hi.x) / 2.0, 26.0) && near(hi.z, 7.0 + 3.5) && near(lo.z, 7.0 - 14.0), "{lo:?} {hi:?}");
+}
+
+/// Two rivet families of the same sizes: `rivet_grip` and `rivet_alt`.
+fn two_rivet_families() -> Library {
+    let family = |name: &str| {
+        json!({"kind": "fastener_family", "name": name, "label": "Rivet", "shape": "blind_rivet",
+               "sizes": [{"size": "4.8", "d": 4.8, "head": {"d": 9.6, "h": 1.5, "style": "dome"},
+                          "lengths": [{"length": 8, "grip": [1, 3.5]}, {"length": 10, "grip": [3.5, 5.5]}, {"length": 12, "grip": [5.5, 7.5]}]}]})
+    };
+    Library::new(&json!({"format": "solidcraft-parts/1", "id": "example.rivets2", "name": "Example rivets", "families": [family("rivet_grip"), family("rivet_alt")]}))
+}
+
+#[test]
+fn a_refresh_of_a_chosen_stack_replaces_what_it_held() {
+    let lib = two_rivet_families();
+    let mut s = Session::default();
+    run(&mut s, "parts.library.load", json!({"path": lib.path()}));
+    run(&mut s, "parameters.add", json!({"name": "t", "expression": "1 mm"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 1, "corner": [0, 0, 0], "operation": "new", "body_name": "Lower"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": "t", "corner": [0, 0, 1], "operation": "new", "body_name": "Upper"}));
+    run(&mut s, "solid.hole", json!({"position": [20, 15, "1 mm + t"], "diameter": 4.9}));
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_grip", "stacks": [0], "refresh": false}));
+    assert_eq!(r["placed"][0]["length_mm"].as_f64(), Some(8.0), "{r}");
+    // The top plate 5 thick: grip 6 takes the 12 long rivet, and the 8 long one goes.
+    run(&mut s, "parameters.change", json!({"name": "t", "expression": "5 mm"}));
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_grip", "stacks": [0], "refresh": true}));
+    assert_eq!((count(&r, "placed"), count(&r, "kept"), count(&r, "removed"), count(&r, "unfilled")), (1, 0, 1, 0), "{r}");
+    assert_eq!(r["placed"][0]["length_mm"].as_f64(), Some(12.0), "{r}");
+    assert_eq!(part_occurrences(&s), 1);
+    // Another family asked for that stack by name: it takes the stack over.
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_alt", "stacks": [0], "refresh": true}));
+    assert_eq!((count(&r, "placed"), count(&r, "kept"), count(&r, "removed"), count(&r, "unfilled")), (1, 0, 1, 0), "{r}");
+    assert_eq!(part_occurrences(&s), 1);
+    let r = run(&mut s, "parts.fasten", json!({"family": "rivet_alt", "stacks": [0], "refresh": true}));
+    assert_eq!((count(&r, "placed"), count(&r, "kept"), count(&r, "removed")), (0, 1, 0), "{r}");
+    assert_eq!(part_occurrences(&s), 1);
+}
