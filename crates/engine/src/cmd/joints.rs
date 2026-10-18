@@ -72,7 +72,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("joint; type?, flip?, offset?, angle? (a number, or an expression the joint then follows), suppressed?, name?"),
     CommandSpec::new("joint.delete", "Delete Joint", delete).icon("delete").params("joint: id|name (or origin: name, link: index)"),
     CommandSpec::new("joint.list", "List Joints", list).icon("list").noundo().params(
-        "→ joints (type, occurrences, values, limits), origins, links, degrees of freedom, conflicts, floating: [{occurrences, joints}] \
+        "→ joints (type, occurrences, values, limits; expressions: {offset?, angle?, values?} when they were typed as expressions), origins, links, degrees of freedom, conflicts, floating: [{occurrences, joints}] \
          (joint chains joined to nothing grounded: the solver places none of them, so driving them moves nothing)",
     ),
     CommandSpec::new("joint.solve", "Solve Joints", solve_cmd).icon("compute").params("re-place the occurrences from the joints → conflicts, errors, dof"),
@@ -475,11 +475,11 @@ pub(crate) fn value(s: &Session, v: &Value, angle: bool, cmd: &str) -> Result<f6
     s.doc.eval(&e, kind).map_err(|e| bad(cmd, e.to_string()))
 }
 
-/// The expression a number was typed as (`None` for a plain number), kept so the joint follows
-/// the parameters it names.
+/// The expression a number was typed as, kept so the joint follows the parameters it names
+/// (`None` for a plain number, or for text that names no parameter, such as `"5 mm"`).
 fn typed(v: Option<&Value>) -> Option<String> {
     match v {
-        Some(Value::String(t)) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        Some(Value::String(t)) if !solidcraft_doc::expr::references(t).is_empty() => Some(t.trim().to_string()),
         _ => None,
     }
 }
@@ -1181,10 +1181,18 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = s.doc_mut();
     let Some(j) = doc.assembly.joints.iter_mut().find(|j| j.id == id) else { return Err(bad(cmd, "joint")) };
     if let Some(k) = kind {
+        let was = j.kind;
         j.kind = k;
         j.values.resize(k.dofs().len(), 0.0);
         j.limits.resize(k.dofs().len(), None);
         j.exprs.values.truncate(k.dofs().len());
+        // A value that changes unit with the type (a slide becoming a turn) drops its expression,
+        // which would no longer work out and leave the joint out of the solve.
+        for i in 0..j.exprs.values.len() {
+            if was.is_angle(i) != k.is_angle(i) {
+                j.exprs.set_value(i, None);
+            }
+        }
     }
     if let Some(o) = offset {
         j.offset = o;
@@ -1386,7 +1394,7 @@ pub(crate) fn overlapping_pairs(boxes: &[Aabb3], limit: usize) -> (Vec<(usize, u
 }
 
 #[cfg(test)]
-#[path = "joint_exprs_tests.rs"]
+#[path = "joints_exprs_tests.rs"]
 mod exprs_tests;
 #[cfg(test)]
 #[path = "joints_face_tests.rs"]

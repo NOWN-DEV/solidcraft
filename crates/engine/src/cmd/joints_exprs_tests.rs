@@ -6,7 +6,7 @@ use solidcraft_geom::Vec3;
 use super::tests::{occ, place, run};
 use crate::Session;
 
-/// Two 10 mm cubes in components A (grounded) and B, a `gap` and a `travel` parameter.
+/// Two 10 mm cubes in components A (grounded) and B, a `gap` and a `turn` parameter.
 fn cubes() -> Session {
     let mut s = Session::default();
     for (name, x) in [("A", 0), ("B", 20)] {
@@ -21,7 +21,7 @@ fn cubes() -> Session {
     s
 }
 
-/// Where B's bottom-face corner (25, 5, 0 in B) is.
+/// Where B's bottom corner (20, 0, 0 in B) is.
 fn b_corner(s: &Session) -> Vec3 {
     place(s, "B", Vec3::new(20.0, 0.0, 0.0))
 }
@@ -40,7 +40,7 @@ fn an_offset_and_an_angle_typed_as_expressions_follow_their_parameters() {
     );
     let z = |s: &Session| place(s, "B", Vec3::new(25.0, 5.0, 0.0)).z;
     assert!((z(&s) - 15.0).abs() < 1e-6, "{}", z(&s));
-    // The panel gets a new gap: B rides up with it, without touching the joint.
+    // The gap changes: B rides up with it, without touching the joint.
     run(&mut s, "parameters.change", json!({"name": "gap", "expression": "12 mm"}));
     assert!((z(&s) - 22.0).abs() < 1e-6, "{}", z(&s));
     // A parameter the gap is worked out from changes too.
@@ -119,4 +119,28 @@ fn a_joint_whose_expression_stops_working_out_is_left_out_with_the_reason() {
     run(&mut s, "parameters.change", json!({"name": "gap", "expression": "2 mm", "unit": "mm"}));
     assert!((place(&s, "B", Vec3::new(25.0, 5.0, 0.0)).z - 12.0).abs() < 1e-6);
     assert_eq!(run(&mut s, "joint.solve", json!({}))["errors"], json!([]));
+}
+
+#[test]
+fn a_value_that_changes_unit_with_the_joint_type_drops_its_expression() {
+    let mut s = cubes();
+    run(&mut s, "joint.create", json!({"type": "slider", "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}, "values": ["gap"], "name": "Rail"}));
+    // The slide becomes a turn: `gap` (a length) can't be its angle, so the turn keeps a number
+    // and the joint stays in the solve.
+    let r = run(&mut s, "joint.edit", json!({"joint": "Rail", "type": "revolute"}));
+    assert_eq!(r["errors"], json!([]), "{r}");
+    assert!(s.doc.assembly.joints.first().is_some_and(|j| j.exprs.is_empty()));
+}
+
+#[test]
+fn text_that_names_no_parameter_is_kept_as_a_number() {
+    let mut s = cubes();
+    run(
+        &mut s,
+        "joint.create",
+        json!({"type": "slider", "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}, "offset": "3 mm", "angle": "0 deg", "values": ["2 * 2 mm"]}),
+    );
+    let j = s.doc.assembly.joints.first().cloned().unwrap_or_else(|| panic!("no joint"));
+    assert!(j.exprs.is_empty(), "{:?}", j.exprs);
+    assert!((j.offset - 3.0).abs() < 1e-12 && j.values.first().is_some_and(|v| (v - 4.0).abs() < 1e-12), "{j:?}");
 }
