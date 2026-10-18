@@ -393,10 +393,16 @@ fn union_disagrees(a: &solidcraft_kernel::Body, b: &solidcraft_kernel::Body, sha
     contradicted(shared, volume(a)?, volume(b)?, volume(&union)?)
 }
 
-/// Relative error of a measured volume. [`solidcraft_kernel::measure`] keeps a face's fine
-/// tessellation when it is within 1 % of one with a 5 times coarser chord; the volume a chord
-/// misses grows in step with it, so the kept one can be off by up to 1 % / 4.
-const VOLUME_NOISE: f64 = 0.0025;
+/// How far vol(a) + vol(b) − vol(a ∪ b) can stray from the shared volume by measuring alone,
+/// as a share of vol(a) + vol(b) + vol(a ∪ b). [`solidcraft_kernel::measure`] facets a curved
+/// face with chords of up to 3e-4 of its radius where the radius sets them, which leaves the
+/// volume it encloses short by up to (4/3) × 3e-4 = 4e-4. That shortfall is the same for a face
+/// measured on its own body and in the union, and cancels in the difference, except where the
+/// chord changes with the body measured (it also follows the body's size). Measured, that
+/// change stays near 2e-5 of the three volumes: 2.1e-5 for a 40 mm roller pressed 0.2 mm into a
+/// 2 m plate (`a_roller_pressed_into_a_large_plate_is_reported`), 2e-5 and 1e-6 in the examples
+/// of `the_union_check_allows_for_the_bodies_measuring_error`. This allows five times that.
+const VOLUME_NOISE: f64 = 1e-4;
 
 /// [`union_disagrees`] on measured volumes: `shared` against vol(a) + vol(b) − vol(a ∪ b).
 /// That difference of large numbers carries the measuring error of all three, so a small overlap

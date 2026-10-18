@@ -298,3 +298,27 @@ fn a_small_overlap_on_a_large_plate_is_reported() {
     assert_eq!(pair(&overlaps[0]), ["Box", "Plate"]);
     assert!((f(&overlaps[0]["volume_mm3"]) - 5.4).abs() < 1e-6, "{r}");
 }
+
+/// A 40 mm roller lying on a 2000 × 1000 × 3 mm plate, pressed 0.2 mm into it, shares the
+/// circular segment along its 10 mm (7.53 mm³). Its curved wall is faceted differently on its
+/// own and in the union, so vol(a) + vol(b) − vol(a ∪ b) comes out 0.64 mm³ over the shared
+/// volume (2e-5 of the three volumes, past the 1 % of the shared part): the measuring allowance
+/// keeps it an overlap, not an unchecked pair.
+#[test]
+fn a_roller_pressed_into_a_large_plate_is_reported() {
+    let (r, depth, length) = (20.0_f64, 0.2_f64, 10.0);
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 2000, "width": 1000, "height": 3, "corner": [0, 0, 0], "operation": "new", "body_name": "Plate"}));
+    run(
+        &mut s,
+        "solid.cylinder",
+        json!({"radius": r, "height": length, "base": [100, 50, 3.0 + r - depth], "axis": [1, 0, 0], "operation": "new", "body_name": "Roller"}),
+    );
+    let res = run(&mut s, "inspect.clearance", json!({}));
+    assert_eq!(res["unchecked"].as_array().map(Vec::len), Some(0), "{res}");
+    let overlaps = res["overlaps"].as_array().cloned().unwrap_or_default();
+    assert_eq!(overlaps.len(), 1, "{res}");
+    assert_eq!(pair(&overlaps[0]), ["Plate", "Roller"]);
+    let want = (r * r * ((r - depth) / r).acos() - (r - depth) * (r * r - (r - depth) * (r - depth)).sqrt()) * length;
+    assert!((f(&overlaps[0]["volume_mm3"]) - want).abs() < 0.01 * want, "{want} {res}");
+}
