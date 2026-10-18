@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use solidcraft_doc::Document;
+use solidcraft_geom::Vec3;
 
 use super::analysis::checked_pairs;
 use super::contact_sweep::{ContactGeometry, Gap};
@@ -26,8 +27,8 @@ pub const SWEEP_DOC: &str = "joint: id|name; from, to: its value the sweep runs 
      stopped_by: {a, b, at: [x,y,z] (where they touch, world)} | \"loop\" | \"limit\" | null, samples: [{value, min_gap_mm?, \
      pair?}], min_gap? (report_gaps: {part: {mm, at_value, to}}, the nearest each part came to another), unit, gap_method \
      (\"mesh\": distances between the tessellations), gap_tolerance_mm (how far those can be off: 0 when every face is flat), \
-     pairs (checked), touching_at_start: [[a, b]] (pairs already touching at `from`, such as parts joined face to face: not \
-     checked), applied. The parts are tested at the samples and through the bisection; the motion is on a copy (closed loops \
+     pairs (checked), touching_at_start: [[a, b]] (pairs already touching at `from`, such as parts joined face to face or a door \
+     on its frame: these stop it only once they pass into each other deeper than they start), applied. The parts are tested at the samples and through the bisection; the motion is on a copy (closed loops \
      follow, contact sets do not stop it)";
 
 /// Most samples a sweep takes before its bisection: each is a solve.
@@ -114,34 +115,46 @@ pub(super) fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
     // Nearer than this is touching (well below any `refine`).
     let touch = 1e-6 * scale;
     let mut work = 0usize;
-    // Pairs touching where the sweep starts (parts joined face to face, a door on its stop)
-    // are not what stops it.
+    let key = |x: u64, y: u64| (x.min(y), x.max(y));
+    // Pairs touching where the sweep starts (parts joined face to face, a door on its frame)
+    // stop it only when they pass into each other, deeper than they start (by more than their
+    // meshes can be off): a door resting on its frame cannot sweep through it.
     let start: Vec<Gap> = geometry.gaps(&t, touch, &mut work, MAX_WORK)?;
-    let touching: BTreeSet<(u64, u64)> = start.iter().map(|g| (g.a.0.min(g.b.0), g.a.0.max(g.b.0))).collect();
+    let touching: BTreeSet<(u64, u64)> = start.iter().map(|g| key(g.a.0, g.b.0)).collect();
     let touching_names: Vec<Value> = start.iter().map(|g| json!([g.a.1, g.b.1])).collect();
-    geometry.keep_pairs(|x, y| !touching.contains(&(x.min(y), x.max(y))));
-    if !geometry.has_pairs() {
-        return Err(bad(cmd, "every pair of parts checked already touches at `from`: list the parts that must stay clear"));
-    }
+    let resting = geometry.take_pairs(|x, y| touching.contains(&key(x, y)));
+    let rest_depth: BTreeMap<(u64, u64), f64> = if resting.has_pairs() {
+        resting.hits(&t, &mut work, MAX_WORK, true)?.into_iter().map(|(a, b, d)| (key(a.0, b.0), d)).collect()
+    } else {
+        BTreeMap::new()
+    };
+    let margin = touch.max(2.0 * resting.chord());
 
-    let n = match step {
+    // The samples run to where the joint gets: a limit or a loop can stop it short of `to`, and
+    // the default count is for the motion up to there. One more drive toward `to` then finds
+    // what stops it.
+    let (n, sample_to) = match step {
         Some(h) => {
             let n = ((to - from).abs() / h).ceil();
             if !n.is_finite() || n > MAX_SAMPLES as f64 {
                 return Err(bad(cmd, format!("`step` makes more than {MAX_SAMPLES} samples: take a larger step")));
             }
-            n as usize
+            (n as usize, to)
         }
         None => {
             let mut end = t.scratch();
             drive_to(&mut end, to)?;
-            geometry.samples(&t, &end).map_err(|e| match e {
+            let n = geometry.samples(&t, &end).map_err(|e| match e {
                 crate::EngineError::BadParams { msg, .. } => bad(cmd, format!("{msg} (or give a `step`)")),
                 e => e,
-            })?
+            })?;
+            let got = reached(&end);
+            (n, if (got - to).abs() > 1e-9 && got.is_finite() { got } else { to })
         }
-    }
-    .max(1);
+    };
+    let n = n.max(1);
+    let targets: Vec<f64> =
+        (1..=n).map(|k| from + (sample_to - from) * k as f64 / n as f64).chain(((sample_to - to).abs() > 1e-9).then_some(to)).collect();
 
     let mut samples: Vec<Value> = Vec::new();
     let mut nearest: BTreeMap<String, Nearest> = BTreeMap::new();
@@ -165,14 +178,25 @@ pub(super) fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     };
     let contact = |t: &Session, work: &mut usize, geometry: &ContactGeometry| -> Result<Option<Gap>> {
-        Ok(geometry.gaps(t, touch, work, MAX_WORK)?.into_iter().next())
+        if let Some(g) = geometry.gaps(t, touch, work, MAX_WORK)?.into_iter().next() {
+            return Ok(Some(g));
+        }
+        if !resting.has_pairs() {
+            return Ok(None);
+        }
+        let deeper =
+            resting.hits(t, work, MAX_WORK, true)?.into_iter().find(|(a, b, d)| *d > rest_depth.get(&key(a.0, b.0)).copied().unwrap_or(0.0) + margin);
+        let Some((a, b, _)) = deeper else { return Ok(None) };
+        // Where: the nearest points of that pair (passing into each other, at no gap).
+        let k = key(a.0, b.0);
+        let at = resting.gaps(t, touch, work, MAX_WORK)?.into_iter().find(|g| key(g.a.0, g.b.0) == k).map_or((Vec3::ZERO, Vec3::ZERO), |g| g.at);
+        Ok(Some(Gap { a, b, mm: 0.0, at }))
     };
 
     record(&t, from, &mut work, &geometry)?;
     let (mut lo_doc, mut lo_v): (Arc<Document>, f64) = (t.doc.clone(), from);
     let mut stop: Option<(f64, Value)> = None;
-    for k in 1..=n {
-        let target = from + (to - from) * k as f64 / n as f64;
+    for target in targets {
         let r = drive_to(&mut t, target)?;
         let v = reached(&t);
         if let Some(mut hit) = contact(&t, &mut work, &geometry)? {
@@ -196,7 +220,10 @@ pub(super) fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
             stop = Some((lo_v, json!({"a": hit.a.1, "b": hit.b.1, "at": [at.x, at.y, at.z]})));
             break;
         }
-        record(&t, v, &mut work, &geometry)?;
+        // (The drive on toward `to` past a limit stays where the last sample was.)
+        if (v - lo_v).abs() > 1e-12 {
+            record(&t, v, &mut work, &geometry)?;
+        }
         if r["stopped_by_loop"].is_object() {
             stop = Some((v, json!("loop")));
             break;
@@ -222,7 +249,7 @@ pub(super) fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
         "samples": samples,
         "refine_mm": refine,
         "gap_method": "mesh", "gap_tolerance_mm": geometry.chord(),
-        "pairs": geometry.pair_count(),
+        "pairs": geometry.pair_count() + resting.pair_count(),
         "touching_at_start": touching_names,
         "applied": applied,
     });

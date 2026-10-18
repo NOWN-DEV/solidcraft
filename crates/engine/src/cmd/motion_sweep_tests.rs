@@ -90,18 +90,57 @@ fn a_door_swings_free_until_its_limit() {
     assert!(s.execute("joint.sweep", &json!({"joint": "Hinge", "from": 20, "to": 0})).is_err(), "`from` is past the limit");
 }
 
-/// Parts already touching where the sweep starts (a door on its stop) do not stop it; listing
-/// only the parts that must stay clear checks those.
+/// Parts already touching where the sweep starts (a door resting on its frame) do not stop it
+/// while they move apart, but they do once they pass into each other: the door cannot sweep
+/// through its frame.
 #[test]
-fn parts_touching_at_the_start_are_left_out() {
+fn parts_touching_at_the_start_stop_it_only_passing_into_each_other() {
     let mut s = door();
     block(&mut s, "Frame", [0.0, -10.0, 0.0], [100.0, 10.0, 50.0]);
     let r = run(&mut s, "joint.sweep", json!({"joint": "Hinge", "from": 0, "to": 90}));
     let touching = r["touching_at_start"].as_array().cloned().unwrap_or_default();
     assert_eq!(touching.len(), 1, "{r}");
-    assert!(r["stopped_by"].is_object(), "the block still stops it: {r}");
+    let by = &r["stopped_by"];
+    assert!(by.is_object() && [&by["a"], &by["b"]].contains(&&json!("Block:1")), "the block still stops it: {r}");
+    // Swung open, away from the frame: nothing stops it.
     let only = json!({"joint": "Hinge", "from": 0, "to": 90, "occurrences": ["Door"], "against": ["Frame"]});
-    assert!(s.execute("joint.sweep", &only).is_err(), "the only pair touches at the start");
+    let r = run(&mut s, "joint.sweep", only);
+    assert!(r["stopped_by"].is_null() && r["touching_at_start"].as_array().map(Vec::len) == Some(1), "{r}");
+    // Swung into the frame: it stops where it starts.
+    let into = json!({"joint": "Hinge", "from": 0, "to": -90, "occurrences": ["Door"], "against": ["Frame"]});
+    let r = run(&mut s, "joint.sweep", into);
+    let by = &r["stopped_by"];
+    assert!(by.is_object() && [&by["a"], &by["b"]].contains(&&json!("Frame:1")), "{r}");
+    assert!(num(&r["stopped_at"]).abs() < 0.01, "{r}");
+}
+
+/// A limit stops the door well short of `to`: the samples are still as fine as the motion up to
+/// the limit needs, so a thin plate just inside the limit is met, not stepped over.
+#[test]
+fn a_thin_part_just_inside_a_limit_is_met() {
+    let mut s = Session::default();
+    block(&mut s, "Door", [0.0, 0.0, 0.0], [100.0, 1.0, 50.0]);
+    block(&mut s, "Plate", [80.0, -32.0, 0.0], [0.5, 6.0, 50.0]);
+    run(
+        &mut s,
+        "joint.create",
+        json!({"type": "revolute", "a": {"occurrence": 0, "point": [0, 0, 0]}, "b": {"occurrence": "Door", "point": [0, 0, 0]}, "flip": true, "name": "Hinge"}),
+    );
+    run(&mut s, "joint.limits", json!({"joint": "Hinge", "min": -30, "max": 10}));
+    // The door's face through the hinge meets the plate's far upper corner (80.5, -26).
+    let expected = (-26.0f64).atan2(80.5).to_degrees();
+    let r = run(&mut s, "joint.sweep", json!({"joint": "Hinge", "from": 0, "to": -1800}));
+    let by = &r["stopped_by"];
+    assert!(by.is_object() && [&by["a"], &by["b"]].contains(&&json!("Plate:1")), "the plate stops it, not the limit: {r}");
+    let at = num(&r["stopped_at"]);
+    assert!((at - expected).abs() < 0.01 && at >= expected - 1e-9, "stopped at {at}°, the plate is met at {expected}°: {r}");
+    // The samples are as fine as the motion up to the limit needs (spread over `to`, they were
+    // sixty times coarser).
+    let values: Vec<f64> = r["samples"].as_array().unwrap().iter().map(|v| num(&v["value"])).collect();
+    assert!(values.len() > 100, "{r}");
+    for w in values.windows(2) {
+        assert!((w[1] - w[0]).abs() < 0.5, "samples {}° apart: {r}", (w[1] - w[0]).abs());
+    }
 }
 
 #[test]

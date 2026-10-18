@@ -225,8 +225,9 @@ to another (`min_gap`). The samples are fine enough that no part passes through 
 two (or `step` apart), and the first contact is bisected until no part moves more than `refine`
 (0.01 mm by default) across it. Gaps are distances between the parts' tessellations
 (`gap_method: "mesh"`): exact for flat faces, within `gap_tolerance_mm` for curved ones. Pairs
-already touching at `from`, such as parts joined face to face, are listed in `touching_at_start`
-and not checked. The sweep runs on a copy (closed loops follow, contact sets don't stop it) and
+already touching at `from`, such as parts joined face to face or a door resting on its frame, are
+listed in `touching_at_start` and stop the sweep only once they pass into each other, deeper than
+they start. The sweep runs on a copy (closed loops follow, contact sets don't stop it) and
 leaves the design as it was unless `apply` is true.
 
 **Insert Design** (`component.insert_design {path, translate?}`, on the **ASSEMBLE** panel and

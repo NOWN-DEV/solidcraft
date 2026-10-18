@@ -21,6 +21,7 @@ fn limit(message: &str) -> crate::EngineError {
     bad("contact.sweep", message)
 }
 
+#[derive(Clone)]
 struct CachedBody {
     path: Vec<u64>,
     offset: Mat,
@@ -164,6 +165,14 @@ impl ContactGeometry {
     /// Keeps only the pairs of set members (occurrence ids) `keep` takes.
     pub(super) fn keep_pairs(&mut self, keep: impl Fn(u64, u64) -> bool) {
         self.pairs.retain(|(_, _, a, b)| keep(a.0, b.0));
+    }
+
+    /// Move the pairs of set members `take` picks into a geometry of their own (with the same
+    /// bodies), leaving the rest here.
+    pub(super) fn take_pairs(&mut self, take: impl Fn(u64, u64) -> bool) -> ContactGeometry {
+        let (taken, kept) = std::mem::take(&mut self.pairs).into_iter().partition(|(_, _, a, b)| take(a.0, b.0));
+        self.pairs = kept;
+        ContactGeometry { bodies: self.bodies.clone(), pairs: taken, step: self.step }
     }
 
     /// How many mesh points are placed for each check.
