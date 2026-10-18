@@ -130,8 +130,8 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     // A pin's face flush against the other body (a rivet's head on the sheet) touches it over
     // an area, which the boolean cannot always take: it is pulled back off it by a little.
     // Only material outside the other body goes, so the overlap is the same.
-    let (fa, fb) = (flush(a, b, same), flush(b, a, same));
     let back = pairs.iter().map(|p| p.step).fold(f64::INFINITY, f64::min) * 0.05;
+    let (fa, fb) = (flush(a, b, same, back), flush(b, a, same, back));
     // A pin's faces move together: one step for each of them (the pin's walls do not repeat
     // across pairs unless one pin is near two holes, which the check below then answers).
     let shared_at = |k: f64| -> Option<(f64, Option<Body>)> {
@@ -225,9 +225,11 @@ fn near(pin: &Wall, hole: &Wall, same: f64) -> Option<(Vec3, f64)> {
     Some((toward, offset))
 }
 
-/// The planar faces of `x` on a plane of `y`'s facing the other way: where the two may touch
-/// flat.
-fn flush(x: &Body, y: &Body, same: f64) -> Vec<usize> {
+/// The planar faces of `x` that lie on a face of `y`'s facing the other way, where the two touch
+/// flat: on a plane of `y`'s, with `y` just beyond the face and not just behind it (within
+/// `depth`, at every sampled facet of it). A face on such a plane elsewhere (a collar's
+/// underside inside the other body, level with a pocket's floor) is not one.
+fn flush(x: &Body, y: &Body, same: f64, depth: f64) -> Vec<usize> {
     let planes = |b: &Body| -> Vec<(usize, Vec3, Vec3)> {
         (0..b.face_count())
             .filter_map(|i| match crate::face_surface(b, i)? {
@@ -237,10 +239,34 @@ fn flush(x: &Body, y: &Body, same: f64) -> Vec<usize> {
             .collect()
     };
     let theirs = planes(y);
-    planes(x)
+    let level: Vec<(usize, Vec3)> = planes(x)
         .into_iter()
         .filter(|(_, n, p)| theirs.iter().any(|(_, m, q)| n.dot(*m) < -1.0 + 1e-9 && (*q - *p).dot(*n).abs() <= same))
-        .map(|(i, _, _)| i)
+        .map(|(i, n, _)| (i, n))
+        .collect();
+    if level.is_empty() || !(depth.is_finite() && depth > 0.0) {
+        return Vec::new();
+    }
+    let tol = (x.size().max(y.size()) * 2e-3).max(1e-4);
+    let (Ok(mx), Ok(my)) = (x.tessellate(tol), y.tessellate(tol)) else { return Vec::new() };
+    // At most this many facets of a face are sampled.
+    const SAMPLES: usize = 64;
+    level
+        .into_iter()
+        .filter(|&(i, n)| {
+            let centres: Vec<Vec3> = mx
+                .triangles
+                .iter()
+                .zip(&mx.tri_face)
+                .filter(|(_, f)| **f as usize == i)
+                .filter_map(|(t, _)| mx.tri(t))
+                .filter(|[a, b, c]| (*b - *a).cross(*c - *a).len() > 0.0)
+                .map(|[a, b, c]| (a + b + c) / 3.0)
+                .collect();
+            let stride = centres.len().div_ceil(SAMPLES).max(1);
+            !centres.is_empty() && centres.iter().step_by(stride).all(|c| my.contains(*c + n * depth) && !my.contains(*c - n * depth))
+        })
+        .map(|(i, _)| i)
         .collect()
 }
 
@@ -492,6 +518,30 @@ mod tests {
         let (v0, v1) = (crate::measure(&bush).unwrap().volume, crate::measure(&split).unwrap().volume);
         assert!((v0 - v1).abs() < 1e-6 * v0, "{v0} {v1}");
         assert!(crate::step_in::split::split_seams(&outer).is_none());
+    }
+
+    /// A pin with a Ø7 collar embedded in a block (the collar's underside at z = 0, inside the
+    /// block's material), a hair off its hole, and a pocket elsewhere in the block whose floor
+    /// is at z = 0 too, facing the collar's underside: the two are level but don't touch, so the
+    /// collar is not pulled back, and all of it inside the block counts.
+    #[test]
+    fn a_collar_level_with_a_pocket_floor_elsewhere_is_not_pulled_back() {
+        let e = 0.01;
+        let mut block = crate::box_solid(Vec3::new(-10.0, -10.0, -5.0), Vec3::new(20.0, 10.0, 3.0)).unwrap();
+        let hole = crate::cylinder(Vec3::new(0.0, 0.0, -6.0), Vec3::Z, 2.0, 10.0).unwrap();
+        let pocket = crate::box_solid(Vec3::new(10.0, -3.0, 0.0), Vec3::new(14.0, 3.0, 4.0)).unwrap();
+        for cut in [&hole, &pocket] {
+            block = crate::boolean(&block, cut, BoolOp::Cut).unwrap().unwrap();
+        }
+        let shank = crate::cylinder(Vec3::new(e, 0.0, -7.0), Vec3::Z, 2.0, 8.0).unwrap();
+        let collar = crate::cylinder(Vec3::new(e, 0.0, 0.0), Vec3::Z, 3.5, 1.0).unwrap();
+        let pin = crate::boolean(&shank, &collar, BoolOp::Union).unwrap().unwrap();
+        // The collar less the hole, plus the shank's crescent over the 5 mm below the collar.
+        let want = std::f64::consts::PI * (3.5 * 3.5 - 2.0 * 2.0) + 5.0 * crescent(2.0, 2.0, e).area;
+        for (x, y) in [(&block, &pin), (&pin, &block)] {
+            let o = coaxial_overlap(x, y).unwrap();
+            assert!((o.volume - want).abs() < 1e-4 * want, "{o:?} {want}");
+        }
     }
 
     /// Two rivets with their heads flush on both faces of a sheet, each a hair off its hole,
