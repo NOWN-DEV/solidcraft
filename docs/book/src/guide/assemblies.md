@@ -28,6 +28,10 @@ made. Contact sets stop motion where bodies would pass through each other,
 **Motion Study** keys joint values along a timeline, and **Interference** shows overlapping
 volumes in red, lists the pairs closer than its **Clearance** and each body's nearest neighbour.
 
+A joint origin on a face or a hole keeps the turn it had when it was picked: when the face tilts
+(a bend angle or a rotation changing with a parameter) the part on it tilts with the face but
+doesn't spin about it.
+
 The check behind it, `inspect.clearance`, does all of that in one call for any number of bodies,
 which suits scripts and agents checking a whole assembly:
 

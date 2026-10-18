@@ -300,7 +300,7 @@ fn origin_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<JointOrigin
                 pick
             };
             let face = solidcraft_doc::naming::face_names_at(&s.model.state(), &[named_at]).into_iter().next().filter(|n| !n.is_empty());
-            if what == "face" { Snap::FaceCenter { pick, face } } else { Snap::CircleCenter { pick, face } }
+            if what == "face" { Snap::FaceCenter { pick, face, x: None } } else { Snap::CircleCenter { pick, face, x: None } }
         }
         "point" => Snap::Point { point: local(world), z: v.get("z").and_then(vec3).map(local_dir) },
         _ => {
@@ -311,7 +311,8 @@ fn origin_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<JointOrigin
     };
     let o = JointOrigin { occurrence, snap };
     match joints::resolve_origin(&s.doc, &s.model.state(), &o) {
-        Ok(_) => Ok(o),
+        // A face or circle keeps the x it has now, so its frame doesn't turn as the face tilts.
+        Ok(m) => Ok(JointOrigin { snap: o.snap.with_frame_x(Vec3::new(m[0][0], m[0][1], m[0][2])), ..o }),
         // A circle given by its centre, where no face lies (#393).
         Err(e) => match (what == "circle").then(|| circle_centre(s, occurrence, local(world))).flatten() {
             Some(snap) => Ok(JointOrigin { occurrence, snap }),
@@ -1230,6 +1231,9 @@ pub(crate) fn overlapping_pairs(boxes: &[Aabb3], limit: usize) -> (Vec<(usize, u
     (pairs, skipped)
 }
 
+#[cfg(test)]
+#[path = "joint_frames_tests.rs"]
+mod frames_tests;
 #[cfg(test)]
 #[path = "joints_reach_tests.rs"]
 mod reach_tests;

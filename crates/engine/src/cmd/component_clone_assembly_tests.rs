@@ -35,11 +35,14 @@ fn documents() -> (Document, Document) {
     source.assembly.origins = vec![
         NamedOrigin {
             name: "Typed origin".into(),
-            origin: JointOrigin { occurrence: 1, snap: Snap::FaceCenter { pick: Vec3::new(1.0, 2.0, 3.0), face: Some("F1:start@F10.2".into()) } },
+            origin: JointOrigin {
+                occurrence: 1,
+                snap: Snap::FaceCenter { pick: Vec3::new(1.0, 2.0, 3.0), face: Some("F1:start@F10.2".into()), x: None },
+            },
         },
         NamedOrigin {
             name: "Foreign geometry".into(),
-            origin: JointOrigin { occurrence: 1, snap: Snap::CircleCenter { pick: Vec3::ZERO, face: Some("F99:end".into()) } },
+            origin: JointOrigin { occurrence: 1, snap: Snap::CircleCenter { pick: Vec3::ZERO, face: Some("F99:end".into()), x: None } },
         },
         NamedOrigin { name: "Outside".into(), origin: at(9) },
     ];
@@ -103,7 +106,8 @@ fn internal_relationships_receive_independent_ids_and_remapped_typed_references(
 #[test]
 fn copied_gears_take_their_picked_faces_along() {
     let (mut source, _) = documents();
-    let circle = |face: &str| Size::Circle(JointOrigin { occurrence: 1, snap: Snap::CircleCenter { pick: Vec3::X, face: Some(face.into()) } });
+    let circle =
+        |face: &str| Size::Circle(JointOrigin { occurrence: 1, snap: Snap::CircleCenter { pick: Vec3::X, face: Some(face.into()), x: None } });
     let gear = |ra| Coupling::Gear { ra, rb: Size::Length(5.0), internal: false, reverse: false };
     source.assembly.links = vec![
         MotionLink { a: 1, ia: 0, b: 2, ib: 0, ratio: -2.0, offset: 0.0, coupling: Some(gear(circle("F1:side"))), lift: Vec::new() },
