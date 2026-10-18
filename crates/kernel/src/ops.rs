@@ -278,6 +278,8 @@ fn overlap(
 
 /// Whether some facet of `m` has material just under it (`depth` in from its middle) that is
 /// inside the other body (`inside`) or outside it. With `within`, only facets in that box.
+/// Points for which `ignored` holds, asked with the point and the facet's face (`u32::MAX`
+/// where the mesh has none), are no evidence either.
 fn under_surface(
     m: &solidcraft_geom::Mesh,
     own: &solidcraft_geom::InsideIndex,
@@ -285,13 +287,14 @@ fn under_surface(
     depth: f64,
     inside: bool,
     within: Option<&solidcraft_geom::Aabb3>,
+    ignored: &dyn Fn(Vec3, u32) -> bool,
 ) -> bool {
-    m.triangles.iter().filter_map(|t| m.tri(t)).any(|[p, q, r]| {
+    m.triangles.iter().enumerate().filter_map(|(i, t)| Some((m.tri(t)?, m.tri_face.get(i).copied().unwrap_or(u32::MAX)))).any(|([p, q, r], face)| {
         let Some(n) = (q - p).cross(r - p).normalized() else { return false };
         let c = (p + q + r) * (1.0 / 3.0) - n * depth;
         let near = within.is_none_or(|b| c.x >= b.min.x && c.x <= b.max.x && c.y >= b.min.y && c.y <= b.max.y && c.z >= b.min.z && c.z <= b.max.z);
         // A wall thinner than `depth` puts the point outside its own body: no evidence.
-        near && other.contains(c) == inside && own.contains(c)
+        near && other.contains(c) == inside && own.contains(c) && !ignored(c, face)
     })
 }
 
@@ -299,8 +302,8 @@ fn under_surface(
 /// their surfaces pass through each other, or a facet of one has material under it on the
 /// wrong side of the other. Overlaps and gaps shallower than `tol` are not seen, nor surfaces
 /// that pass through each other only on a cylinder both bodies have faces on, there between
-/// those faces or one of them and an end face across its axis (`shared`, asked only when they
-/// do pass through each other).
+/// those faces or one of them and an end face across its axis, nor material under such an end
+/// face's facets at the cylinder (`shared`, asked only when the facetings disagree).
 fn contradicted(
     (ma, ia): (&solidcraft_geom::Mesh, &solidcraft_geom::InsideIndex),
     (mb, ib): (&solidcraft_geom::Mesh, &solidcraft_geom::InsideIndex),
@@ -311,18 +314,25 @@ fn contradicted(
     if !(disjoint || b_in_a || a_in_b) {
         return false;
     }
+    let cylinders = std::cell::OnceCell::new();
+    let shared = || cylinders.get_or_init(shared);
     if ma.crosses(mb, tol) {
         let shared = shared();
         if shared.cylinders.is_empty() || ma.crosses_except(mb, tol, |p, fa, fb| shared.ignores(p, fa, fb, tol)) {
             return true;
         }
     }
+    // The end faces of a shared cylinder end on it at their own faceting: a facet of a pin's end
+    // inside the hole, or of the hole part's end face round the pin, has its middle within the
+    // facetings' error of the cylinder, where the other body's facets can reach over it.
+    let (under_a, under_b) = (|p: Vec3, f: u32| shared().under_cap(p, f, true, tol), |p: Vec3, f: u32| shared().under_cap(p, f, false, tol));
     if disjoint {
         let (ba, bb) = (ma.bounds(), mb.bounds());
-        let shared = solidcraft_geom::Aabb3 { min: ba.min.max(bb.min), max: ba.max.min(bb.max) };
-        return !shared.is_empty() && (under_surface(ma, ia, ib, tol, true, Some(&shared)) || under_surface(mb, ib, ia, tol, true, Some(&shared)));
+        let meet = solidcraft_geom::Aabb3 { min: ba.min.max(bb.min), max: ba.max.min(bb.max) };
+        return !meet.is_empty()
+            && (under_surface(ma, ia, ib, tol, true, Some(&meet), &under_a) || under_surface(mb, ib, ia, tol, true, Some(&meet), &under_b));
     }
-    (a_in_b && under_surface(ma, ia, ib, tol, false, None)) || (b_in_a && !a_in_b && under_surface(mb, ib, ia, tol, false, None))
+    (a_in_b && under_surface(ma, ia, ib, tol, false, None, &under_a)) || (b_in_a && !a_in_b && under_surface(mb, ib, ia, tol, false, None, &under_b))
 }
 
 /// Sampled overlap fraction below which two bodies share no material.
@@ -373,6 +383,14 @@ impl SharedCylinders {
             let (on_a, on_b) = (fa == c.faces.0, fb == c.faces.1);
             ((on_a && on_b) || (on_a && c.caps.1.contains(&fb)) || (c.caps.0.contains(&fa) && on_b)) && c.holds(p, tol)
         })
+    }
+
+    /// Whether `p`, just under a facet of the first body's face `face` (`first`) or the second's,
+    /// lies within `tol` of a shared cylinder with that face one of its end faces: material the
+    /// other body's facets of the cylinder can cover there, though the surfaces only touch.
+    fn under_cap(&self, p: Vec3, face: u32, first: bool, tol: f64) -> bool {
+        let face = face as usize;
+        self.cylinders.iter().any(|c| (if first { &c.caps.0 } else { &c.caps.1 }).contains(&face) && c.holds(p, tol))
     }
 }
 
@@ -699,6 +717,67 @@ mod shortcut_tests {
         let counts = record::counts(&[&ma, &mb]);
         let (sa, sb) = (ma.tessellate_with(0.009, true).unwrap(), mb.tessellate_with(0.009, true).unwrap());
         assert!(trivial(&ma, &mb, BoolOp::Intersect, &sa, &sb, &counts, 0.027).is_none_or(|(_, sure)| !sure));
+    }
+
+    /// A pin turned from a profile (its wall in three faces) and a plate with a bore of the pin's
+    /// size (its wall in two), the pin's end inside the bore: turned about the pin's axis and
+    /// the pair placed and tilted.
+    fn pin_in_plate_bore(radius: f64, turn: f64, (to, axis, angle): (Vec3, Vec3, f64)) -> (Body, Body) {
+        use solidcraft_geom::{Loop2, Plane, Region2, Vec2};
+        let profile = Region2 {
+            outer: Loop2::polygon(&[Vec2::new(0.0, -2.35), Vec2::new(radius, -2.35), Vec2::new(radius, 9.65), Vec2::new(0.0, 9.65)]),
+            holes: vec![],
+        };
+        let plane = Plane { origin: Vec3::ZERO, x: Vec3::X, y: Vec3::Z };
+        let pin = crate::revolve(&plane, &[profile], Vec2::ZERO, Vec2::new(0.0, 1.0), std::f64::consts::TAU).unwrap().pop().unwrap();
+        let pin = crate::transform(&pin, Vec3::ZERO, Vec3::ZERO, Vec3::Z, turn).unwrap();
+        let block = crate::box_solid(Vec3::new(-8.0, -8.0, 0.0), Vec3::new(8.0, 8.0, 19.5)).unwrap();
+        let bore = crate::cylinder(Vec3::new(0.0, 0.0, -1.0), Vec3::Z, 3.0, 21.5).unwrap();
+        let plate = boolean(&block, &bore, BoolOp::Cut).unwrap().unwrap();
+        let place = |b: &Body| crate::transform(b, to, Vec3::ZERO, axis, angle).unwrap();
+        (place(&pin), place(&plate))
+    }
+
+    /// Placements of the pair: as built, far off the origin on its side, and tilted two ways.
+    const PLACEMENTS: [(Vec3, Vec3, f64); 4] = [
+        (Vec3::ZERO, Vec3::Z, 0.0),
+        (Vec3::new(-270.0, 267.1, 546.7), Vec3::Y, -std::f64::consts::FRAC_PI_2),
+        (Vec3::new(120.0, -40.0, 15.0), Vec3::new(1.0, 1.0, 0.0), 0.7),
+        (Vec3::new(-35.0, 80.0, -60.0), Vec3::new(0.3, -0.5, 1.0), 2.1),
+    ];
+
+    /// The pin's end lies on the bore's rim at its own faceting, the plate's end face round the
+    /// pin at the bore's: the middle of a facet there can be just under the other body's facets
+    /// of the cylinder, so the material under it looked inside the other body though the two
+    /// only touch (the pin turned 9 steps and the pair tilted about x = y did, the boolean then
+    /// fell back on its retries and called its answer unverified). At every turn and placement
+    /// the pin is clear of the plate, answered at once.
+    #[test]
+    fn a_pin_in_a_plate_bore_of_its_size_is_clear_of_it_at_any_placement() {
+        for k in 0..12 {
+            for placement in PLACEMENTS {
+                let (pin, plate) = pin_in_plate_bore(3.0, k as f64 * 0.13, placement);
+                for (x, y) in [(&pin, &plate), (&plate, &pin)] {
+                    let (r, report) = crate::capture_boolean_diagnostics(|| boolean(x, y, BoolOp::Intersect));
+                    assert!(matches!(r, Ok(None)) && report.events.is_empty(), "{k} {placement:?} {r:?} {report:?}");
+                }
+            }
+        }
+    }
+
+    /// The same pin 0.02 mm larger than the bore shares a ring with the plate along the length
+    /// it is in it: an overlap, at the placements above too.
+    #[test]
+    fn a_pin_slightly_larger_than_its_plate_bore_still_overlaps_it() {
+        let want = std::f64::consts::PI * (3.02f64.powi(2) - 9.0) * 9.65;
+        for k in [0, 3, 6, 9] {
+            for placement in PLACEMENTS {
+                let (pin, plate) = pin_in_plate_bore(3.02, k as f64 * 0.13, placement);
+                let (r, report) = crate::capture_boolean_diagnostics(|| boolean(&pin, &plate, BoolOp::Intersect));
+                let shared = r.unwrap().map(|b| crate::measure(&b).unwrap().volume);
+                assert!(shared.is_some_and(|v| (v - want).abs() < 0.05 * want), "{k} {placement:?} {shared:?} {want} {report:?}");
+            }
+        }
     }
 
     /// A pin of the bore's size pushed 0.05 mm on past the bore, into a narrower one, shares a
