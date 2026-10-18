@@ -55,6 +55,18 @@ pub enum Snap {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<Vec3>,
     },
+    /// A point on an edge of a planar face: the edge's middle, or the corner where it meets the
+    /// edge `corner` names (`joints_edge.rs`). `edge` and `face` are the persistent names of the
+    /// edge and the face (found first); `pick` is a point on the edge as it was picked.
+    Edge {
+        pick: Vec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edge: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        face: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        corner: Option<String>,
+    },
     /// A point, z along `z` (default +Z).
     Point {
         point: Vec3,
@@ -72,7 +84,7 @@ impl Snap {
     pub fn frame_x(&self) -> Option<Vec3> {
         match self {
             Snap::Frame { x, .. } | Snap::FaceCenter { x, .. } | Snap::CircleCenter { x, .. } => *x,
-            Snap::Point { .. } => None,
+            Snap::Point { .. } | Snap::Edge { .. } => None,
         }
     }
 
@@ -447,6 +459,7 @@ pub fn resolve_origin(doc: &Document, st: &ModelState, o: &JointOrigin) -> Resul
             let (_, c, n) = best.ok_or_else(|| DocError::Invalid("joint origin: no planar face there".into()))?;
             frame(c, n, *x).ok_or_else(bad)
         }
+        Snap::Edge { .. } => edge::edge_frame(doc, st, component_of(doc, o.occurrence)?, &o.snap),
         Snap::CircleCenter { x, .. } => {
             let (pick, cyl) = circle_at(doc, st, o)?;
             let s = (pick - cyl.axis_point).dot(cyl.axis);
@@ -1459,6 +1472,10 @@ impl Document {
 
 #[path = "joints_cam.rs"]
 pub mod cam;
+
+#[path = "joints_edge.rs"]
+mod edge;
+pub use edge::edge_snap;
 
 #[path = "joints_reach.rs"]
 mod reach;
