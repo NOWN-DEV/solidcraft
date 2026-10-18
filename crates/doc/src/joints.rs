@@ -477,17 +477,23 @@ fn named_pick(doc: &Document, st: &ModelState, pick: Vec3, face: Option<&str>) -
     }
 }
 
-/// The centre and outward normal of the planar face nearest `pick` (component coordinates).
+/// The centre and outward normal of the planar face nearest `pick` (component coordinates; a
+/// body moved in from another component placed by its offset, as a named face is).
 fn nearest_plane(doc: &Document, st: &ModelState, o: &JointOrigin, pick: Vec3) -> Result<(Vec3, Vec3)> {
     let comp = component_of(doc, o.occurrence)?;
     let mut best: Option<(f64, Vec3, Vec3)> = None;
     for b in component_bodies(doc, st, comp) {
+        let offset = doc.model_body_offset(b);
         let tol = (b.body.size() * 2e-3).max(1e-3);
         for f in b.body.faces(tol)? {
             let Some(n) = f.plane_normal else { continue };
-            let d = (pick - f.centroid).dot(n).abs() + 1e-3 * (pick - f.centroid).len();
+            let (c, n) = match offset {
+                Some(m) => (apply_point(m, f.centroid), apply_vector(m, n)),
+                None => (f.centroid, n),
+            };
+            let d = (pick - c).dot(n).abs() + 1e-3 * (pick - c).len();
             if best.as_ref().is_none_or(|(bd, _, _)| d < *bd) {
-                best = Some((d, f.centroid, n));
+                best = Some((d, c, n));
             }
         }
     }
@@ -532,9 +538,14 @@ fn round_of(doc: &Document, st: &ModelState, o: &JointOrigin) -> Result<face::Ro
     }
     let pick = named_pick(doc, st, *pick, face.as_deref())?;
     let comp = component_of(doc, o.occurrence)?;
+    // A body moved in from another component: looked at in its own coordinates, its cylinder
+    // placed by its offset (as a named face is).
     let cyl = component_bodies(doc, st, comp)
         .into_iter()
-        .filter_map(|b| solidcraft_kernel::cylinder_face_at(&b.body, pick))
+        .filter_map(|b| match doc.model_body_offset(b) {
+            Some(m) => solidcraft_kernel::cylinder_face_at(&b.body, apply_point(&mat_inverse(m)?, pick)).map(|c| face::placed(m, c)),
+            None => solidcraft_kernel::cylinder_face_at(&b.body, pick),
+        })
         .min_by(|a, b| {
             let off = |c: &solidcraft_kernel::CylinderFace| {
                 let v = pick - c.axis_point;

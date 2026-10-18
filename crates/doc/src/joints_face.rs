@@ -45,6 +45,9 @@ pub(super) fn named_face<'a>(doc: &Document, st: &'a ModelState, pick: Vec3, nam
 impl NamedFace<'_> {
     /// A point of the component's coordinates in the body's own.
     fn local(&self, p: Vec3) -> Vec3 {
+        if self.offset == IDENTITY {
+            return p;
+        }
         mat_inverse(&self.offset).map_or(p, |inv| apply_point(&inv, p))
     }
 
@@ -67,7 +70,7 @@ impl NamedFace<'_> {
 }
 
 /// A cylinder of a body's own coordinates placed by the body's (rigid) offset.
-fn placed(m: &Mat, c: CylinderFace) -> CylinderFace {
+pub(super) fn placed(m: &Mat, c: CylinderFace) -> CylinderFace {
     CylinderFace { axis_point: apply_point(m, c.axis_point), axis: apply_vector(m, c.axis), ..c }
 }
 
@@ -118,11 +121,33 @@ fn ends(c: &CylinderFace) -> [(f64, f64); 2] {
     [(c.start, -1.0), (c.end, 1.0)]
 }
 
-/// The end of `c` nearer `pick` along the axis (the start on a tie).
+/// The end of `c` nearer `pick` along the axis. On a tie, the end older builds took: the start
+/// of the axis as the kernel turns it (toward +x, else +y, else +z), whichever way the face's
+/// own surface runs.
 fn nearer_end(c: &CylinderFace, pick: Vec3) -> (f64, f64) {
     let s = (pick - c.axis_point).dot(c.axis);
     let [start, end] = ends(c);
-    if (s - c.start).abs() <= (c.end - s).abs() { start } else { end }
+    let (to_start, to_end) = ((s - c.start).abs(), (c.end - s).abs());
+    let reversed = c.axis.x + c.axis.y * 1e-3 + c.axis.z * 1e-6 < 0.0;
+    if to_start < to_end || (to_start == to_end && !reversed) { start } else { end }
+}
+
+/// The end a named round face takes without an `end` (a design saved before origins named
+/// it): the one nearer the pick (moved onto the face) along the axis, decided as those builds
+/// decided it, by the kernel's reading of the cylinder at the pick, so a pick midway along the
+/// wall takes the same end as it did then. `own` is the face's cylinder (the body's own
+/// coordinates).
+fn end_by_pick(nf: &NamedFace, own: &CylinderFace) -> (f64, f64) {
+    let pick = nf.local(nf.point);
+    let [start, end] = ends(own);
+    match solidcraft_kernel::cylinder_face_at(&nf.body.body, pick).filter(|k| k.axis.dot(own.axis).abs() > 0.5) {
+        Some(k) => {
+            let s = (pick - k.axis_point).dot(k.axis);
+            let out = if (s - k.start).abs() <= (k.end - s).abs() { -k.axis } else { k.axis };
+            if out.dot(own.axis) < 0.0 { start } else { end }
+        }
+        None => nearer_end(own, pick),
+    }
 }
 
 /// A round joint origin worked out: its cylinder, and the centre and outward axis of the end
@@ -145,7 +170,6 @@ impl Round {
 pub(super) fn named_round(doc: &Document, st: &ModelState, pick: Vec3, face: &str, end: Option<&str>) -> Result<Option<Round>> {
     let nf = named_face(doc, st, pick, face)?;
     let Some(own) = nf.own_cylinder() else { return Ok(None) };
-    let local_pick = nf.local(pick);
     let chosen = end
         .and_then(|name| {
             let hits: Vec<(f64, f64)> = ends(&own)
@@ -157,7 +181,7 @@ pub(super) fn named_round(doc: &Document, st: &ModelState, pick: Vec3, face: &st
                 _ => None,
             }
         })
-        .unwrap_or_else(|| nearer_end(&own, local_pick));
+        .unwrap_or_else(|| end_by_pick(&nf, &own));
     Ok(Some(Round::at(placed(&nf.offset, own), chosen)))
 }
 
@@ -262,7 +286,7 @@ pub fn pin_end(doc: &Document, st: &ModelState, snap: &mut Snap) {
     let Snap::CircleCenter { pick, face: Some(face), end: end @ None, .. } = snap else { return };
     let Ok(nf) = named_face(doc, st, *pick, face) else { return };
     let Some(own) = nf.own_cylinder() else { return };
-    let (at, _) = nearer_end(&own, nf.local(*pick));
+    let (at, _) = end_by_pick(&nf, &own);
     *end = rim_neighbour(nf.body, nf.face, &own, at).and_then(|n| crate::naming::face_names(nf.body).get(n).cloned()).filter(|n| !n.is_empty());
 }
 

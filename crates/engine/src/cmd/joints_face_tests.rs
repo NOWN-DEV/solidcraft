@@ -189,3 +189,79 @@ fn an_origin_without_an_end_or_turn_opens_as_before() {
     assert_eq!(v["x"], json!({"face": "F2:+x"}));
     assert_eq!(serde_json::from_value::<Snap>(v).ok(), Some(turned));
 }
+
+/// The frame a named joint origin resolves to: its origin and z.
+fn origin_frame(s: &Session, name: &str) -> Option<(Vec3, Vec3)> {
+    let o = s.doc.assembly.origins.iter().find(|o| o.name == name)?;
+    let m = solidcraft_doc::joints::resolve_origin(&s.doc, &s.model.state(), &o.origin).ok()?;
+    Some((Vec3::new(m[3][0], m[3][1], m[3][2]), Vec3::new(m[2][0], m[2][1], m[2][2])))
+}
+
+#[test]
+fn a_round_origin_saved_without_an_end_takes_the_end_it_took_before() {
+    // A plate `T` thick (5 mm) with a 6 mm hole through it, and two round origins as builds
+    // before `end` saved them (no `end`, no `x`): picks on the hole's wall 4 mm and 1 mm up.
+    let mut s = Session::default();
+    run(&mut s, "parameters.change", json!({"name": "T", "expression": "5 mm"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": "T", "corner": [0, 0, 0]}));
+    run(&mut s, "solid.hole", json!({"position": [20, 20, "T"], "diameter": 6}));
+    let wall = solidcraft_doc::joints::face_name_at(&s.doc, &s.model.state(), 0, Vec3::new(23.0, 20.0, 2.5), true).unwrap_or_default();
+    assert!(!wall.is_empty());
+    for (name, z) in [("High", 4.0), ("Low", 1.0)] {
+        let saved = json!({"name": name, "origin": {"occurrence": 0, "snap": {"face": wall, "pick": [23.0, 20.0, z], "type": "circle_center"}}});
+        let o: solidcraft_doc::joints::NamedOrigin = serde_json::from_value(saved).unwrap_or_else(|e| panic!("{e}"));
+        s.doc_mut().assembly.origins.push(o);
+    }
+    let dir = std::env::temp_dir().join(format!("solidcraft-joint-end-tie-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("plate.json").to_string_lossy().to_string();
+    run(&mut s, "file.save", json!({"path": path}));
+    run(&mut s, "file.new", json!({}));
+    run(&mut s, "doc.open", json!({"path": path}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (top, bottom) = (|t: f64| (Vec3::new(20.0, 20.0, t), Vec3::Z), (Vec3::new(20.0, 20.0, 0.0), -Vec3::Z));
+    // Where the pick is nearer one end, that end; midway along the wall (the plate 8 mm thick
+    // for the pick 4 mm up, 2 mm for the one 1 mm up), the bottom end, as those builds took.
+    for (t, high, low) in [(5.0, Some(top(5.0)), bottom), (8.0, Some(bottom), bottom), (2.0, None, bottom), (5.0, Some(top(5.0)), bottom)] {
+        run(&mut s, "parameters.change", json!({"name": "T", "expression": format!("{t} mm")}));
+        for (name, want) in [("High", high), ("Low", Some(low))] {
+            let Some((o, z)) = want else { continue };
+            let got = origin_frame(&s, name);
+            assert!(got.is_some_and(|(go, gz)| near(go, o) && near(gz, z)), "T = {t}, {name}: {got:?}, expected {o:?} {z:?}");
+        }
+    }
+}
+
+#[test]
+fn origins_on_a_body_placed_by_an_offset_agree_named_or_not() {
+    // A plate made at the origin, then placed by an offset (turned a quarter about x, moved):
+    // a body moved in from another component keeps its geometry where it was made.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 5, "corner": [0, 0, 0], "body_name": "Plate"}));
+    run(&mut s, "solid.hole", json!({"position": [20, 20, 5], "diameter": 6}));
+    let offset = solidcraft_doc::rigid(Vec3::new(7.0, 0.0, 3.0), Vec3::ZERO, Vec3::X, std::f64::consts::FRAC_PI_2);
+    s.doc_mut().body_offsets.insert("Plate".into(), offset);
+    s.refresh();
+    let at = |p: Vec3| solidcraft_doc::apply_point(&offset, p);
+    let up = solidcraft_doc::apply_vector(&offset, Vec3::Z);
+    let st = s.model.state();
+    let (top_pick, wall_pick) = (at(Vec3::new(10.0, 10.0, 5.0)), at(Vec3::new(23.0, 20.0, 4.0)));
+    let top = solidcraft_doc::joints::face_name_at(&s.doc, &st, 0, top_pick, false);
+    let wall = solidcraft_doc::joints::face_name_at(&s.doc, &st, 0, wall_pick, true);
+    assert!(top.is_some() && wall.is_some(), "{top:?} {wall:?}");
+    let resolve = |snap: Snap| {
+        let o = solidcraft_doc::joints::JointOrigin { occurrence: 0, snap };
+        let m = solidcraft_doc::joints::resolve_origin(&s.doc, &st, &o).unwrap_or_else(|e| panic!("{e}"));
+        (Vec3::new(m[3][0], m[3][1], m[3][2]), Vec3::new(m[2][0], m[2][1], m[2][2]))
+    };
+    // The top face's centre: by its name, and by the point alone.
+    let named = resolve(Snap::FaceCenter { pick: top_pick, face: top, x: None });
+    let unnamed = resolve(Snap::FaceCenter { pick: top_pick, face: None, x: None });
+    assert!(near(named.0, unnamed.0) && near(named.1, unnamed.1), "{named:?} {unnamed:?}");
+    assert!(near(named.1, up) && (named.0 - at(Vec3::new(0.0, 0.0, 5.0))).dot(up).abs() < 1e-6, "{named:?}");
+    // The hole's top end (the pick nearer it): by the wall's name, and by the point alone.
+    let named = resolve(Snap::CircleCenter { pick: wall_pick, face: wall, end: None, x: None });
+    let unnamed = resolve(Snap::CircleCenter { pick: wall_pick, face: None, end: None, x: None });
+    assert!(near(named.0, unnamed.0) && near(named.1, unnamed.1), "{named:?} {unnamed:?}");
+    assert!(near(named.0, at(Vec3::new(20.0, 20.0, 5.0))) && near(named.1, up), "{named:?}");
+}
