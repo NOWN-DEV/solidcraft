@@ -37,9 +37,10 @@ pub struct CoaxialOverlap {
 const NEAR: f64 = 0.01;
 /// The step the pin's wall is moved by, as a share of its radius.
 const STEP: f64 = 0.1;
-/// The tries each intersection here gets: with a wall moved clear it takes one or two, and
-/// one that needs more meets something this work does not cover.
-const ATTEMPTS: usize = 3;
+/// The tries each intersection here gets: with a wall moved clear it takes one or two, and a
+/// few more where a flush face is pulled back or the tool is nudged by a hair; one that needs
+/// more than that meets something this work does not cover.
+const ATTEMPTS: usize = 10;
 
 /// The faces of one body on one cylinder, the side its material is on and their extent along
 /// the axis.
