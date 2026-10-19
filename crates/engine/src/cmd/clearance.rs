@@ -351,17 +351,19 @@ fn measure_pair(
         // first, and what the walls share is otherwise worked out apart, with a few tries of the
         // boolean left for when that declines. The body left whole is cut down to where the
         // other's piece is first, so that both meet only the faces there.
-        let candidate = solidcraft_kernel::coaxial_candidate(ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body));
+        let candidate = solidcraft_kernel::coaxial_candidate(ca.as_ref().unwrap_or(ka), cb.as_ref().unwrap_or(kb));
         let pin = candidate.is_some();
         let (ca, cb) = match (ca, cb) {
             (Some(x), None) if pin => {
-                let y = narrowed(&bb.body, &x);
+                let y = narrowed(kb, &x);
                 (Some(x), y)
             }
-            (None, Some(y)) if pin => (narrowed(&ba.body, &y), Some(y)),
+            (None, Some(y)) if pin => (narrowed(ka, &y), Some(y)),
             other => other,
         };
-        let (pa, pb) = (ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body));
+        // A body left whole is the copy that keeps its meshes: meeting several others at one
+        // size, it is meshed once for the booleans of all of them.
+        let (pa, pb) = (ca.as_ref().unwrap_or(ka), cb.as_ref().unwrap_or(kb));
         let intersect = || {
             solidcraft_kernel::capture_boolean_diagnostics(|| {
                 let run = || solidcraft_kernel::boolean(pa, pb, solidcraft_kernel::BoolOp::Intersect);
