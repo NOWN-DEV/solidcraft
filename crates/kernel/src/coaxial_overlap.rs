@@ -1,10 +1,11 @@
 //! The shared volume of a pin in a hole of (nearly) its own size whose axis is a hair off the
-//! hole's (parts placed from rounded coordinates).
+//! hole's (parts placed from rounded coordinates), or on it: a pin seated line to line.
 //!
 //! The pin's wall and the hole's wall then meet along two lines where they are all but tangent,
-//! which the boolean cannot intersect, and the facets of the two walls pass through each other
+//! or lie on one another, which the boolean cannot intersect, and the facets of the two walls pass through each other
 //! by less than the boolean's sampled shortcuts can see. So the overlap is worked out in two
-//! parts instead. The pin's wall is moved off the hole's by a clear step (`offset_body`) and the
+//! parts instead. The pin's wall is moved off the hole's by a clear step (`offset_body`; where a
+//! blend running into the pin's wall keeps it from moving, the hole's wall is moved instead) and the
 //! bodies are intersected as they then are, which the boolean can do: narrowed, that gives the
 //! overlap away from the walls (the core). In the band the move swept, what the two walls
 //! share is a crescent in every section, whose area follows from the two circles alone. The
@@ -36,6 +37,9 @@ pub struct CoaxialOverlap {
 const NEAR: f64 = 0.01;
 /// The step the pin's wall is moved by, as a share of its radius.
 const STEP: f64 = 0.1;
+/// The tries each intersection here gets: with a wall moved clear it takes one or two, and
+/// one that needs more meets something this work does not cover.
+const ATTEMPTS: usize = 3;
 
 /// The faces of one body on one cylinder, the side its material is on and their extent along
 /// the axis.
@@ -66,8 +70,8 @@ struct Pair {
 }
 
 /// The overlap of `a` and `b` when a pin of one sits in a hole of the other on nearly the same
-/// cylinder (axes parallel, offset plus radius difference within 1 % of the radius, but not on
-/// the same surface), worked out as the module says. `None` when there is no such pin, or the
+/// cylinder (axes parallel, offset plus radius difference within 1 % of the radius, none for a
+/// pin seated line to line), worked out as the module says. `None` when there is no such pin, or the
 /// bodies hold more than the pin and the hole where the work assumes they don't: the caller
 /// then takes the general boolean.
 pub fn coaxial_overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
@@ -77,16 +81,51 @@ pub fn coaxial_overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     crate::guard("near-coaxial overlap", || Ok(overlap(a, b))).ok().flatten()
 }
 
+/// Whether a cylinder of `a` and one of `b` are on one cylinder or nearly (what
+/// [`coaxial_overlap`] asks first, from the faces' surfaces alone): a cheap test for whether
+/// it is worth preparing the bodies for it. `Some(true)` when every such pair is on one cylinder
+/// within the kernel's same-surface tolerance, which the boolean takes as one wall; `Some(false)`
+/// when one is a hair off, which it cannot intersect and may even pass as clear.
+pub fn coaxial_candidate(a: &Body, b: &Body) -> Option<bool> {
+    if a.is_mesh() || b.is_mesh() {
+        return None;
+    }
+    crate::guard("near-coaxial candidate", || {
+        let same = same_surface(a.size().max(b.size()));
+        let (ca, cb) = (cylinders(a), cylinders(b));
+        let mut found = None;
+        for x in &ca {
+            for y in &cb {
+                if x.axis.dot(y.axis).abs() <= 1.0 - 1e-9 {
+                    continue;
+                }
+                if let Some((_, offset)) = near(x, y) {
+                    let one = offset + (x.radius - y.radius).abs() <= same;
+                    found = Some(found.unwrap_or(true) && one);
+                }
+            }
+        }
+        Ok(found)
+    })
+    .ok()
+    .flatten()
+}
+
+/// The distance within which the kernel takes two surfaces as one, for bodies of `size`.
+fn same_surface(size: f64) -> f64 {
+    (size * 1e-7).max(1e-9) * 10.0
+}
+
 fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     let size = a.size().max(b.size());
     if !(size.is_finite() && size > 0.0) {
         return None;
     }
     // The same surface as the kernel takes it elsewhere: walls that close are one wall.
-    let same = (size * 1e-7).max(1e-9) * 10.0;
+    let same = same_surface(size);
     // Meshed only when two cylinders are close enough to be asked about.
     let (ca, cb) = (cylinders(a), cylinders(b));
-    let close = |x: &Wall, y: &Wall| x.axis.dot(y.axis).abs() > 1.0 - 1e-9 && near(x, y, same).is_some();
+    let close = |x: &Wall, y: &Wall| x.axis.dot(y.axis).abs() > 1.0 - 1e-9 && near(x, y).is_some();
     if !ca.iter().any(|x| cb.iter().any(|y| close(x, y))) {
         return None;
     }
@@ -101,35 +140,65 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
                 (true, false) => (x, y, true),
                 (false, true) => (y, x, false),
                 // Two pins or two holes on nearly one cylinder: not this case.
-                _ if near(x, y, same).is_some() => return None,
+                _ if near(x, y).is_some() => return None,
                 _ => continue,
             };
-            let Some((toward, offset)) = near(pin, hole, same) else { continue };
+            let Some((toward, offset)) = near(pin, hole) else { continue };
             let shared = intersect(&union(&pin.spans), &union(&project(hole, pin)));
             if total(&shared) <= same {
                 continue;
             }
             let step = (pin.radius * STEP).min(size * 0.02);
-            pairs.push(Pair { pin: pin.clone(), pin_in_a, hole: hole.clone(), toward, offset, shared, step });
+            // Within the kernel's same-surface tolerance the two walls are one: no crescent.
+            let mut hole = hole.clone();
+            let offset = if offset + (pin.radius - hole.radius).abs() <= same {
+                hole.radius = pin.radius;
+                0.0
+            } else {
+                offset
+            };
+            pairs.push(Pair { pin: pin.clone(), pin_in_a, hole, toward, offset, shared, step });
         }
     }
     if pairs.is_empty() {
         return None;
     }
-    // A pin's faces move together: one step for each of them (the pin's walls do not repeat
-    // across pairs unless one pin is near two holes, which the check below then answers).
+    // The pin's wall is moved where its neighbours let it; where they don't (a blend running
+    // into it), the hole's wall is moved away from the pin instead.
+    let stuck = std::cell::Cell::new(false);
+    answer(a, b, &pairs, size, false, &stuck).or_else(|| if stuck.get() { answer(a, b, &pairs, size, true, &stuck) } else { None })
+}
+
+/// The overlap of the `pairs` worked out with each pin's wall moved by steps, or each hole's
+/// (`move_hole`); `stuck` set when a body could not be moved.
+fn answer(a: &Body, b: &Body, pairs: &[Pair], size: f64, move_hole: bool, stuck: &std::cell::Cell<bool>) -> Option<CoaxialOverlap> {
+    // The pin's and the hole's radius with the moved wall `k` steps toward the other.
+    let radii = |p: &Pair, k: f64| if move_hole { (p.pin.radius, p.hole.radius - p.step * k) } else { (p.pin.radius + p.step * k, p.hole.radius) };
+    // A wall's faces move together: one step for each of them (a wall does not repeat across
+    // pairs unless one pin is near two holes, which the check below then answers).
     let shared_at = |k: f64| -> Option<(f64, Option<Body>)> {
         let moved = |body: &Body, in_a: bool| -> Option<Body> {
-            let mine: Vec<&Pair> = pairs.iter().filter(|p| p.pin_in_a == in_a).collect();
+            let mine: Vec<(&Wall, f64)> = pairs
+                .iter()
+                .filter_map(|p| match (move_hole, p.pin_in_a == in_a) {
+                    (false, true) => Some((&p.pin, p.step)),
+                    (true, false) => Some((&p.hole, p.step)),
+                    _ => None,
+                })
+                .collect();
             if mine.is_empty() {
                 return Some(body.clone());
             }
-            let shift = |i: usize, _| mine.iter().find(|p| p.pin.faces.contains(&i)).map(|p| p.step * k).unwrap_or(0.0);
-            let m = crate::offset::offset_body(body, shift).ok()?;
-            m.validity().is_empty().then_some(m)
+            let shift = |i: usize, _| mine.iter().find(|(w, _)| w.faces.contains(&i)).map(|(_, step)| step * k).unwrap_or(0.0);
+            let m = crate::offset::offset_body(body, shift).ok().filter(|m| m.validity().is_empty());
+            if m.is_none() {
+                stuck.set(true);
+            }
+            m
         };
         let (ma, mb) = (moved(a, true)?, moved(b, false)?);
-        let (r, report) = crate::capture_boolean_diagnostics(|| crate::ops::boolean(&ma, &mb, BoolOp::Intersect));
+        let (r, report) =
+            crate::capture_boolean_diagnostics(|| crate::ops::with_attempt_budget(ATTEMPTS, || crate::ops::boolean(&ma, &mb, BoolOp::Intersect)));
         if report.unverified().is_some() || report.warning().is_some() {
             return None;
         }
@@ -138,14 +207,17 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
             Some(body) => Some((crate::measure(&body).ok()?.volume, Some(body))),
         }
     };
-    // The crescents' volume with every pin grown by `k` steps.
-    let crescents =
-        |k: f64| -> f64 { pairs.iter().map(|p| total(&p.shared) * crescent(p.pin.radius + p.step * k, p.hole.radius, p.offset).area).sum() };
+    // The crescents' area along each pair with the moved walls `k` steps toward each other.
+    let crescent_at = |p: &Pair, k: f64| {
+        let (r, h) = radii(p, k);
+        crescent(r, h, p.offset).area
+    };
+    let crescents = |k: f64| -> f64 { pairs.iter().map(|p| total(&p.shared) * crescent_at(p, k)).sum() };
     let (core, core_body) = shared_at(-1.0)?;
     for k in [0.5, 1.0] {
         let (v, _) = shared_at(k)?;
         let gain = crescents(k) - crescents(-1.0);
-        if !((v - core - gain).abs() <= 0.02 * gain + 1e-4 * v.abs() + 1e-12 * size.powi(3)) {
+        if !((v - core - gain).abs() <= 0.002 * gain + 1e-4 * v.abs() + 1e-12 * size.powi(3)) {
             return None;
         }
     }
@@ -162,11 +234,11 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
         bbox = m.bbox;
         volume = m.volume;
     }
-    for p in &pairs {
+    for p in pairs {
         let c = crescent(p.pin.radius, p.hole.radius, p.offset);
         let length = total(&p.shared);
-        // Less what the narrowed pin already reached (nothing, unless the hole is the smaller).
-        let v = length * c.area - length * crescent(p.pin.radius - p.step, p.hole.radius, p.offset).area;
+        // Less what the moved walls already shared (nothing, unless the hole is the smaller).
+        let v = length * (c.area - crescent_at(p, -1.0));
         let mid = p.shared.iter().map(|(s, t)| (s + t) * 0.5 * (t - s)).sum::<f64>() / length;
         let side = p.toward.cross(p.pin.axis);
         moment += (p.pin.origin + p.pin.axis * mid + p.toward * c.centroid) * v;
@@ -186,17 +258,13 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     Some(CoaxialOverlap { volume: volume.max(0.0), area, centroid, bbox, offset, length })
 }
 
-/// The pin's offset to the hole, when the two are nearly on one cylinder but not on the same
-/// surface: the unit direction from the pin's axis to the hole's (any, for one axis) and the
-/// distance.
-fn near(pin: &Wall, hole: &Wall, same: f64) -> Option<(Vec3, f64)> {
+/// The pin's offset to the hole, when the two are on one cylinder or nearly: the unit direction
+/// from the pin's axis to the hole's (any, for one axis) and the distance.
+fn near(pin: &Wall, hole: &Wall) -> Option<(Vec3, f64)> {
     let d = hole.origin - pin.origin;
     let across = d - pin.axis * d.dot(pin.axis);
     let offset = across.len();
     let gap = (pin.radius - hole.radius).abs();
-    if offset <= same && gap <= same {
-        return None;
-    }
     if !(offset + gap <= NEAR * pin.radius.min(hole.radius)) {
         return None;
     }
@@ -417,8 +485,26 @@ mod tests {
         let slot = crate::box_solid(Vec3::new(2.5, -1.0, -1.0), Vec3::new(4.0, 1.0, 6.0)).unwrap();
         let slotted = crate::boolean(&plate, &slot, BoolOp::Cut).unwrap().unwrap();
         assert!(coaxial_overlap(&slotted, &pin).is_none());
-        // Pins on the very axis, or far off it, aren't asked about.
-        assert!(coaxial_overlap(&plate, &plate_and_pin(3.0, 0.0).1).is_none());
+        // So it is for a pin on the very axis; one far off it isn't asked about.
+        assert!(coaxial_overlap(&slotted, &plate_and_pin(3.0, 0.0).1).is_none());
         assert!(coaxial_overlap(&plate, &plate_and_pin(3.0, 0.5).1).is_none());
+    }
+
+    /// A pin seated line to line, on the hole's very axis: the walls share nothing, and a head
+    /// sunk 0.2 into the plate's face shares the ring under it.
+    #[test]
+    fn a_pin_seated_line_to_line_shares_only_what_its_head_sinks() {
+        let (plate, pin) = plate_and_pin(3.0, 0.0);
+        for (x, y) in [(&plate, &pin), (&pin, &plate)] {
+            let o = coaxial_overlap(x, y).unwrap();
+            assert!(o.volume < 1e-9 && o.offset < 1e-9 && (o.length - 5.0).abs() < 1e-9, "{o:?}");
+        }
+        let head = crate::cylinder(Vec3::new(0.0, 0.0, 4.8), Vec3::Z, 5.0, 2.0).unwrap();
+        let headed = crate::boolean(&pin, &head, BoolOp::Union).unwrap().unwrap();
+        let want = std::f64::consts::PI * (5.0f64.powi(2) - 3.0f64.powi(2)) * 0.2;
+        let o = coaxial_overlap(&plate, &headed).unwrap();
+        // Measured off the core's mesh, as a boolean's result is.
+        assert!((o.volume - want).abs() < 1e-4 * want, "{o:?} {want}");
+        assert!((o.centroid.z - 4.9).abs() < 1e-6, "{o:?}");
     }
 }
