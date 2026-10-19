@@ -327,6 +327,53 @@ fn face_snaps_mate_face_to_face() {
     assert!((b.max.z - 10.0).abs() < 1e-6, "{b:?}");
 }
 
+/// A new joint's Angle starts empty, showing that `joint.create` picks it: left untouched it is
+/// not sent; typed, it is. Edit Joint shows the joint's angle and sends it as before.
+#[test]
+fn joint_angle_left_empty_is_the_engines_choice() {
+    let mut app = two_boxes();
+    app.start("joint.create");
+    let mut d = app.dialog.take().unwrap();
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(10.0, 10.0, 10.0)).unwrap());
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(40.0, 10.0, 10.0)).unwrap());
+    let c = apply_commands(&app, &d).unwrap();
+    assert!(c[0].1.get("angle").is_none(), "an untouched angle is left out: {}", c[0].1);
+    app.dialog = Some(d);
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+    let frame = |app: &mut SolveApp, events: Vec<egui::Event>| {
+        let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(app, ui.ctx()));
+        // Nothing is painted: drop the texture changes (an unapplied delta panics on drop).
+        out.textures_delta.clear();
+        out
+    };
+    for _ in 0..3 {
+        frame(&mut app, vec![]);
+    }
+    let out = frame(&mut app, vec![]);
+    let at = text_at(&out, crate::i18n::tr("joint.angle_auto")).expect("the empty angle says it is automatic");
+    let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+    frame(&mut app, vec![button(true)]);
+    frame(&mut app, vec![button(false)]);
+    frame(&mut app, vec![egui::Event::Text("90 deg".into())]);
+    let d = app.dialog.as_ref().expect("the dialog stays open");
+    let c = apply_commands(&app, d).unwrap();
+    assert_eq!(c[0].1["angle"], json!("90 deg"), "a typed angle is sent");
+    for (id, p) in c {
+        app.run(&id, p).unwrap();
+    }
+    let id = app.session.doc.assembly.joints[0].id;
+    assert!((app.session.doc.assembly.joints[0].angle - 90f64.to_radians()).abs() < 1e-9);
+    // Edit Joint: the joint's angle is filled in and sent back.
+    let e = edit_joint(&app, id).unwrap();
+    let Kind::Assembly(Asm::Joint(f)) = &e.kind else { panic!("{:?}", e.kind) };
+    assert_eq!(f.angle, "90 deg");
+    let c = apply_commands(&app, &e).unwrap();
+    assert_eq!((c[0].0.as_str(), &c[0].1["angle"]), ("joint.edit", &json!("90 deg")));
+}
+
 /// Drive Joints takes the keyboard: typing a value and Enter drives the joint.
 #[test]
 fn drive_value_takes_the_keyboard() {

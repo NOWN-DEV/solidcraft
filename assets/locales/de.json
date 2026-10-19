@@ -504,6 +504,8 @@
   "install.menu": "App installieren…",
   "install.steps_intro": "Safari installiert Web-Apps über seine eigenen Menüs:",
   "install.title": "SolidCraft installieren",
+  "joint.angle_auto": "automatisch",
+  "joint.angle_auto_hint": "Leer gelassen: keine Drehung oder eine halbe Drehung um die Gelenkachse, je nachdem, was Komponente 2 weniger dreht.",
   "joint.from_bodies_hint": "Jeder ausgewählte Körper kommt in eine eigene neue Komponente und bleibt, wo er ist.",
   "joint.one_body": "Beide Auswahlen liegen auf {body}. Wählen Sie die zweite auf einem anderen Teil.",
   "joint.one_component": "Diese Teile sind Körper einer Komponente: {bodies}. Ein Gelenk bewegt eine Komponente gegenüber einer anderen, daher braucht jedes Teil eine eigene Komponente.",

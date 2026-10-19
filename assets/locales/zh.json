@@ -715,6 +715,8 @@
   "install.menu": "安装应用…",
   "install.steps_intro": "Safari 通过自身的菜单安装网页应用：",
   "install.title": "安装 SolidCraft",
+  "joint.angle_auto": "自动",
+  "joint.angle_auto_hint": "留空时：不转或绕接头轴转半圈，取使组件 2 转动较少的一种。",
   "joint.from_bodies_hint": "每个所选实体移入各自的新组件，位置保持不变。",
   "joint.one_body": "两次选择都在 {body} 上。请在另一个零件上选择第二个。",
   "joint.one_component": "这些零件是同一组件的实体：{bodies}。接头使一个组件相对另一个组件运动，因此每个零件都需要自己的组件。",

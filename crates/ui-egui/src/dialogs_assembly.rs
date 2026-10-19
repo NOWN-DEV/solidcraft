@@ -14,7 +14,7 @@ use solidcraft_engine::doc::joints::JointKind;
 use solidcraft_engine::geom::{Aabb3, Mesh, Vec3};
 
 use crate::SolveApp;
-use crate::dialogs::{Dialog, Kind, combo, field, row_label};
+use crate::dialogs::{Dialog, Kind, combo, field, field_hint, row_label};
 use crate::preview::{Built, Colors};
 use crate::selection::{BODIES, EDGES, FACES, SelInput, VERTICES};
 use crate::theme::Tokens;
@@ -97,6 +97,8 @@ pub struct JointForm {
     pub kind: usize,
     /// Flip B relative to the mate (faces apart instead of together).
     pub flip: bool,
+    /// Empty for a new joint until something is typed: `joint.create` then picks no turn or a
+    /// half turn, whichever turns B less.
     pub angle: String,
     pub offset: [String; 3],
     /// Per joint value: limited, minimum, maximum.
@@ -114,7 +116,7 @@ impl JointForm {
             editing: None,
             kind: 0,
             flip: false,
-            angle: "0 deg".into(),
+            angle: String::new(),
             offset: ["0 mm".into(), "0 mm".into(), "0 mm".into()],
             limits: Vec::new(),
             animate: false,
@@ -526,7 +528,12 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
             f.fit_limits();
             if !f.as_built {
                 row_label(ui, "Angle");
-                enter |= field(ui, &mut f.angle);
+                // A new joint's empty angle is the engine's own choice; an edited joint shows its angle.
+                if f.editing.is_none() {
+                    enter |= field_hint(ui, &mut f.angle, crate::i18n::tr("joint.angle_auto"), crate::i18n::tr("joint.angle_auto_hint"));
+                } else {
+                    enter |= field(ui, &mut f.angle);
+                }
                 ui.end_row();
                 for (l, v) in ["Offset X", "Offset Y", "Offset Z"].iter().zip(f.offset.iter_mut()) {
                     if f.editing.is_some() && *l != "Offset Z" {
@@ -905,7 +912,11 @@ pub fn commands(app: &SolveApp, k: &Asm, inputs: &[SelInput]) -> Result<Vec<(Str
             let limits: Vec<Value> =
                 f.limits.iter().take(jk.dofs().len()).map(|(on, lo, hi)| if *on { json!([lo, hi]) } else { Value::Null }).collect();
             if let Some(id) = f.editing {
-                let mut out = cmd("joint.edit", json!({"joint": id, "type": kind, "flip": f.flip, "offset": f.offset[2], "angle": f.angle}));
+                let mut p = json!({"joint": id, "type": kind, "flip": f.flip, "offset": f.offset[2]});
+                if !f.angle.trim().is_empty() {
+                    p["angle"] = json!(f.angle);
+                }
+                let mut out = cmd("joint.edit", p);
                 for (i, l) in limits.iter().enumerate() {
                     let p = match l.as_array() {
                         Some(a) => json!({"joint": id, "index": i, "min": a.first(), "max": a.get(1)}),
@@ -935,7 +946,12 @@ pub fn commands(app: &SolveApp, k: &Asm, inputs: &[SelInput]) -> Result<Vec<(Str
             // Picked origins mate by default (the engine's default: B's z opposite A's, faces
             // meet face to face, a pin goes into its hole); the dialog's Flip is the command's
             // `flip`, which turns B the other way.
-            let p = json!({"type": kind, "a": a_param, "b": b.param, "flip": f.flip, "offset": f.offset[2], "angle": f.angle, "limits": limits});
+            let mut p = json!({"type": kind, "a": a_param, "b": b.param, "flip": f.flip, "offset": f.offset[2], "limits": limits});
+            // An angle left empty is left out: `joint.create` then keeps B's turn (none or a half
+            // turn, whichever turns it less) instead of the dialog forcing none.
+            if !f.angle.trim().is_empty() {
+                p["angle"] = json!(f.angle);
+            }
             cmd("joint.create", p)
         }
         Asm::JointOrigin { name, .. } => {

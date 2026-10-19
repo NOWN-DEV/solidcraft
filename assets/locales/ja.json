@@ -715,6 +715,8 @@
   "install.menu": "アプリをインストール…",
   "install.steps_intro": "Safari では、Web アプリを Safari 自身のメニューからインストールします:",
   "install.title": "SolidCraft をインストール",
+  "joint.angle_auto": "自動",
+  "joint.angle_auto_hint": "空欄のとき: 回転なし、またはジョイント軸まわりの半回転のうち、コンポーネント 2 の回転が少ない方になります。",
   "joint.from_bodies_hint": "選択した各ボディを、位置はそのままで専用の新しいコンポーネントに移動します。",
   "joint.one_body": "両方の選択が {body} 上にあります。2 つ目は別の部品で選択してください。",
   "joint.one_component": "これらの部品は 1 つのコンポーネントのボディです: {bodies}。ジョイントはコンポーネント同士を動かすため、部品ごとに専用のコンポーネントが必要です。",

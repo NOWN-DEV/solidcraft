@@ -1347,6 +1347,19 @@ pub(crate) fn field(ui: &mut egui::Ui, s: &mut String) -> bool {
     r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
+/// A value field that may be left empty, showing `hint` (what an empty field means) until
+/// something is typed, and `hover` (when not empty) as its tooltip; true when Enter was pressed
+/// in it.
+pub(crate) fn field_hint(ui: &mut egui::Ui, s: &mut String, hint: &str, hover: &str) -> bool {
+    let mut r = ui.add(egui::TextEdit::singleline(s).hint_text(hint));
+    if !hover.is_empty() {
+        r = r.on_hover_text(hover);
+    }
+    publish_row(&r);
+    crate::params_dialog::complete(ui, &r, s);
+    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
 /// A checkbox row. Its row handle (`dialog:<row label>`) lets a scenario click it by the label
 /// beside it, the way `field` already publishes one for a value field.
 pub(crate) fn check(ui: &mut egui::Ui, on: &mut bool) {

@@ -715,6 +715,8 @@
   "install.menu": "Install app…",
   "install.steps_intro": "Safari installs web apps from its own menus:",
   "install.title": "Install SolidCraft",
+  "joint.angle_auto": "auto",
+  "joint.angle_auto_hint": "Left empty: no turn or a half turn about the joint's axis, whichever turns component 2 less.",
   "joint.from_bodies_hint": "Each picked body moves into a new component of its own and stays where it is.",
   "joint.one_body": "Both picks are on {body}. Pick the second one on another part.",
   "joint.one_component": "These parts are bodies of one component: {bodies}. A joint moves one component against another, so each part needs a component of its own.",
