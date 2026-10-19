@@ -214,11 +214,15 @@ fn clearance(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let todo: Vec<usize> = (0..close.len()).filter(|&k| results.get(k).is_some_and(Option::is_none)).collect();
     let reused = close.len() - todo.len();
+    // A body in many pairs is cut down to each pair's region from the same mesh of it.
+    let kept: Vec<std::sync::OnceLock<Option<solidcraft_kernel::Body>>> = (0..n).map(|_| std::sync::OnceLock::new()).collect();
+    let kept_body = |i: usize| kept.get(i)?.get_or_init(|| solid.get(i).map(|b| b.body.keeping_meshes())).as_ref();
     let measured = solidcraft_kernel::map_with_local_pools(&todo, usize::MAX, |&k| {
         let Some(&(i, j)) = close.get(k) else { return Ok(PairResult::default()) };
         let (Some(a), Some(b)) = (shape(i), shape(j)) else { return Ok(PairResult::default()) };
         let (Some(ba), Some(bb)) = (solid.get(i), solid.get(j)) else { return Ok(PairResult::default()) };
-        Ok(measure_pair(ba, a, bb, b, gap, min_volume, tolerance))
+        let (Some(ka), Some(kb)) = (kept_body(i), kept_body(j)) else { return Ok(PairResult::default()) };
+        Ok(measure_pair((ba, ka), a, (bb, kb), b, gap, min_volume, tolerance))
     });
     if let Ok(mut cache) = s.clearance_cache.lock() {
         for (&k, r) in todo.iter().zip(&measured) {
@@ -310,9 +314,9 @@ fn clearance(s: &mut Session, p: &Value) -> Result<Value> {
 /// One pair: its overlap when the meshes meet or one holds the other, otherwise its distance
 /// when it may be closer than `gap`.
 fn measure_pair(
-    ba: &solidcraft_doc::ModelBody,
+    (ba, ka): (&solidcraft_doc::ModelBody, &solidcraft_kernel::Body),
     a: &DistanceShape,
-    bb: &solidcraft_doc::ModelBody,
+    (bb, kb): (&solidcraft_doc::ModelBody, &solidcraft_kernel::Body),
     b: &DistanceShape,
     gap: f64,
     min_volume: f64,
@@ -336,7 +340,7 @@ fn measure_pair(
     if touching || holds(ba, bb) || holds(bb, ba) {
         // A pair whose shared part can't be worked out is reported, not passed as clear.
         let region = shared_region(a, b);
-        let (ca, cb) = (clipped(&ba.body, region), clipped(&bb.body, region));
+        let (ca, cb) = (clipped(ka, region), clipped(kb, region));
         let (shared, report) = solidcraft_kernel::capture_boolean_diagnostics(|| {
             solidcraft_kernel::boolean(ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body), solidcraft_kernel::BoolOp::Intersect)
         });
