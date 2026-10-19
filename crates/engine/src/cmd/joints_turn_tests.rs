@@ -58,3 +58,22 @@ fn joining_two_faces_that_already_meet_leaves_the_part_where_it_is() {
     let j = s.doc.assembly.joints.last().map(|j| j.angle);
     assert_eq!(j, Some(0.0));
 }
+
+#[test]
+fn an_angle_typed_as_an_expression_is_not_replaced_by_the_kept_turn() {
+    // `turn` is 0 deg: the hinge takes the half turn the angle says, not the one that would
+    // leave it where it is, and follows the parameter when it changes.
+    let mut s = panel_and_hinge();
+    run(&mut s, "parameters.add", json!({"name": "turn", "expression": "0 deg"}));
+    run(
+        &mut s,
+        "joint.create",
+        json!({"type": "rigid", "a": {"occurrence": "Panel", "face": [30, 25, 3]}, "b": {"occurrence": "Hinge", "face": [30, 25, 3]}, "angle": "turn", "name": "J"}),
+    );
+    assert!(!stays(&s));
+    let j = s.doc.assembly.joints.last().map(|j| (j.angle, j.exprs.angle.clone()));
+    assert_eq!(j, Some((0.0, Some("turn".to_string()))));
+    run(&mut s, "parameters.change", json!({"name": "turn", "expression": "180 deg"}));
+    assert!(stays(&s), "{:?}", place(&s, "Hinge", Vec3::new(20.0, 15.0, 0.0)));
+    assert!(s.doc.assembly.joints.last().is_some_and(|j| j.exprs.angle.as_deref() == Some("turn")));
+}
