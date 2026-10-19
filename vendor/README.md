@@ -35,6 +35,12 @@ Changes:
   circle) is divided again, finer, before its area's sign tells a hole from a face piece. The
   sign of a zero area was random: the hole became a face of its own, inside out, and the face it
   was cut in stayed whole.
+- `transversal/divide_face/mod.rs`: on a periodic surface, each point of a loop's parameter
+  boundary is taken the period nearest the one before it (the searches still start where they
+  did), and a loop inside a face piece is also looked for a period either way. The search gives
+  each parameter within one period, so a boundary crossing the seam jumped by the period: a face
+  of a revolved surface holding its seam got loops of the wrong sign and area, a piece was taken
+  for a hole inside no other piece, and the operation gave up.
 - `transversal/intersection_curve/mod.rs`: a point of the leading polyline that does not
   project onto both surfaces in the plane across the polyline is projected in the plane across
   the intersection curve itself (the cross product of the surfaces' normals at its nearest
