@@ -95,6 +95,7 @@ mod tests {
             offset: 0.0,
             angle: 0.6,
             suppressed: false,
+            exprs: Default::default(),
         }
     }
 
