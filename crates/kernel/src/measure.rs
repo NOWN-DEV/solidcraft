@@ -158,8 +158,12 @@ fn mass(b: &Body, topology: bool) -> Result<(MassMeasure, Option<Mesh>)> {
         None => None,
     };
     let nf = b.face_count();
-    // About the box's centre: see `face_sums`.
-    let o = Some(fine.bounds().center()).filter(|c| c.is_finite()).unwrap_or(Vec3::ZERO);
+    // About the box's centre when the meshes leave only a crack: see `face_sums`. A body that is
+    // open on purpose (a surface, or a cup whose lid is still a separate sheet) has no volume of
+    // its own; it keeps the origin, so such bodies still compare with each other when the centre
+    // of their boxes moves (a crowned lid rises, the open cup under it doesn't change).
+    let (surface, gap) = face_sums(&fine, nf, Vec3::ZERO).iter().fold((0.0, Vec3::ZERO), |s, f| (s.0 + f.0, s.1 + f.3));
+    let o = Some(fine.bounds().center()).filter(|c| c.is_finite() && gap.len() <= 0.01 * surface).unwrap_or(Vec3::ZERO);
     let (sf, sm, sc) = (face_sums(&fine, nf, o), face_sums(&medium, nf, o), face_sums(&coarse, nf, o));
     let close = |x: f64, y: f64| (x - y).abs() <= 0.01 * x.abs().max(y.abs()) + 1e-9;
     let (mut area, mut v6, mut mom) = (0.0, 0.0, Vec3::ZERO);
