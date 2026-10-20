@@ -113,14 +113,19 @@ where
     if !flat_polygon(&poly) {
         return poly;
     }
-    // The loop's extent, from its edges' ends and middles.
+    // The loop's extent: the diagonal of the box round its edges' ends and middles.
     let mut pts = Vec::new();
     for edge in wire.edge_iter() {
         let curve = edge.curve();
         let (t0, t1) = curve.range_tuple();
         pts.extend([curve.subs(t0), curve.subs((t0 + t1) / 2.0), curve.subs(t1)]);
     }
-    let size = pts.iter().flat_map(|p| pts.iter().map(move |q| p.distance(*q))).fold(0.0, f64::max);
+    let (mut lo, mut hi) = (Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for p in &pts {
+        lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    let size = if pts.is_empty() { 0.0 } else { hi.distance(lo) };
     let mut fine = tol;
     for _ in 0..3 {
         fine = (fine / 8.0).min(size * 0.01);
