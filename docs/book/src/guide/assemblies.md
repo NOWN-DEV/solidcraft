@@ -351,6 +351,46 @@ Layers belong to one stack when the gap between them is at most `touching` (defa
 ranges, and `slots: false` leaves slots out. Standard parts already placed (a washer's hole)
 are left out unless named in `bodies`. The command only reads the design.
 
+**Fill Hole Stacks** (`parts.fasten`, or **Fill hole stacks** in the Insert Part dialog) puts a
+fastener in every stack, or in the ones you give:
+
+```json
+{"command": "parts.fasten", "params": {"family": "hex_bolt", "washer": true, "nut": true}}
+```
+
+`family` is a built-in family or one from a [part library](../dev/local-libraries.md#part-libraries-fastener-families).
+`stack` (an index or a stack object from `inspect.hole_stacks`) or `stacks` (a list of them, or
+`"all"`, the default) say which stacks; indices and `"all"` take the same filters as
+`inspect.hole_stacks`. Without `size`, each stack gets the largest size that passes its
+narrowest hole and has a length for its grip.
+
+- **Length.** `rule: "grip"` (the default) clamps the whole stack: a library family's shortest
+  length whose grip range holds the grip; otherwise the shortest length at least as long as the
+  grip, plus the nut's height and two thread pitches when there is a nut. `rule: "thread"` is a
+  screw into a tapped far layer: sized to pass the other layers (and not the far layer's tap
+  drill), at least as long as their grip plus `engagement` (default 1.5 × the diameter).
+- **Washers and nut.** `washer` (`true`, a family, or `{family, size}`) goes under the head and
+  under the nut (`washer_side: "head"`, `"nut"` or `"both"`) and counts toward the grip; `nut`
+  (`true` for the built-in hex nut, a family, or `{family, size}`) goes on the far face.
+- **Head side.** The head goes on the stack's `start` face; `head_side: "end"` puts it on the
+  other one and `{"body": "Base"}` on the face of that body's layer. A stack in `stacks` can
+  carry its own: `{"index": 3, "head_side": "end"}`, or `head_side` in a stack object.
+- **Set rivets.** A library family of blind rivets is drawn set: the shank ends at the far face
+  of the stack and the tail it forms (a disc 1.5 × the diameter across) sits beyond it, so the
+  rivet does not reach into what lies behind the stack. `drawn: "unset"` draws the full length.
+  Rivets set on different grips are different parts. `parts.insert` takes `drawn: "set"` with the
+  `grip` as well.
+- **Dry run.** `dry_run: true` returns what would go where (size, length, grip, article) and
+  places nothing.
+
+Each distinct part (family, size, length and, for a set rivet, grip) is one component, built once and placed as an
+occurrence in every stack that takes it, held by a rigid joint on the hole it sits on, so it
+follows the hole when the design changes; the joints are solved once, when all are placed. A
+stack through a slot on the head's side is placed without a joint. The result lists `placed`
+parts (component, occurrence, joint, stack, `head_side`, size, `length_mm`, `grip_mm`, the
+library's `article`, `part`: the article or `family/sizexlength`, and the washers' and nut's
+occurrences) and `unfilled` stacks with the reason: one no size or length fits, or whose hole
+gives no wall to seat on. The whole fill is one undo step.
 ## Part properties and the bill of materials
 
 A component definition carries its own **part properties**: a part number, a description and a

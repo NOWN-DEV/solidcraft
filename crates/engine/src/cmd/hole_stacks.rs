@@ -137,7 +137,7 @@ impl Stack {
 }
 
 /// Millimetres to a nanometre (and no negative zero): readable output, far finer than any fit.
-fn round(x: f64) -> f64 {
+pub(crate) fn round(x: f64) -> f64 {
     (x * 1e6).round() / 1e6 + 0.0
 }
 
@@ -445,7 +445,7 @@ pub(crate) fn stacks(holes: &[Hole], o: &Options) -> (Vec<Stack>, Vec<usize>) {
             out.push(Stack { axis, start: p + axis * t_start, grip: t_end - t_start, layers });
         }
     }
-    let key = |v: Vec3| (v.x, v.y, v.z);
+    let key = |v: Vec3| (round(v.x), round(v.y), round(v.z));
     out.sort_by(|a, b| {
         let (x, y) = (key(a.start), key(b.start));
         x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)).then(x.2.total_cmp(&y.2))

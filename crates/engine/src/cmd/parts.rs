@@ -41,10 +41,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         "family (socket_head_cap_screw | hex_bolt | hex_nut | washer | set_screw | dowel_pin | bearing, or a library family: parts.library); size (\"M6\", or \"608\" for bearings); \
          length? (mm; screws, bolts, set screws, pins; default a standard length near 2.5 d, a library family's shortest); \
          grip?: mm (a library family: the shortest length whose grip range holds it); \
+         drawn?: \"set\" | \"unset\" (default unset; a library blind rivet set on `grip`: its shank that long, with its formed tail beyond); \
          at?: [x,y,z] on a hole's rim or wall (the part seats on the hole's face with a rigid joint) | point?: [x,y,z] with direction?: [x,y,z] (no joint); name?",
     ),
     CommandSpec::new("parts.resize", "Change Part Size", resize_atomic).icon("scale")
-        .params("component: id|name of an inserted part; size?; length? | grip? (a library family) — rebuilds it (joints keep it seated)"),
+        .params("component: id|name of an inserted part; size?; length? | grip? (a library family); drawn?: set | unset (a blind rivet; a set one stays set, on `grip` if given) — rebuilds it (joints keep it seated)"),
 ];
 
 /// A family: (id, name, standard).
@@ -281,6 +282,23 @@ fn thread(s: &mut Session, d: f64, pitch: f64, at: Vec3) {
 }
 
 /// Build a part in the active component.
+/// Build `sh`; a blind rivet `set` on a grip is drawn closed: its shank that long, and beyond it
+/// the tail it forms, a disc 1.5 × d across and d / 2 high.
+fn build_drawn(s: &mut Session, sh: &Shape, set: Option<f64>) -> Result<()> {
+    match (sh, set) {
+        (Shape::Screw { d, len, .. }, Some(g)) if g > 0.0 && g < *len => {
+            let d = *d;
+            let mut short = sh.clone();
+            if let Shape::Screw { len, .. } = &mut short {
+                *len = g;
+            }
+            build(s, &short)?;
+            cyl(s, d * 1.5, -g - d * 0.5, -g, "join")
+        }
+        _ => build(s, sh),
+    }
+}
+
 fn build(s: &mut Session, sh: &Shape) -> Result<()> {
     let _frame = crate::frames::local_geometry();
     match *sh {
@@ -753,7 +771,17 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "parts.insert (Insert Fastener)";
     let family = str_(p, "family").ok_or_else(|| bad(cmd, "`family` is required (parts.library)"))?.to_string();
     let size = str_(p, "size").ok_or_else(|| bad(cmd, "`size` is required"))?.to_string();
-    let r = resolve(s, &family, &size, length_param(p, cmd)?, grip_param(p, cmd)?).map_err(|e| bad(cmd, e))?;
+    let (length, grip) = (length_param(p, cmd)?, grip_param(p, cmd)?);
+    let set = match str_(p, "drawn") {
+        None | Some("unset") => None,
+        Some("set") => Some(grip.ok_or_else(|| bad(cmd, "`drawn: set` needs the `grip` the rivet closes on"))?),
+        Some(d) => return Err(bad(cmd, format!("`drawn` must be set or unset, not `{d}`"))),
+    };
+    if set.is_some() && !blind_rivet(s, &family) {
+        return Err(bad(cmd, "`drawn: set` is for blind rivets"));
+    }
+    // A set rivet of a given length closes on its grip; without a length the grip picks it.
+    let r = resolve(s, &family, &size, length, if set.is_some() && length.is_some() { None } else { grip }).map_err(|e| bad(cmd, e))?;
     let family = r.definition.as_ref().map_or(family, |d| d.name.clone());
     let sh = r.shape.clone();
     // A pick on a hole's rim also touches its end face: step onto the wall just inside the rim.
@@ -767,13 +795,14 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let active = s.active_component;
     let c = run(s, "component.create", json!({"name": name}))?;
     let (comp, occ) = (c["component"].as_u64().unwrap_or(0), c["occurrence"].as_u64().unwrap_or(0));
-    build(s, &sh)?;
+    build_drawn(s, &sh, set)?;
     let part = solidcraft_doc::StandardPart {
         family: family.clone(),
         size: size.clone(),
         length: shape_len(&sh),
         definition: r.definition.clone(),
         article: r.article(),
+        set,
     };
     s.doc_mut().parts.insert(comp, part);
     set_identity(s, comp, identity(&family, &size, &sh), None);
@@ -807,8 +836,122 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// Insert a part (the `parts.insert` command's run), for commands that place several.
+pub(super) fn insert_part(s: &mut Session, p: &Value) -> Result<Value> {
+    insert(s, p)
+}
+
+/// A component that already holds `family` `size` at `length` (from the same library
+/// definition), to place again rather than build again.
+pub(super) fn existing_part(s: &Session, family: &str, size: &str, length: Option<f64>, set: Option<f64>) -> Option<u64> {
+    let (name, def) = if builtin(family) {
+        (family.to_string(), None)
+    } else {
+        let (d, _) = file_family(s, family)?;
+        (d.name.clone(), Some(d))
+    };
+    let same_length = |a: Option<f64>| match (a, length) {
+        (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+        (None, None) => true,
+        _ => false,
+    };
+    s.doc
+        .parts
+        .iter()
+        .find(|(c, p)| {
+            p.family == name
+                && p.size == size
+                && same_length(p.length)
+                && p.set.zip(set).map_or(p.set.is_none() && set.is_none(), |(a, b)| (a - b).abs() < 1e-6)
+                && p.definition == def
+                && s.doc.occurrence_of(**c).is_some()
+        })
+        .map(|(c, _)| *c)
+}
+
+/// Whether `family` is a library family of blind rivets (drawn set when placed in a stack).
+pub(super) fn blind_rivet(s: &Session, family: &str) -> bool {
+    !builtin(family) && file_family(s, family).is_some_and(|(d, _)| d.shape == FastenerShape::BlindRivet)
+}
+
+/// A family's sizes and their nominal diameters (a washer's or bearing's: its bore).
+pub(super) fn sizes(s: &Session, family: &str) -> std::result::Result<Vec<(String, f64)>, String> {
+    let m = |n: &str| metric(n).map_or(0.0, |x| x.0);
+    Ok(match family {
+        "socket_head_cap_screw" => SHCS.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "hex_bolt" => HEX_BOLT.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "hex_nut" => HEX_NUT.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "washer" => WASHER.iter().map(|r| (r.0.to_string(), r.1)).collect(),
+        "set_screw" => SET_SCREW.iter().map(|r| (r.0.to_string(), m(r.0))).collect(),
+        "dowel_pin" => DOWEL.iter().map(|d| (format!("{d}"), *d)).collect(),
+        "bearing" => BEARINGS.iter().map(|r| (r.0.to_string(), r.1)).collect(),
+        _ => {
+            let (def, _) = file_family(s, family).ok_or_else(|| format!("unknown part family `{family}` (parts.library lists them)"))?;
+            def.sizes.iter().map(|z| (z.size.clone(), z.d)).collect()
+        }
+    })
+}
+
+/// How thick a washer or nut of `family` `size` is.
+pub(super) fn thickness(s: &Session, family: &str, size: &str) -> std::result::Result<f64, String> {
+    match resolve(s, family, size, None, None)?.shape {
+        Shape::Ring { h, .. } => Ok(h),
+        Shape::Nut { m, .. } => Ok(m),
+        _ => Err(format!("`{family}` is not a washer or a nut")),
+    }
+}
+
+/// The thread pitch of a threaded size.
+pub(super) fn pitch(s: &Session, family: &str, size: &str) -> Option<f64> {
+    if builtin(family) {
+        return matches!(family, "socket_head_cap_screw" | "hex_bolt" | "hex_nut" | "set_screw").then(|| metric(size).map(|m| m.1)).flatten();
+    }
+    file_family(s, family).and_then(|(def, _)| def.size(size).and_then(|z| z.pitch))
+}
+
+/// A length of `family` `size` chosen by [`length_for`]: the grip range and article number the
+/// library lists for it.
+pub(super) struct Chosen {
+    pub length: f64,
+    pub grip: Option<[f64; 2]>,
+    pub article: Option<String>,
+}
+
+/// The length of `family` `size` for a stack `clamp` thick. By grip (`by_grip`), a library
+/// size's shortest length whose grip range holds `clamp`; where the lengths list no grips, or
+/// not by grip, the shortest length at least `clamp + extra` (room for a nut, or the thread a
+/// screw engages).
+pub(super) fn length_for(s: &Session, family: &str, size: &str, clamp: f64, extra: f64, by_grip: bool) -> std::result::Result<Chosen, String> {
+    let need = clamp + extra;
+    if builtin(family) {
+        if !matches!(family, "socket_head_cap_screw" | "hex_bolt" | "set_screw" | "dowel_pin") {
+            return Err(format!("`{family}` has no lengths"));
+        }
+        return LENGTHS
+            .iter()
+            .find(|l| **l >= need - 1e-9)
+            .map(|l| Chosen { length: *l, grip: None, article: None })
+            .ok_or_else(|| format!("{family} {size}: no standard length is {need:.3} mm or more"));
+    }
+    let (def, _) = file_family(s, family).ok_or_else(|| format!("unknown part family `{family}`"))?;
+    if !def.shape.has_lengths() {
+        return Err(format!("`{family}` has no lengths"));
+    }
+    let z = def.size(size).ok_or_else(|| format!("no size `{size}` in `{family}`"))?;
+    let chosen = |l: &solidcraft_doc::part_family::FastenerLength| Chosen { length: l.length, grip: l.grip, article: l.article.clone() };
+    if by_grip && z.lengths.iter().any(|l| l.grip.is_some()) {
+        return z.length_for_grip(clamp).map(chosen).ok_or_else(|| format!("no length of {family} {size} holds a grip of {clamp:.3} mm"));
+    }
+    z.lengths
+        .iter()
+        .filter(|l| l.length >= need - 1e-9)
+        .min_by(|a, b| a.length.total_cmp(&b.length))
+        .map(chosen)
+        .ok_or_else(|| format!("{family} {size}: no length is {need:.3} mm or more"))
+}
+
 /// A point on the cylindrical wall of the hole at `a`, a little in from the picked rim.
-fn hole_wall(s: &Session, a: Vec3) -> Option<Vec3> {
+pub(super) fn hole_wall(s: &Session, a: Vec3) -> Option<Vec3> {
     let st = s.model.state();
     let dirs = [Vec3::Z * -1.0, Vec3::Z, Vec3::X, Vec3::X * -1.0, Vec3::Y, Vec3::Y * -1.0];
     for step in [0.2, 0.5, 1.0, 2.0] {
@@ -860,6 +1003,16 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     let part = s.doc.parts.get(&comp).cloned().ok_or_else(|| bad(cmd, "that component is not a standard part"))?;
     let size = str_(p, "size").map(str::to_string).unwrap_or(part.size.clone());
     let grip = grip_param(p, cmd)?;
+    // A set rivet stays set, on the grip given if one is.
+    let set = match str_(p, "drawn") {
+        None => part.set.map(|g| grip.unwrap_or(g)),
+        Some("unset") => None,
+        Some("set") if blind_rivet(s, &part.family) => {
+            Some(grip.or(part.set).ok_or_else(|| bad(cmd, "`drawn: set` needs the `grip` the rivet closes on"))?)
+        }
+        Some("set") => return Err(bad(cmd, "`drawn: set` is for blind rivets")),
+        Some(d) => return Err(bad(cmd, format!("`drawn` must be set or unset, not `{d}`"))),
+    };
     let length = if grip.is_some() { None } else { length_param(p, cmd)?.or(if size == part.size { part.length } else { None }) };
     // A library part rebuilds from the copy of its family it keeps.
     let r = match &part.definition {
@@ -878,7 +1031,7 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let active = s.active_component;
     run(s, "component.activate", json!({"component": comp}))?;
-    build(s, &sh)?;
+    build_drawn(s, &sh, set)?;
     let name = resolved_name(&r, &size);
     let was = shape(&part.family, &part.size, part.length).ok().map(|old| identity(&part.family, &part.size, &old));
     set_identity(s, comp, identity(&part.family, &size, &sh), was);
@@ -888,6 +1041,7 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
         length: shape_len(&sh),
         definition: r.definition.clone(),
         article: r.article(),
+        set,
     };
     s.doc_mut().parts.insert(comp, standard);
     if let Some(c) = s.doc_mut().components.iter_mut().find(|c| c.id == comp) {
