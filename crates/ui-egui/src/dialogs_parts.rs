@@ -177,10 +177,8 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Pt, inputs: &[SelInpu
     }
     let Some(f) = lib.get(k.family) else { return false };
     let sizes: Vec<&str> = f.sizes.iter().map(|s| s.0.as_str()).collect();
-    row_label(ui, "Size");
     let before = k.size;
-    combo(ui, "pt_size", &sizes, &mut k.size);
-    ui.end_row();
+    choice_row(ui, "Size", "pt_size", &mut k.size, &sizes);
     if k.size != before && f.sizes.get(before).is_some_and(|(_, row)| row.get("lengths").is_some()) {
         k.length = None;
     }
@@ -224,12 +222,12 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Pt, inputs: &[SelInpu
     {
         // A library size's lengths are the Length row's choices already.
         for (key, v) in o.iter().filter(|(key, _)| !matches!(key.as_str(), "size" | "lengths")) {
-            row_label(ui, &key.replace('_', " "));
             // Numbers in the length unit, text (a head style) as it is, without JSON quotes.
             let shown =
                 v.as_f64().map(|x| crate::prefs::show_mm(app, x, 1)).or_else(|| v.as_str().map(str::to_string)).unwrap_or_else(|| v.to_string());
-            ui.label(RichText::new(shown).color(t.text_dim));
-            ui.end_row();
+            form_row(ui, &key.replace('_', " "), |ui| {
+                crate::ui_kit::text(ui, &shown, crate::ui_kit::Text::Cell);
+            });
         }
     }
     if inputs.first().is_some_and(|i| i.items.is_empty()) {
