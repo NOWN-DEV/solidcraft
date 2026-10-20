@@ -43,7 +43,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          grip?: mm (a library family: the shortest length whose grip range holds it); \
          at?: [x,y,z] on a hole's rim or wall (the part seats on the hole's face with a rigid joint) | point?: [x,y,z] with direction?: [x,y,z] (no joint); name?",
     ),
-    CommandSpec::new("parts.resize", "Change Part Size", resize).icon("scale")
+    CommandSpec::new("parts.resize", "Change Part Size", resize_atomic).icon("scale")
         .params("component: id|name of an inserted part; size?; length? | grip? (a library family) — rebuilds it (joints keep it seated)"),
 ];
 
@@ -776,6 +776,7 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
         article: r.article(),
     };
     s.doc_mut().parts.insert(comp, part);
+    set_identity(s, comp, identity(&family, &size, &sh), None);
     run(s, "component.activate", json!({"component": active}))?;
     let mut out = json!({"component": comp, "occurrence": occ, "name": name, "family": family, "size": size});
     describe(&mut out, &r);
@@ -879,6 +880,8 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     run(s, "component.activate", json!({"component": comp}))?;
     build(s, &sh)?;
     let name = resolved_name(&r, &size);
+    let was = shape(&part.family, &part.size, part.length).ok().map(|old| identity(&part.family, &part.size, &old));
+    set_identity(s, comp, identity(&part.family, &size, &sh), was);
     let standard = solidcraft_doc::StandardPart {
         family: part.family.clone(),
         size: size.clone(),
