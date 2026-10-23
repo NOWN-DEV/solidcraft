@@ -265,6 +265,9 @@ pub struct Session {
     /// Occurrence moves not captured yet (Capture Position keeps them, a recompute drops them).
     pub pending_moves: std::collections::BTreeMap<u64, solidcraft_doc::Mat>,
     world_cache: std::sync::Mutex<Option<WorldCache>>,
+    /// The design the joints were last solved for, as the solve left it, and the model it read
+    /// (see [`Session::solve_joints`]).
+    joints_settled: Option<(Arc<Document>, std::sync::Weak<solidcraft_doc::ModelState>)>,
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
     /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
@@ -309,6 +312,9 @@ pub struct Session {
     /// Full model evaluations (`refresh`), for tests.
     #[cfg(test)]
     pub(crate) evaluations: usize,
+    /// Joint solves (`refresh`), for tests.
+    #[cfg(test)]
+    pub(crate) joint_solves: usize,
 }
 
 /// A sketch changed by one frame of an interactive gesture (`live: true`).
@@ -426,6 +432,7 @@ impl Session {
             active_occurrence_path: None,
             pending_moves: Default::default(),
             world_cache: Default::default(),
+            joints_settled: None,
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
             clearance_cache: Default::default(),
@@ -445,6 +452,8 @@ impl Session {
             render_jobs: Default::default(),
             #[cfg(test)]
             evaluations: 0,
+            #[cfg(test)]
+            joint_solves: 0,
             crash_journal: false,
         }
     }
@@ -651,13 +660,34 @@ impl Session {
         self.prune_occurrence_state();
         // Joints follow the geometry their origins snap to.
         if !self.doc.assembly.joints.is_empty() {
-            cmd::joints::resolve(self);
+            self.solve_joints();
         }
         if let Some(id) = self.active_sketch
             && self.doc.feature(id).is_none()
         {
             self.active_sketch = None;
         }
+    }
+
+    /// Solve the joints, unless nothing they read changed since this session last solved them:
+    /// the model is the one that solve read and the design is as the solve left it, apart from
+    /// its features (the joints read those only through the model). A command that refreshes on
+    /// its own (a parameter change) is refreshed again after it, and that second solve would
+    /// find every occurrence where it is.
+    fn solve_joints(&mut self) {
+        let state = self.model.state();
+        let settled = self.joints_settled.as_ref().is_some_and(|(doc, model)| {
+            std::sync::Weak::as_ptr(model) == Arc::as_ptr(&state) && (Arc::ptr_eq(doc, &self.doc) || same_but_features(doc, &self.doc))
+        });
+        if settled {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.joint_solves += 1;
+        }
+        cmd::joints::resolve(self);
+        self.joints_settled = Some((self.doc.clone(), Arc::downgrade(&self.model.state())));
     }
 
     /// [`Session::refresh`] after the design changed from `previous`; a change that only renamed
@@ -669,7 +699,7 @@ impl Session {
         {
             self.revision += 1;
             if !self.doc.assembly.joints.is_empty() {
-                cmd::joints::resolve(self);
+                self.solve_joints();
             }
             return;
         }
@@ -959,6 +989,7 @@ impl Session {
             active_occurrence_path: self.active_occurrence_path.clone(),
             pending_moves: self.pending_moves.clone(),
             world_cache: std::sync::Mutex::new(self.world_cache.lock().ok().and_then(|cache| cache.clone())),
+            joints_settled: self.joints_settled.clone(),
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
@@ -978,6 +1009,8 @@ impl Session {
             saved_visibility: self.saved_visibility.clone(),
             #[cfg(test)]
             evaluations: 0,
+            #[cfg(test)]
+            joint_solves: 0,
             crash_journal: false,
         }
     }
@@ -1210,4 +1243,72 @@ pub(crate) type SketchValues = std::collections::BTreeMap<u64, std::collections:
 /// changes in it (as opposed to geometry it projects or links from upstream).
 fn own_values(sk: &solidcraft_sketch::Sketch) -> std::collections::BTreeMap<String, f64> {
     sk.constraints.iter().filter(|c| c.param.is_some() && !c.driven).filter_map(|c| Some((c.id.clone(), c.kind.value()?))).collect()
+}
+
+/// Whether two designs differ at most in their features. Every field is named, so a new one has
+/// to be decided on here.
+fn same_but_features(a: &Document, b: &Document) -> bool {
+    let Document {
+        render,
+        format,
+        format_pending,
+        name,
+        units,
+        metadata,
+        params,
+        features: _,
+        marker,
+        next_id,
+        components,
+        occurrences,
+        assembly,
+        sheet,
+        plastic,
+        parts,
+        links,
+        configs,
+        favorites,
+        canvases,
+        param_comments,
+        materials,
+        user_materials,
+        appearances,
+        body_components,
+        body_offsets,
+        browser_groups,
+        timeline_groups,
+        browser_order,
+        named_views,
+        visibility,
+    } = a;
+    *render == b.render
+        && *format == b.format
+        && *format_pending == b.format_pending
+        && *name == b.name
+        && *units == b.units
+        && *metadata == b.metadata
+        && *params == b.params
+        && *marker == b.marker
+        && *next_id == b.next_id
+        && *components == b.components
+        && *occurrences == b.occurrences
+        && *assembly == b.assembly
+        && *sheet == b.sheet
+        && *plastic == b.plastic
+        && *parts == b.parts
+        && *links == b.links
+        && *configs == b.configs
+        && *favorites == b.favorites
+        && *canvases == b.canvases
+        && *param_comments == b.param_comments
+        && *materials == b.materials
+        && *user_materials == b.user_materials
+        && *appearances == b.appearances
+        && *body_components == b.body_components
+        && *body_offsets == b.body_offsets
+        && *browser_groups == b.browser_groups
+        && *timeline_groups == b.timeline_groups
+        && *browser_order == b.browser_order
+        && *named_views == b.named_views
+        && *visibility == b.visibility
 }
