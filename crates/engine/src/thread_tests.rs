@@ -348,3 +348,34 @@ fn fillet_beside_a_modelled_thread_finishes() {
     let volume_after = volume(&mut s, "Screw");
     assert!(volume_after < volume_before && volume_after > volume_before * 0.99, "{volume_before} -> {volume_after}");
 }
+
+/// A thread in a part finds its face and its cylinder on that part. Parts are modelled about
+/// their own origins, so another part's face can pass through the thread's point: the thread
+/// must not take that face's name, nor follow it to another part's hole when a parameter moves
+/// that face (an M6 thread on a bolt was refused against a 2 mm hole of a plate beside it).
+#[test]
+fn a_thread_in_a_part_keeps_to_its_own_part_when_another_part_moves() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.change", json!({"name": "PX", "expression": "3 mm"}));
+    // A plate whose end face lies on the bolt's surface at the thread's point, with a 2 mm hole
+    // beside that face; made first, so its body comes first.
+    run(&mut s, "component.create", json!({"name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": "PX", "width": 20, "height": 20, "corner": [0, -10, 0], "body_name": "Plate"}));
+    run(&mut s, "solid.hole", json!({"position": ["PX - 2 mm", 0, 20], "diameter": 2}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "component.create", json!({"name": "Bolt"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 20, "body_name": "Bolt"}));
+    run(&mut s, "solid.thread", json!({"face": [3, 0, 10], "designation": "M6"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let thread = |s: &Session| {
+        let error = s.model.results.iter().find(|r| r.name.starts_with("Thread")).map(|r| r.error.clone());
+        let st = s.model.state();
+        (error, st.threads.first().map(|t| (t.body.clone(), t.designation.clone())))
+    };
+    let bolt_m6 = (Some(None), Some(("Bolt".to_string(), "M6".to_string())));
+    assert_eq!(thread(&s), bolt_m6);
+    for px in ["30 mm", "12 mm", "3 mm"] {
+        run(&mut s, "parameters.change", json!({"name": "PX", "expression": px}));
+        assert_eq!(thread(&s), bolt_m6, "PX = {px}");
+    }
+}

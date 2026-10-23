@@ -6312,7 +6312,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 Some(e) => Some(val(vals, e, Kind::Length)?),
                 None => None,
             };
-            let t = thread_on(st, f.id, face.0, designation.as_deref(), l, *modeled)?;
+            let t = thread_on(&part_bodies_state(doc, st, f.component), f.id, face.0, designation.as_deref(), l, *modeled)?;
             if !*modeled {
                 st.threads.push(t);
                 return Ok(());
@@ -7209,12 +7209,26 @@ pub fn state_in_frame<'a>(doc: &Document, st: &'a ModelState, comp: u64) -> std:
 /// From and Revolve's To place geometry, so they are kept in the feature's own component frame
 /// (`comp`): the model as that component sees it, a target in another, moved component where it
 /// is shown (#928). Other face points are picks, kept in the frame of the body they lie on: the
-/// model itself.
+/// model itself. A thread's face is a pick on its own part ([`part_bodies_state`]).
 pub fn face_point_state<'a>(doc: &Document, st: &'a ModelState, kind: &FeatureKind, comp: u64) -> std::borrow::Cow<'a, ModelState> {
     match kind {
         FeatureKind::Extrude { .. } | FeatureKind::Revolve { .. } => state_in_frame(doc, st, comp),
+        FeatureKind::Thread { .. } => part_bodies_state(doc, st, comp),
         _ => std::borrow::Cow::Borrowed(st),
     }
+}
+
+/// The bodies of component `comp`, where a thread made in that part looks for its face and its
+/// cylinder. Parts are modelled about their own origins, so another part's face can pass through
+/// the thread's point: looking over every body, the thread took that face's name and, once a
+/// parameter moved it, that part's hole or shaft. The root, or a part with no body of its own,
+/// keeps every body.
+fn part_bodies_state<'a>(doc: &Document, st: &'a ModelState, comp: u64) -> std::borrow::Cow<'a, ModelState> {
+    if comp == 0 || !st.bodies.iter().any(|b| doc.model_body_component(b) == comp) {
+        return std::borrow::Cow::Borrowed(st);
+    }
+    let bodies = st.bodies.iter().filter(|b| doc.model_body_component(b) == comp).cloned().collect();
+    std::borrow::Cow::Owned(ModelState { bodies, ..Default::default() })
 }
 
 /// The names of the faces a feature's face points lie on (empty where none), found in
@@ -7224,7 +7238,7 @@ pub fn face_point_state<'a>(doc: &Document, st: &'a ModelState, kind: &FeatureKi
 pub fn face_point_names(doc: &Document, st: &ModelState, kind: &FeatureKind, comp: u64) -> Vec<String> {
     let pts = kind.face_points();
     if !matches!(kind, FeatureKind::Extrude { .. } | FeatureKind::Revolve { .. }) {
-        return crate::naming::face_names_at(st, &pts);
+        return crate::naming::face_names_at(&face_point_state(doc, st, kind, comp), &pts);
     }
     let fst = face_point_state(doc, st, kind, comp);
     let normal = match kind {
