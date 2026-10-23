@@ -3189,6 +3189,7 @@ impl Document {
                 crate::config::Column::Suppress(id) => !gone.contains(id),
                 crate::config::Column::Param(name) => !gone_params.contains(name),
                 crate::config::Column::FaceAppearance(target) => !gone.contains(&target.origin_feature),
+                crate::config::Column::Text { sketch, .. } => !gone.contains(sketch),
                 _ => true,
             })
             .collect();

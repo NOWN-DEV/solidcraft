@@ -1,6 +1,6 @@
 //! Configurations: a table whose rows are variants of the design. Each column is a parameter
-//! expression, feature suppression, body material or body appearance. Activating a row sets
-//! those values in the design atomically, which then rebuilds as usual.
+//! expression, feature suppression, body material, body appearance or a sketch text's words.
+//! Activating a row sets those values in the design atomically, which then rebuilds as usual.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,9 @@ pub enum Column {
     ComponentAppearance(u64),
     /// A certified semantic face lineage in a shared definition.
     FaceAppearance(ConfigFaceTarget),
+    /// The words of a text in a sketch (the sketch's feature id, the text's link id): a label
+    /// or part number that differs from row to row.
+    Text { sketch: u64, link: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,6 +151,15 @@ impl Document {
             Column::FaceAppearance(target) => {
                 Some(self.config_face_look(target).and_then(|look| serde_json::to_string(&look).ok()).unwrap_or_default())
             }
+            Column::Text { sketch, link } => self.config_text(*sketch, link).map(str::to_string),
+        }
+    }
+
+    /// The words of text `link` in sketch `sketch`.
+    fn config_text(&self, sketch: u64, link: &str) -> Option<&str> {
+        match &self.sketch(sketch).ok()?.link(link)?.source {
+            solidcraft_sketch::LinkSource::Text { text, .. } => Some(text),
+            _ => None,
         }
     }
 
@@ -160,6 +172,9 @@ impl Document {
             Column::Appearance(body) => format!("appearance:{body}"),
             Column::ComponentAppearance(id) => format!("component_appearance:{id}"),
             Column::FaceAppearance(target) => format!("face_appearance:{}", target.key()),
+            Column::Text { sketch, link } => {
+                format!("text:{}/{link}", self.feature(*sketch).map(|f| f.name.clone()).unwrap_or_else(|| sketch.to_string()))
+            }
         }
     }
 
@@ -239,6 +254,22 @@ impl Document {
                         });
                     }
                 }
+                Column::Text { sketch, link } => {
+                    if v.trim().is_empty() || v.chars().count() > solidcraft_sketch::MAX_TEXT_CHARS {
+                        return Err(DocError::Invalid(format!(
+                            "configuration `{row}`: a text takes 1 to {} characters",
+                            solidcraft_sketch::MAX_TEXT_CHARS
+                        )));
+                    }
+                    let gone = || DocError::Unknown(format!("configuration `{row}`: text `{link}` of sketch {sketch} is gone"));
+                    // The words are the text's source: its outlines are drawn from them when
+                    // the sketch is evaluated, as for a text whose place or height follows a
+                    // parameter.
+                    match next.sketch_mut(*sketch).map_err(|_| gone())?.links.iter_mut().find(|l| l.id == *link).map(|l| &mut l.source) {
+                        Some(solidcraft_sketch::LinkSource::Text { text, .. }) => *text = v.clone(),
+                        _ => return Err(gone()),
+                    }
+                }
             }
         }
         next.configs.active = Some(row.to_string());
@@ -275,6 +306,7 @@ impl Document {
             Column::Appearance(body) => appearance_cell(v).is_ok_and(|look| self.appearances.bodies.get(body) == look.as_ref()),
             Column::ComponentAppearance(id) => appearance_cell(v).is_ok_and(|look| self.appearances.components.get(id) == look.as_ref()),
             Column::FaceAppearance(target) => appearance_cell(v).is_ok_and(|look| self.config_face_look(target) == look),
+            Column::Text { sketch, link } => self.config_text(*sketch, link) == Some(v.as_str()),
         })
     }
 }

@@ -1,9 +1,9 @@
 # Design configurations
 
 The configuration table stores named design variants. Add parameter, feature suppression,
-physical material, body appearance, component appearance, and semantic face appearance columns
-with `config.configure` or `config.column`.
-The desktop Configuration Table's **Add Column** menu offers the same targets. Material and
+physical material, body appearance, component appearance, semantic face appearance and sketch
+text columns with `config.configure` or `config.column`.
+The desktop Configuration Table's **Add Column** menu offers the same targets except texts. Material and
 appearance cells have a **Library** picker; their text fields also accept exact saved values.
 
 ```json
@@ -37,6 +37,22 @@ face appearances keep their existing priority. Physical material changes affect 
 
 Body style columns target body names. Assignments remain stored when a row suppresses the
 feature that produces that body, and become visible when it returns.
+
+## Text columns
+
+A text column holds the words of a text in a sketch, so each row carries its own label or part
+number:
+
+```json
+{"command":"config.configure","params":{"texts":[{"sketch":"Sketch2","link":"t1"}]}}
+{"command":"config.row","params":{"name":"Panel B","values":{"text:Sketch2/t1":"B-02"}}}
+```
+
+`sketch` is the sketch's name or id and `link` the text's id, as `sketch.text` returns it and
+`sketch.edit_text` takes it. Activating a row sets the words; the text keeps its place, height,
+font and angle, and the sketch draws the new words' outlines when it is evaluated, so the
+features built on it follow in the same rebuild. A row's words need at least one character
+other than a space. Deleting the sketch removes its text columns.
 
 ## Component and face appearances
 

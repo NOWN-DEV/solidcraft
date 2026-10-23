@@ -81,6 +81,7 @@ impl ConfigTable {
                         Column::FaceAppearance(target)
                     })
                 }
+                Column::Text { sketch, link } => maps.features.get(sketch).map(|sketch| Column::Text { sketch: *sketch, link: link.clone() }),
             };
             if let Some(mapped) = mapped {
                 if mapped == *column {

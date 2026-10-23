@@ -1,5 +1,5 @@
-//! Configurations: the design's configuration table (rows of parameter values and feature
-//! suppressions) and switching between its rows.
+//! Configurations: the design's configuration table (rows of parameter values, feature
+//! suppressions, materials, appearances and sketch texts) and switching between its rows.
 
 use serde_json::{Value, json};
 use solidcraft_doc::config::{Column, ConfigRow, MAX_COLUMNS, MAX_ROWS};
@@ -10,27 +10,47 @@ use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("config.configure", "Configure", configure).at("SOLID", "CONFIGURE").icon("params").params(
-        "params?: [parameter names]; features?: [feature names]; materials?: [body names]; appearances?: [body names] (columns to add; with no rows yet, a \"Default\" row takes the current values)",
+        "params?: [parameter names]; features?: [feature names]; materials?: [body names]; appearances?: [body names]; texts?: [{sketch: id|name, link: text id}] (columns to add; with no rows yet, a \"Default\" row takes the current values)",
     ),
     CommandSpec::new("config.table", "Display Configuration Table", show)
         .at("SOLID", "CONFIGURE")
         .icon("configuration_table")
         .noundo()
-        .params("→ columns (param:<name> or suppress:<feature>), rows, the active row and whether the design still matches it"),
-    CommandSpec::new("config.column", "Configuration Column", column).icon("configuration_table").params("param? | feature? | material? | appearance? (target name); delete?: bool"),
+        .params("→ columns (param:<name>, suppress:<feature>, text:<sketch>/<link>, …), rows, the active row and whether the design still matches it"),
+    CommandSpec::new("config.column", "Configuration Column", column)
+        .icon("configuration_table")
+        .params("param? | feature? | material? | appearance? (target name) | text?: {sketch: id|name, link: text id}; delete?: bool"),
     CommandSpec::new("config.row", "Configuration Row", row).icon("configuration_table").params(
         "name; from? (row to copy; default current values); values?: {column key: expression, suppression, material name, appearance name or Look object}; rename?; delete?: bool",
     ),
-    CommandSpec::new("config.activate", "Activate Configuration", activate).icon("activate").params("row: name — sets its parameter values and suppressions"),
+    CommandSpec::new("config.activate", "Activate Configuration", activate).icon("activate").params("row: name — sets its parameter values, suppressions and texts"),
     CommandSpec::new("config.preview", "Preview Configuration", preview).icon("eye").noundo().params("row: name — validates a rebuild without changing the design or history"),
     CommandSpec::new("config.rule", "Configuration Rule", rule).icon("configuration_table").params("rule?: {id,name,enabled,condition,effect}; id? + delete?; id? + index? (ordered move)"),
     CommandSpec::new("config.rules", "Configuration Rules", show).icon("list").noundo().params("ordered typed rules, rows and active state"),
 ];
 
 fn column_of(s: &Session, p: &Value, cmd: &str) -> Result<Column> {
-    if ["param", "feature", "material", "appearance", "component_appearance", "face_appearance"].iter().filter(|k| p.get(**k).is_some()).count() != 1
+    if ["param", "feature", "material", "appearance", "component_appearance", "face_appearance", "text"]
+        .iter()
+        .filter(|k| p.get(**k).is_some())
+        .count()
+        != 1
     {
         return Err(bad(cmd, "give exactly one configuration target"));
+    }
+    if let Some(t) = p.get("text") {
+        let key = match t.get("sketch") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(x)) => x.clone(),
+            _ => return Err(bad(cmd, "`text.sketch` must be a sketch's id or name")),
+        };
+        let link = t.get("link").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`text.link` must be the text's id"))?;
+        let sketch = s.doc.find_feature(&key).map(|f| f.id).ok_or_else(|| bad(cmd, format!("no sketch `{key}`")))?;
+        let c = Column::Text { sketch, link: link.to_string() };
+        if !s.doc.configs.columns.contains(&c) && s.doc.config_current(&c).is_none() {
+            return Err(bad(cmd, format!("sketch `{key}` has no text `{link}`")));
+        }
+        return Ok(c);
     }
     if let Some(value) = p.get("component_appearance") {
         let key = value
@@ -141,7 +161,7 @@ fn configure(s: &mut Session, p: &Value) -> Result<Value> {
             add_column(s, c, cmd)?;
         }
     }
-    for (plural, singular) in [("component_appearances", "component_appearance"), ("face_appearances", "face_appearance")] {
+    for (plural, singular) in [("component_appearances", "component_appearance"), ("face_appearances", "face_appearance"), ("texts", "text")] {
         if let Some(values) = p.get(plural) {
             let values = values
                 .as_array()
@@ -259,7 +279,11 @@ fn row(s: &mut Session, p: &Value) -> Result<Value> {
                         || match c {
                             Column::Param(n) => n == k,
                             Column::Suppress(id) => s.doc.feature(*id).is_some_and(|f| f.name == *k),
-                            Column::Material(_) | Column::Appearance(_) | Column::ComponentAppearance(_) | Column::FaceAppearance(_) => false,
+                            Column::Material(_)
+                            | Column::Appearance(_)
+                            | Column::ComponentAppearance(_)
+                            | Column::FaceAppearance(_)
+                            | Column::Text { .. } => false,
                         }
                 })
                 .ok_or_else(|| bad(cmd, format!("`{k}` is not a column (config.column adds one)")))?;
@@ -272,6 +296,9 @@ fn row(s: &mut Session, p: &Value) -> Result<Value> {
                         Some(look) => serde_json::to_string(&look).map_err(|e| bad(cmd, e.to_string()))?,
                         None => String::new(),
                     };
+                }
+                Some(Column::Text { .. }) if text.trim().is_empty() || text.chars().count() > solidcraft_sketch::MAX_TEXT_CHARS => {
+                    return Err(bad(cmd, format!("`{k}`: a text takes 1 to {} characters", solidcraft_sketch::MAX_TEXT_CHARS)));
                 }
                 _ => {}
             }
@@ -786,5 +813,50 @@ mod tests {
         assert!(!reopened.doc.appearances.bodies.contains_key("Block"));
         assert!((volume(&mut reopened) - 6000.0).abs() < 1e-6);
         assert!(reopened.doc.configuration_matches());
+    }
+
+    /// A plate with `text` cut 1 mm into its top: the sketch's id and the text's link.
+    fn labelled_plate(s: &mut Session, text: &str) -> (u64, String) {
+        run(s, "solid.box", json!({"length": 80, "width": 30, "height": 5, "body_name": "Plate"}));
+        run(s, "sketch.create", json!({"plane": "XY", "offset": "5 mm"}));
+        let link = run(s, "sketch.text", json!({"text": text, "at": [5, 10], "height": 10}))["link"].as_str().unwrap_or_default().to_string();
+        run(s, "sketch.finish", json!({}));
+        let sketch = s.doc.features.last().map_or(0, |f| f.id);
+        run(s, "solid.extrude", json!({"distance": "1 mm", "direction": "negative", "operation": "cut"}));
+        (sketch, link)
+    }
+
+    #[test]
+    fn a_configuration_row_sets_the_words_of_a_sketch_text() {
+        let mut wide = Session::default();
+        labelled_plate(&mut wide, "WWW");
+        let cut_wide = volume(&mut wide);
+        let mut s = Session::default();
+        let (sketch, link) = labelled_plate(&mut s, "I");
+        let cut_narrow = volume(&mut s);
+        assert!(cut_wide < cut_narrow - 1.0, "{cut_wide} {cut_narrow}");
+        let table = run(&mut s, "config.configure", json!({"texts": [{"sketch": sketch, "link": link}]}));
+        let name = s.doc.features.iter().find(|f| f.id == sketch).map(|f| f.name.clone()).unwrap_or_default();
+        let key = format!("text:{name}/{link}");
+        assert_eq!((table["columns"][0].as_str(), table["rows"][0]["values"][&key].as_str()), (Some(key.as_str()), Some("I")), "{table}");
+        run(&mut s, "config.row", json!({"name": "Wide", "values": {key.clone(): "WWW"}}));
+        // The row's words are the text's: the cut is the one a text typed so makes.
+        run(&mut s, "config.activate", json!({"row": "Wide"}));
+        assert!(s.model.results.iter().all(|r| r.error.is_none()));
+        assert!((volume(&mut s) - cut_wide).abs() < 1e-6 && s.doc.configuration_matches(), "{} {cut_wide}", volume(&mut s));
+        let reopened = solidcraft_doc::format::read(&s.doc.to_json()).unwrap();
+        assert_eq!(reopened.configs, s.doc.configs);
+        run(&mut s, "config.activate", json!({"row": "Default"}));
+        assert!((volume(&mut s) - cut_narrow).abs() < 1e-6 && s.doc.configuration_matches());
+        // A row without words, and a text the sketch does not have, are refused; so is a saved
+        // row without words.
+        assert!(s.execute("config.row", &json!({"name": "Blank", "values": {key.clone(): " "}})).is_err());
+        assert!(s.execute("config.column", &json!({"text": {"sketch": sketch, "link": "nothing"}})).is_err());
+        run(&mut s, "config.row", json!({"name": "Blank", "from": "Default"}));
+        if let Some(r) = s.doc_mut().configs.rows.iter_mut().find(|r| r.name == "Blank") {
+            r.cells = vec![String::new()];
+        }
+        assert!(s.execute("config.activate", &json!({"row": "Blank"})).is_err());
+        assert!((volume(&mut s) - cut_narrow).abs() < 1e-6);
     }
 }
