@@ -28,7 +28,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "INSPECT")
         .icon("center_of_mass")
         .noundo()
-        .params("bodies?: [names] (default all): the centre of mass (uniform density) of each and of all together"),
+        .params("bodies?: [names] (default all): the centre of mass (uniform density) of each, where it is placed (every occurrence of a component), and of all together"),
 ];
 
 /// Curvature (signed, 1/mm) and unit normal of a segment at `t`.
@@ -319,7 +319,9 @@ fn isocurves(s: &mut Session, p: &Value) -> Result<Value> {
 fn center_of_mass(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "inspect.center_of_mass";
     let names = string_list(p, "bodies");
-    let st = s.model.state();
+    // The bodies where they are placed, as inspect.measure measures them: every occurrence of a
+    // component, not each definition once in its own frame.
+    let st = s.world_state();
     let mut out = Vec::new();
     let (mut vol, mut moment) = (0.0, Vec3::ZERO);
     for b in st.bodies.iter().filter(|b| names.is_empty() || names.contains(&b.name)) {
@@ -411,5 +413,33 @@ mod tests {
         };
         assert!(curves.iter().filter(|c| flat(c)).count() >= 4, "rings at constant height");
         assert!(s.execute("inspect.isocurve", &json!({"faces": []})).is_err());
+    }
+
+    /// A component placed twice: each occurrence's body is measured where it is placed, and both
+    /// count in the total. A 10 × 20 × 30 block (centre (5, 10, 15) in its component) is moved
+    /// by (0, 50, 7); a copy is placed 100 along x and turned a quarter about z around (100, 0, 0).
+    #[test]
+    fn center_of_mass_of_placed_occurrences() {
+        let mut s = Session::default();
+        // Not grounded: a design's first part is grounded when it is made, and this one is moved.
+        let c = s.execute("component.create", &json!({"name": "P", "grounded": false})).unwrap();
+        s.execute("solid.box", &json!({"length": 10, "width": 20, "height": 30, "body_name": "Blk"})).unwrap();
+        s.execute("component.activate", &json!({"component": 0})).unwrap();
+        let copy = s.execute("occurrence.copy", &json!({"occurrence": c["occurrence"], "translate": [100, 0, 0]})).unwrap()["occurrence"].clone();
+        s.execute("occurrence.move", &json!({"occurrence": copy, "space": "world", "axis": [0, 0, 1], "angle": "90 deg", "origin": [100, 0, 0]}))
+            .unwrap();
+        s.execute("occurrence.move", &json!({"occurrence": c["occurrence"], "space": "world", "translate": [0, 50, 7]})).unwrap();
+        let r = s.execute("inspect.center_of_mass", &json!({})).unwrap();
+        let centre = |v: &Value| [0, 1, 2].map(|i| v[i].as_f64().unwrap());
+        let near = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        let mut got: Vec<[f64; 3]> = r["bodies"].as_array().unwrap().iter().map(|b| centre(&b["center"])).collect();
+        got.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(got.len(), 2, "{r}");
+        assert!(near(got[0], [5.0, 60.0, 22.0]) && near(got[1], [90.0, 5.0, 15.0]), "{r}");
+        assert!(near(centre(&r["center"]), [47.5, 32.5, 18.5]), "{r}");
+        assert!((r["volume"].as_f64().unwrap() - 12000.0).abs() < 1e-6, "{r}");
+        // A body picked by name: the first placement keeps the body's name.
+        let r = s.execute("inspect.center_of_mass", &json!({"bodies": ["Blk"]})).unwrap();
+        assert!(near(centre(&r["center"]), [5.0, 60.0, 22.0]), "{r}");
     }
 }
