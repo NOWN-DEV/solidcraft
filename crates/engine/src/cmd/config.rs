@@ -547,6 +547,42 @@ mod tests {
     }
 
     #[test]
+    fn configuration_rules_given_together_are_checked_with_all_of_them_in_place() {
+        // A cut on a box: suppressing the box alone leaves the cut without a body, so a row that
+        // switches both off fails while only the box's rule is in; the two rules together pass.
+        let mut s = Session::default();
+        run(&mut s, "parameters.add", json!({"name":"on","expression":"1","unit":""}));
+        run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10}));
+        run(&mut s, "solid.cylinder", json!({"radius":2,"height":20,"base":[5,5,-5],"axis":"Z","operation":"cut"}));
+        let (body, cut) = (s.doc.features[0].id, s.doc.features[1].id);
+        let names = [s.doc.features[0].name.clone(), s.doc.features[1].name.clone()];
+        run(&mut s, "config.configure", json!({"params":["on"],"features":names}));
+        run(&mut s, "config.row", json!({"name":"Off","values":{"param:on":"0"}}));
+        let off = |id: u64| {
+            json!({"id":format!("off_{id}"),"name":format!("off_{id}"),"enabled":true,
+            "condition":{"type":"parameter","parameter":"on","operator":"eq","expression":"0"},
+            "effect":{"type":"drive_suppression","feature":id,"value":true}})
+        };
+        let before = s.doc.clone();
+        assert!(s.execute("config.rule", &json!({"rule":off(body)})).is_err(), "the box off alone leaves its cut nothing to cut");
+        assert_eq!(s.doc, before);
+        run(&mut s, "config.rule", json!({"rules":[off(body), off(cut)]}));
+        assert_eq!(s.doc.configs.rules.len(), 2);
+        run(&mut s, "config.activate", json!({"row":"Off"}));
+        assert!(s.doc.features.iter().all(|f| f.suppressed));
+        assert!(s.model.results.iter().all(|r| r.error.is_none()));
+        run(&mut s, "edit.undo", json!({}));
+        run(&mut s, "edit.undo", json!({}));
+        assert!(s.doc.configs.rules.is_empty(), "one undo step for the rules given together");
+        // A bad rule among them adds none of them.
+        let mut bad = off(cut);
+        bad["effect"]["feature"] = json!("nothing");
+        assert!(s.execute("config.rule", &json!({"rules":[off(body), bad]})).is_err());
+        assert!(s.execute("config.rule", &json!({"rules":{"id":"x"}})).is_err());
+        assert!(s.doc.configs.rules.is_empty());
+    }
+
+    #[test]
     fn configuration_preview_and_failed_geometry_leave_design_unchanged() {
         let mut s = Session::default();
         run(&mut s, "parameters.change", json!({"name":"length", "expression":"10 mm"}));
