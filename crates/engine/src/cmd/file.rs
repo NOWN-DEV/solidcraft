@@ -901,7 +901,7 @@ mod tests {
 
     /// A sheet-metal design keeps each sheet body once in its saved model, not again with every
     /// later feature's state: a design of many features after its sheet metal wrote the sheets
-    /// over and over, and past the cache's size limit was saved without its model.
+    /// over and over, and past the cache's size limit kept only some of its states.
     #[test]
     fn a_saved_model_keeps_each_sheet_body_once() {
         let design = |boxes: usize| {
