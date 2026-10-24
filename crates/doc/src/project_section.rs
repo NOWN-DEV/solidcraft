@@ -208,8 +208,13 @@ fn capped(pts: Vec<Vec2>) -> Vec<Vec2> {
 }
 
 /// The loops where `plane` cuts the mesh, in the plane's frame. An error when a spline of the
-/// cut cannot be fitted (rather than leaving it out).
+/// cut cannot be fitted or the cut has more than [`MAX_PIECES`] face curves (rather than leaving
+/// them out).
 pub fn section_loops(plane: &Plane, m: &Mesh) -> Result<Vec<SectionLoop>> {
+    section_loops_within(plane, m, MAX_PIECES)
+}
+
+fn section_loops_within(plane: &Plane, m: &Mesh, max_pieces: usize) -> Result<Vec<SectionLoop>> {
     let size = m.bounds().diagonal().max(1e-9);
     let q = size * 1e-7;
     let key = |p: Vec2| -> Key { ((p.x / q).round() as i64, (p.y / q).round() as i64) };
@@ -222,8 +227,8 @@ pub fn section_loops(plane: &Plane, m: &Mesh) -> Result<Vec<SectionLoop>> {
     let mut pieces = Vec::new();
     for s in by_face.values() {
         for (chain, closed) in chains(s, &key) {
-            if pieces.len() >= MAX_PIECES {
-                break;
+            if pieces.len() >= max_pieces {
+                return Err(DocError::Invalid(format!("the section has more than {max_pieces} face curves")));
             }
             if let Some(seg) = classify(&chain, closed, &exact, &key, size) {
                 let ends = (!closed).then(|| chain.first().zip(chain.last()).map(|(a, b)| (key(*a), key(*b)))).flatten();
@@ -507,4 +512,22 @@ fn inside(poly: &[Vec2], p: Vec2) -> bool {
         }
     }
     odd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solidcraft_geom::Vec3;
+
+    /// A cut with more face curves than the limit is refused, not cut short.
+    #[test]
+    fn a_cut_past_the_piece_limit_is_refused() {
+        let body = solidcraft_kernel::box_solid(Vec3::ZERO, Vec3::new(40.0, 30.0, 20.0)).unwrap();
+        let mesh = body.reference_display_mesh_angular(0.01, solidcraft_kernel::DISPLAY_ANGLE).unwrap();
+        let plane = Plane::from_normal(Vec3::new(0.0, 0.0, 10.0), Vec3::Z).unwrap();
+        // One curve on each of the box's four sides, joined into one loop.
+        assert_eq!(section_loops_within(&plane, &mesh, 4).map(|l| l.len()).ok(), Some(1));
+        let e = section_loops_within(&plane, &mesh, 3).map(|l| l.len()).unwrap_err().to_string();
+        assert!(e.contains("more than 3 face curves"), "{e}");
+    }
 }
