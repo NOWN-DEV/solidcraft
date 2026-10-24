@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const MAX_RULES: usize = 128;
+/// Most configuration rules a design keeps. A rule drives one feature's suppression, so an
+/// assembly that switches a few hundred parts on and off, by two rules each, needs hundreds.
+pub const MAX_RULES: usize = 2048;
 const MAX_NODES: usize = 64;
 const MAX_DEPTH: usize = 8;
 
