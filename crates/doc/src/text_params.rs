@@ -1,4 +1,4 @@
-//! Text parameters: named texts (`Label` = `2L_B`) that the words of a sketch text can be built
+//! Text parameters: named texts (`Label` = `TAG-1`) that the words of a sketch text can be built
 //! from, by an expression that joins them and quoted texts with `+` (`Label + '-L'`). They are
 //! kept apart from the number parameters: a text has no unit and no number expression reads it.
 //! A parameter edit or a configuration row that sets one relabels every text built from it, and
@@ -231,11 +231,11 @@ mod tests {
     #[test]
     fn words_expressions_join_quoted_texts_and_parameters() {
         let look = |n: &str| match n {
-            "Label" => Ok("2L_B".to_string()),
+            "Label" => Ok("TAG-1".to_string()),
             _ => Err(DocError::Expr(format!("unknown text parameter `{n}`"))),
         };
-        assert_eq!(eval("Label + '-L'", &look).unwrap(), "2L_B-L");
-        assert_eq!(eval("\"it's \" + Label", &look).unwrap(), "it's 2L_B");
+        assert_eq!(eval("Label + '-L'", &look).unwrap(), "TAG-1-L");
+        assert_eq!(eval("\"it's \" + Label", &look).unwrap(), "it's TAG-1");
         assert_eq!(eval("'it''s'", &look).unwrap(), "it's");
         assert_eq!(eval("'a+b' + 'c'", &look).unwrap(), "a+bc");
         for bad in ["", "Label +", "+ 'a'", "Label 'a'", "'open", "Label - 'a'", "Other"] {
@@ -247,6 +247,6 @@ mod tests {
         assert_eq!(unquote("\"it''s\""), "it''s");
         assert_eq!(unquote("'it''s'"), "it's");
         assert_eq!(unquote("'a' + 'b'"), "'a' + 'b'");
-        assert_eq!(unquote("2L_B"), "2L_B");
+        assert_eq!(unquote("TAG-1"), "TAG-1");
     }
 }
