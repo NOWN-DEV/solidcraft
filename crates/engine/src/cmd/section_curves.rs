@@ -5,12 +5,12 @@ use serde_json::{Value, json};
 use solidcraft_doc::project::{SectionLoop, SectionSeg, section_loops};
 use solidcraft_geom::Vec2;
 
-use crate::params::{bad, string_list};
+use crate::params::bad;
 use crate::{Result, Session};
 
 pub(super) const CMD: &str = "inspect.section_curves";
 pub(super) const PARAMS: &str = "plane: XY|XZ|YZ | construction plane name or id | {origin, normal}; offset?, at?, flip?: as inspect.section; \
-     bodies?: [name] (default every visible body); tolerance?: 0.0001..1 mm (mesh chord tolerance, default 0.01); \
+     bodies?: name | [name] (1–10000 names; default every visible body); tolerance?: 0.0001..1 mm (mesh chord tolerance, default 0.01); \
      Returns {frame: {origin, x, y, normal}, loops: [{body, closed, area (mm², closed loops), segments}]}: points [x, y] in the frame, \
      segments {type: line, start, end} | {type: arc, center, radius, start, end, sweep_deg (counter-clockwise +)} | \
      {type: spline, closed, points (fit points), beziers ([[p0, p1, p2, p3]], the same curve as cubic pieces)}. \
@@ -22,6 +22,21 @@ fn pt(p: Vec2) -> Value {
     json!([p.x, p.y])
 }
 
+/// The bodies the request names (none: every visible body). Read whole rather than with
+/// `string_list`, which keeps the first 10,000 entries and drops any that is not text: a list past
+/// the limit, or with an entry that is not a name, is refused instead of cut short.
+fn body_names(p: &Value) -> Result<Vec<String>> {
+    match p.get("bodies") {
+        None => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(a)) if a.len() > MAX_BODIES => Err(bad(CMD, format!("`bodies` lists at most {MAX_BODIES} names"))),
+        Some(Value::Array(a)) if !a.is_empty() => {
+            a.iter().map(|v| v.as_str().map(str::to_string).ok_or_else(|| bad(CMD, "`bodies` must list body names (text)"))).collect()
+        }
+        Some(_) => Err(bad(CMD, "`bodies` must list body names")),
+    }
+}
+
 pub(super) fn section_curves(s: &mut Session, p: &Value) -> Result<Value> {
     let (plane, _) = super::cut_plane(s, p, CMD)?;
     let tolerance = match p.get("tolerance") {
@@ -29,10 +44,7 @@ pub(super) fn section_curves(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => v.as_f64().filter(|t| (0.0001..=1.0).contains(t)).ok_or_else(|| bad(CMD, "tolerance must be 0.0001..1 mm"))?,
     };
     let world = s.world_state();
-    let names = string_list(p, "bodies");
-    if p.get("bodies").is_some() && (names.is_empty() || names.len() > MAX_BODIES) {
-        return Err(bad(CMD, "`bodies` must list body names"));
-    }
+    let names = body_names(p)?;
     if let Some(n) = names.iter().find(|n| world.bodies.iter().all(|b| &b.name != *n)) {
         return Err(bad(CMD, format!("no body `{n}`")));
     }
