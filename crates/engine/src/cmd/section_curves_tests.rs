@@ -131,6 +131,31 @@ fn section_curves_select_bodies_and_reject_bad_input() {
     }
 }
 
+/// `bodies` is read whole: 10,001 names are refused, not cut to the first 10,000 (whose last
+/// one would go unseen).
+#[test]
+fn section_curves_refuse_a_body_list_past_the_limit() {
+    let mut s = plate();
+    let mut names = vec![json!("Plate"); MAX_BODIES];
+    names.push(json!("Nope"));
+    assert!(s.execute(CMD, &json!({"plane": "XY", "at": 5, "bodies": names})).is_err());
+}
+
+/// A body list with an entry that is not a name is refused, not taken without it.
+#[test]
+fn section_curves_refuse_a_body_name_that_is_not_text() {
+    let mut s = plate();
+    assert!(s.execute(CMD, &json!({"plane": "XY", "at": 5, "bodies": ["Plate", 42]})).is_err());
+}
+
+/// A list of exactly the limit is taken.
+#[test]
+fn section_curves_take_a_body_list_at_the_limit() {
+    let mut s = plate();
+    let r = run(&mut s, CMD, json!({"plane": "XY", "at": 5, "bodies": vec![json!("Plate"); MAX_BODIES]}));
+    assert_eq!(r["loops"].as_array().map(Vec::len), Some(2), "{r}");
+}
+
 fn closed_areas(r: &Value) -> Vec<f64> {
     r["loops"]
         .as_array()
