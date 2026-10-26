@@ -130,7 +130,6 @@ fn the_value_types_match_the_readers() {
         (bends(16), true),
         (bends(17), false),
         (json!([{"angle": 30}]), false),
-        (json!([{"height": 10, "angle": true}]), false),
         (json!([{"height": 10, "depth": 1}]), false),
         (json!([{"height": 10, "flip": "yes"}]), false),
         (json!([5]), false),
@@ -138,6 +137,13 @@ fn the_value_types_match_the_readers() {
     ] {
         assert_eq!(takes::<ThenSteps>(&v), ok, "{v}");
         assert_eq!(parse::<ThenSteps>(v.clone()).map(|t| t.0), crate::cmd::then_list(Some(&v)).ok(), "{v}");
+    }
+    // The handler reads a bend's `angle` that is no expression as left out (90°); the type
+    // refuses it, which is what warn and strict report.
+    for angle in [json!(true), json!([45])] {
+        let v = json!([{"height": 10, "angle": angle}]);
+        assert!(!takes::<ThenSteps>(&v), "{v}");
+        assert_eq!(crate::cmd::then_list(Some(&v)), crate::cmd::then_list(Some(&json!([{"height": 10}]))), "{v}");
     }
     for (v, ok) in [
         (json!([[0, 0, 0], [1, 1, 1]]), true),
@@ -197,7 +203,6 @@ fn strict_keeps_todays_errors() {
         ("sheet.flange", json!({"edges": [[0, 0, 0]], "height": 10, "height_from": "sharp"})),
         ("sheet.flange", json!({"edges": [[0, 0, 0]], "height": 10, "then": 5})),
         ("sheet.flange", json!({"edges": [[0, 0, 0]], "height": 10, "then": [{"angle": 30}]})),
-        ("sheet.flange", json!({"edges": [[0, 0, 0]], "height": 10, "then": [{"height": 5, "angle": true}]})),
         ("sheet.flange", json!({"edges": [[0, 0, 0]], "height": 10, "then": [{"height": 5, "turn": 1}]})),
         ("sheet.perforate", json!({"diameter": 2, "pitch": 5, "pattern": "hex"})),
         ("sheet.perforate", json!({"diameter": 2, "pitch": 5, "pattern": "Square"})),
@@ -252,6 +257,25 @@ fn rule_values_are_refused_with_the_check_off_and_in_strict() {
         assert!(off.contains(&format!("`{key}` is not a {id} parameter: the sheet metal rule sets it")), "{p}: {off}");
         assert!(error(ParamCheck::Strict).contains(&format!("unknown key `{key}`")), "{p}");
     }
+}
+
+/// A further bend's `angle` that is no expression: with the check off the flange bends it 90°,
+/// as before; warn reports it and strict refuses it.
+#[test]
+fn a_bend_angle_that_is_no_expression_is_reported() {
+    let p = json!({"edges": [[0, 30, 2.5]], "height": 12, "then": [{"height": 8, "angle": true}]});
+    let want = "then[0]: `angle` must be a number or an expression";
+    let run = |level: ParamCheck| {
+        let mut s = sheet();
+        s.param_check = level;
+        s.execute("sheet.flange", &p)
+    };
+    let off = run(ParamCheck::Off).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(off.get("param_warnings"), None, "{off}");
+    let warn = run(ParamCheck::Warn).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(warn["param_warnings"], json!([want]), "{warn}");
+    let strict = run(ParamCheck::Strict).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(strict.ends_with(want), "{strict}");
 }
 
 #[test]

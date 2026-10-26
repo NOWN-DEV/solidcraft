@@ -171,8 +171,8 @@ fn then_steps(s: &Session, p: &Value, cmd: &str) -> Result<Vec<ThenStep>> {
 }
 
 /// What [`then_steps`] reads `then` as, without the design: up to [`MAX_THEN`] bends
-/// `{angle?, height, flip?}` (the angle 90° when it is left out or null). Whether the expressions
-/// suit the design is checked by the handler.
+/// `{angle?, height, flip?}` (the angle 90° when it is left out, null or not an expression).
+/// Whether the expressions suit the design is checked by the handler.
 pub(crate) fn then_list(v: Option<&Value>) -> std::result::Result<Vec<ThenStep>, String> {
     let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
     let list = "`then` must list further bends {angle?, height, flip?}: each on the far edge of the flange before it";
@@ -191,11 +191,7 @@ pub(crate) fn then_list(v: Option<&Value>) -> std::result::Result<Vec<ThenStep>,
             None => None,
         };
         let height = expr(step, "height").ok_or_else(|| format!("then[{i}]: `height` is required"))?;
-        // Left out (or null), 90°; anything else must be an angle, as an edge's own is.
-        let angle = match step.get("angle").filter(|v| !v.is_null()) {
-            Some(a) => expr(step, "angle").ok_or_else(|| format!("then[{i}]: `angle` {}", expr_problem(Some(a))))?,
-            None => "90 deg".into(),
-        };
+        let angle = expr(step, "angle").unwrap_or_else(|| "90 deg".into());
         out.push((angle, height, flip));
     }
     Ok(out)

@@ -265,13 +265,24 @@ impl JsonSchema for HeightFromParam {
 
 /// An edge flange's further bends (`then`): up to 16, each `{angle?, height, flip?}`, made on the
 /// far edge of the flange before it (read by `sheet::then_list`). Whether the expressions suit
-/// the design is checked by the handler.
+/// the design is checked by the handler. The handler reads an `angle` that is no expression as
+/// left out (90°); this type refuses it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThenSteps(pub Vec<crate::cmd::ThenStep>);
 
 impl<'de> Deserialize<'de> for ThenSteps {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        crate::cmd::then_list(Some(&Value::deserialize(d)?)).map(ThenSteps).map_err(|why| D::Error::custom(whole(why)))
+        let v = Value::deserialize(d)?;
+        let steps = crate::cmd::then_list(Some(&v)).map_err(|why| D::Error::custom(whole(why)))?;
+        let bends = v.as_array().map(Vec::as_slice).unwrap_or_default();
+        let wrong = bends
+            .iter()
+            .enumerate()
+            .find_map(|(i, b)| b.get("angle").filter(|a| !a.is_null() && crate::params::expr(b, "angle").is_none()).map(|a| (i, a)));
+        match wrong {
+            Some((i, a)) => Err(D::Error::custom(whole(format!("then[{i}]: `angle` {}", crate::params::expr_problem(Some(a)))))),
+            None => Ok(ThenSteps(steps)),
+        }
     }
 }
 
