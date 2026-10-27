@@ -1635,7 +1635,15 @@ pub fn solve_after_edit_with_analysis(sk: &mut Sketch, old: &DrivingValues, stor
 /// sketch (or turn it half round a point) and still report it solved. Empty when the two
 /// sketches are not the same entities (a link was rebuilt).
 pub fn flips_from_stored(solved: &Sketch, stored: &Sketch) -> Vec<String> {
-    flips(solved, stored, Turned::Both)
+    flips(solved, stored, Turned::Both, 0.0)
+}
+
+/// [`flips_from_stored`] without the senses of parallel and perpendicular lines: the turns a
+/// solve after a link move must not make. A turned sense only asks for the walk
+/// ([`solve_after_link_move`]): where the walk cannot keep it either, the links may run the line
+/// through zero length, which turns it end for end as the only solution.
+pub fn side_flips_from_stored(solved: &Sketch, stored: &Sketch) -> Vec<String> {
+    flips(solved, stored, Turned::Sides, 0.0)
 }
 
 /// Which orientations [`flips`] compares.
@@ -1648,8 +1656,9 @@ enum Turned {
     Both,
 }
 
-/// [`flips_from_stored`] of the orientations `which` names.
-fn flips(solved: &Sketch, stored: &Sketch, which: Turned) -> Vec<String> {
+/// [`flips_from_stored`] of the orientations `which` names; a sense is no reference for a line
+/// no longer than `reach` (see [`senses`]).
+fn flips(solved: &Sketch, stored: &Sketch, which: Turned, reach: f64) -> Vec<String> {
     let aligned = solved.points.len() == stored.points.len()
         && solved.curves.len() == stored.curves.len()
         && solved.constraints.len() == stored.constraints.len()
@@ -1669,7 +1678,7 @@ fn flips(solved: &Sketch, stored: &Sketch, which: Turned) -> Vec<String> {
         checked = orients(&before, &blocks);
     }
     if which != Turned::Sides {
-        checked.extend(senses(&before, &now, &blocks));
+        checked.extend(senses(&before, &now, &blocks, reach));
     }
     let mut out: Vec<String> = Vec::new();
     for (o, cs) in checked {
@@ -1693,6 +1702,10 @@ const LINK_STEPS: usize = 4096;
 const LINK_FIRST_STEP: usize = 4;
 /// Most solves one [`solve_after_link_move`] may spend.
 const LINK_STEP_SOLVES: usize = 400;
+/// In a finest step of the walk, a sense is no reference for a line no longer than this many
+/// times the farthest a linked point moves in the step: the links may run such a line through
+/// zero length within the step, which turns it end for end as the only solution.
+const THROUGH_ZERO: f64 = 4.0;
 
 /// [`solve_after_edit`] for a sketch whose linked (or fixed) points moved far from where
 /// `stored` has them, when that solve fails or turns the sketch over (also as
@@ -1731,6 +1744,12 @@ pub fn solve_after_link_move(sk: &mut Sketch, stored: &Sketch, old: &DrivingValu
     if moving.is_empty() && radii.is_empty() {
         return None;
     }
+    // The farthest a linked point (or radius) moves over the whole walk.
+    let span = moving
+        .iter()
+        .filter_map(|&i| Some(from.get(i)?.dist(*to.get(i)?)))
+        .chain(radii.iter().map(|(_, a, b)| (b - a).abs()))
+        .fold(0.0_f64, f64::max);
     let target = sk.clone();
     // The walk's sketch at `t` of the way: the moved points there, every other point where the
     // last solved step left it.
@@ -1781,8 +1800,11 @@ pub fn solve_after_link_move(sk: &mut Sketch, stored: &Sketch, old: &DrivingValu
         let mut step = at(next as f64 / LINK_STEPS as f64, &start);
         let last = at(t as f64 / LINK_STEPS as f64, &solved);
         let before = step.positions_in(&last);
+        // A sense that turns in a larger step halves it; in a finest one, a line the links move
+        // across zero length may come out end for end.
+        let reach = if h == 1 { THROUGH_ZERO * span * (next - t) as f64 / LINK_STEPS as f64 } else { 0.0 };
         if solve_after_edit_with_analysis(&mut step, &values, before.as_deref(), Analysis::StatusOnly).keeps_orientation()
-            && flips_from_stored(&step, &last).is_empty()
+            && flips(&step, &last, Turned::Both, reach).is_empty()
         {
             prev = Some((t, std::mem::replace(&mut solved, step.points.iter().map(|p| p.pos).collect())));
             t = next;
@@ -1802,13 +1824,17 @@ pub fn solve_after_link_move(sk: &mut Sketch, stored: &Sketch, old: &DrivingValu
     for (p, s) in done.points.iter_mut().zip(&solved) {
         p.pos = *s;
     }
+    let end = done.clone();
     let report = solve_with(&mut done, &Hold::default(), Some(&solved), analysis, None);
     // Sides and turns are the stored sketch's (the value edit kept them); the senses of parallel
-    // and perpendicular lines are the walk's start's, as the value edit left them (it keeps none).
-    (report.keeps_orientation() && flips(&done, stored, Turned::Sides).is_empty() && flips(&done, &first, Turned::Senses).is_empty()).then(|| {
-        *sk = done;
-        report
-    })
+    // and perpendicular lines are the walk's end's: each step kept the last one's, from the
+    // value edit's (which keeps none) on, except where the links ran a line through zero length.
+    (report.keeps_orientation() && flips(&done, stored, Turned::Sides, 0.0).is_empty() && flips(&done, &end, Turned::Senses, 0.0).is_empty()).then(
+        || {
+            *sk = done;
+            report
+        },
+    )
 }
 
 impl Sketch {
@@ -2022,7 +2048,8 @@ enum Orient {
     /// Which way line `a` points along line `b` (`Parallel`), or across it (`Perpendicular`,
     /// `true`): either line turned end for end holds the constraint as well (a line from a
     /// circle's centre to it reaches either end of a diameter). Only the solve after a link move
-    /// keeps it ([`flips_from_stored`]), not a value edit.
+    /// keeps it ([`flips_from_stored`]), not a value edit, and a turned sense only asks for the
+    /// walk: one the walk cannot keep either is not reported ([`side_flips_from_stored`]).
     Sense(usize, usize, bool),
 }
 
@@ -2062,8 +2089,9 @@ fn offset(s: &State, o: Orient) -> Option<(f64, f64, f64)> {
             let (pp, pq) = (s.p(p), s.p(q));
             ((b - a).normalized()?.dot(pq - pp), size, coords(&[pp, pq, a, b]))
         }
-        // The cosine (sine) of the angle between the lines, scaled to the shorter one: a line
-        // too short to have a direction is no reference.
+        // The cosine (sine) of the angle between the lines, scaled to the shorter one: as the
+        // other offsets, it is no reference below `loci::side`'s tolerance, a line shorter than
+        // about 1e-9 mm (plus the rounding of its coordinates).
         Orient::Sense(a, b, square) => {
             let ((a0, a1), (b0, b1)) = (s.line(a), s.line(b));
             let (da, db) = (a1 - a0, b1 - b0);
@@ -2086,6 +2114,11 @@ fn orientation(s: &State, o: Orient) -> Option<f64> {
 /// triangle, a height of 1/1000 of its longest side, about 0.06°). Nearer degenerate, solver
 /// noise decides the sign, and no edit is refused for turning it over.
 const ORIENTED: f64 = 1e-3;
+
+/// A given line whose direction has come this close to the opposite one (one plus the cosine of
+/// its turn, about 2.6°) was turned end for end by its source: the senses of lines held parallel
+/// or square to it are no reference. Turned less, it is a rotation the walk follows.
+const END_FOR_END: f64 = 1e-3;
 
 /// The orientation of the stored state that an edit must keep: its sign where it is clear
 /// (see [`ORIENTED`]), else `None`.
@@ -2349,10 +2382,12 @@ fn orients(s: &State, sub: &[(Block, Vec<usize>)]) -> Vec<(Orient, Vec<usize>)> 
 /// The senses of the lines the driving constraints of `sub` hold parallel or square to each other
 /// ([`Orient::Sense`]), each with its constraint, where `before` is the reference state and `now`
 /// the solved one. A pair the solve cannot turn (both lines given: their ends fixed, linked or
-/// coincident with such a point) has none, nor one whose given line has turned more than a
-/// quarter round since: a source walked the other way (a projected edge whose ends come back
-/// swapped) turns its line end for end, which is not a flip of the solve.
-fn senses(before: &State, now: &State, sub: &[(Block, Vec<usize>)]) -> Vec<(Orient, Vec<usize>)> {
+/// coincident with such a point) has none, nor one whose given line has come end for end since
+/// ([`END_FOR_END`]): a source walked the other way (projected points that come back swapped)
+/// turns its line so, which is not a flip of the solve. Nor has a pair with a line no longer
+/// than `reach` in either state (a step of the walk the links may have run it through zero
+/// length in).
+fn senses(before: &State, now: &State, sub: &[(Block, Vec<usize>)], reach: f64) -> Vec<(Orient, Vec<usize>)> {
     let sk = before.sk;
     let ends = |l: usize| match sk.curves.get(l).map(|c| &c.kind) {
         Some(CurveKind::Line { a, b }) => Some([*a, *b]),
@@ -2377,11 +2412,15 @@ fn senses(before: &State, now: &State, sub: &[(Block, Vec<usize>)]) -> Vec<(Orie
     let is_given = |l: usize| ends(l).is_some_and(|e| e.iter().all(|p| given.get(*p).copied().unwrap_or(false)));
     let turned = |l: usize| {
         let ((a0, a1), (b0, b1)) = (before.line(l), now.line(l));
-        (a1 - a0).dot(b1 - b0) <= 0.0
+        (a1 - a0).normalized().zip((b1 - b0).normalized()).is_none_or(|(u, v)| u.dot(v) < END_FOR_END - 1.0)
+    };
+    let short = |l: usize| {
+        let ((a0, a1), (b0, b1)) = (before.line(l), now.line(l));
+        a0.dist(a1).min(b0.dist(b1)) <= reach
     };
     pairs
         .into_iter()
-        .filter(|&(l, m, ..)| !(is_given(l) && is_given(m)) && ![l, m].into_iter().any(|x| is_given(x) && turned(x)))
+        .filter(|&(l, m, ..)| !(is_given(l) && is_given(m)) && ![l, m].into_iter().any(|x| (is_given(x) && turned(x)) || short(x)))
         .map(|(l, m, square, ci)| (Orient::Sense(l, m, square), vec![ci]))
         .collect()
 }
