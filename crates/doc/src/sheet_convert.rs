@@ -417,18 +417,30 @@ fn bend_cylinder(b: &Body, mesh: &Mesh, f: usize, tol: f64) -> Option<Chamfer> {
     na.cross(nb).normalized().map(|_| Chamfer { strip: f, a, b: bb })
 }
 
+/// A cylindrical face: its index, a point on its axis, the axis and the radius.
+type Cylinder = (usize, Vec3, UnitVec3, f64);
+
+/// The cylindrical faces of `b` (of its first [`MAX_DETECT_FACES`]). Read once per conversion:
+/// telling a face's surface fits it, and [`bend_pieces`] looks through every face for each bend.
+fn cylinders(b: &Body) -> Vec<Cylinder> {
+    (0..b.face_count().min(MAX_DETECT_FACES))
+        .filter_map(|g| match face_surface(b, g) {
+            Some(FaceSurface::Cylinder { origin, axis, radius }) => Some((g, origin, axis, radius)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every piece of bend cylinder `c`'s cylinder (the same axis line and radius) that is a bend
 /// cylinder between the same two faces: the pieces cut-outs across a bend leave of it. `c` too.
-fn bend_pieces(b: &Body, mesh: &Mesh, c: Chamfer, tol: f64) -> Vec<Chamfer> {
-    let Some(FaceSurface::Cylinder { origin, axis, radius }) = face_surface(b, c.strip) else { return vec![c] };
-    let coaxial = |g: usize| match face_surface(b, g) {
-        Some(FaceSurface::Cylinder { origin: o, axis: a, radius: r }) => {
-            (r - radius).abs() <= tol && a.cross(axis).len() <= 1e-6 && ((o - origin) - axis * (o - origin).dot(axis)).len() <= tol
-        }
-        _ => false,
+/// `cylinders` are the body's cylindrical faces ([`cylinders`]).
+fn bend_pieces(b: &Body, mesh: &Mesh, cylinders: &[Cylinder], c: Chamfer, tol: f64) -> Vec<Chamfer> {
+    let Some(&(_, origin, axis, radius)) = cylinders.iter().find(|x| x.0 == c.strip) else { return vec![c] };
+    let coaxial = |&(g, o, a, r): &Cylinder| {
+        g != c.strip && (r - radius).abs() <= tol && a.cross(axis).len() <= 1e-6 && ((o - origin) - axis * (o - origin).dot(axis)).len() <= tol
     };
     let same = |o: &Chamfer| (o.a, o.b) == (c.a, c.b) || (o.a, o.b) == (c.b, c.a);
-    let pieces = (0..b.face_count()).filter(|g| *g != c.strip && coaxial(*g)).filter_map(|g| bend_cylinder(b, mesh, g, tol)).filter(same);
+    let pieces = cylinders.iter().filter(|x| coaxial(x)).filter_map(|x| bend_cylinder(b, mesh, x.0, tol)).filter(same);
     std::iter::once(c).chain(pieces).collect()
 }
 
@@ -810,9 +822,9 @@ pub fn detect_bends(mb: &ModelBody) -> Option<FoundBends> {
     }
     let tol = (size * 1e-6).max(1e-6);
     // Each bend cylinder: its face, axis line and radius.
-    let mut found: Vec<(usize, Vec3, UnitVec3, f64)> = Vec::new();
-    for g in 0..b.face_count().min(MAX_DETECT_FACES) {
-        let Some(FaceSurface::Cylinder { origin, axis, radius }) = face_surface(b, g) else { continue };
+    let all = cylinders(b);
+    let mut found: Vec<Cylinder> = Vec::new();
+    for &(g, origin, axis, radius) in &all {
         if radius.is_finite() && bend_cylinder(b, &mesh, g, tol).is_some() {
             found.push((g, origin, axis, radius));
         }
@@ -862,7 +874,7 @@ pub fn detect_bends(mb: &ModelBody) -> Option<FoundBends> {
             continue;
         }
         if let Some(c) = bend_cylinder(b, &mesh, x.0, tol) {
-            taken.extend(bend_pieces(b, &mesh, c, tol).iter().map(|p| p.strip));
+            taken.extend(bend_pieces(b, &mesh, &all, c, tol).iter().map(|p| p.strip));
         }
         let c = tri.iter().fold(Vec3::default(), |s, p| s + *p) * (1.0 / tri.len() as f64);
         let foot = x.1 + x.2 * (c - x.1).dot(x.2);
@@ -922,11 +934,14 @@ pub fn convert_body(
     // (with a bend cylinder its other skin's too).
     let mut picks = Vec::with_capacity(bends.len());
     let mut chamfers: Vec<Chamfer> = Vec::new();
+    let all = std::cell::OnceCell::new();
     for p in bends {
         if let Some(c) = chamfer_at(mb, &mesh, *p, tol, near) {
             picks.push((*p, (c.a, c.b)));
             // Every piece of the bend, on either skin: cut-outs across it split its cylinder.
-            for c in std::iter::once(c).chain(other_skin(b, &mesh, &c, tol)).flat_map(|c| bend_pieces(b, &mesh, c, tol)) {
+            for c in
+                std::iter::once(c).chain(other_skin(b, &mesh, &c, tol)).flat_map(|c| bend_pieces(b, &mesh, all.get_or_init(|| cylinders(b)), c, tol))
+            {
                 if !chamfers.iter().any(|x| x.strip == c.strip) {
                     chamfers.push(c);
                 }
