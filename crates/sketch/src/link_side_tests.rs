@@ -610,3 +610,59 @@ fn a_line_dropped_square_from_a_linked_point_follows_it_across_its_edge() {
         }
     }
 }
+
+/// Where the line between two linked points stops being a rotation and becomes the source's own
+/// swap (the solver's `END_FOR_END`, about 2.6° short of half round): from the positions alone a
+/// near swap and a rotation look the same, so the threshold decides, and these pin both sides.
+/// Turned 177° about its start, it is a rotation: walked there, the parallel line keeps its sense
+/// along it. Turned 178°, or swapped with a skew of a degree either way, it came end for end: the
+/// parallel line keeps its place and the sketch follows without a walk.
+#[test]
+fn a_line_between_linked_points_turned_nearly_half_round_is_a_rotation_up_to_end_for_end() {
+    let mut sk = Sketch::new();
+    let ends = [("start", Vec2::new(-20.0, 0.0)), ("end", Vec2::new(-20.0, 40.0))]
+        .map(|(name, at)| sk.add_link(LinkKind::Project, LinkSource::SketchPoint { sketch: 1, point: name.into() }, &[LinkGeom::Point(at)]).unwrap());
+    let [p, q] = [0, 1].map(|i| sk.link_points(&ends[i])[0]);
+    let g = sk.add_line(Vec2::new(-20.0, 0.0), Vec2::new(-20.0, 40.0), None, None, None).unwrap();
+    let (g0, g1) = sk.curves[g].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::Coincident { p: g0, q: p }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Coincident { p: g1, q }, None).unwrap();
+    let m = sk.add_point(Vec2::new(12.0, 0.0), None).unwrap();
+    sk.add_constraint(ConstraintKind::Fix { p: m }, None).unwrap();
+    let e = sk.add_curve(CurveKind::Ellipse { c: 0, m, r: 10.0 }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Radius { c: e, value: 10.0 }, None).unwrap();
+    let l = sk.add_line(Vec2::new(0.0, 0.0), Vec2::new(0.0, 10.0), Some(0), None, None).unwrap();
+    let (_, l1) = sk.curves[l].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: l1, c: e }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Parallel { a: l, b: g }, None).unwrap();
+    assert!(solve(&mut sk).ok());
+    let stored = sk.clone();
+    let sense = |sk: &Sketch| (sk.points[q].pos - sk.points[p].pos).dot(sk.points[l1].pos - sk.points[0].pos);
+    let turned = |degrees: f64| {
+        let turn = (90.0 + degrees).to_radians();
+        Vec2::new(-20.0 + 40.0 * turn.cos(), 40.0 * turn.sin())
+    };
+    // Just short of end for end: a rotation, walked there with its sense.
+    let (sk, report, walked) = evaluate(&stored, |sk| assert!(!sk.update_link(&ends[1], &[LinkGeom::Point(turned(177.0))]).unwrap()));
+    assert!(report.keeps_orientation() && report.failing.is_empty() && walked == Some(true), "{:?} {walked:?}", report.status);
+    assert!(sense(&sk) > 0.0, "{:?}", sk.points[l1].pos);
+    // Past it, turned or swapped askew: the source's swap, followed in place without a walk.
+    let centre = Vec2::new(-20.0, 20.0);
+    let askew = |skew: f64| {
+        let (s, c) = (180.0 + skew).to_radians().sin_cos();
+        [Vec2::new(-20.0, 0.0), Vec2::new(-20.0, 40.0)].map(|at| {
+            let d = at - centre;
+            centre + Vec2::new(c * d.x - s * d.y, s * d.x + c * d.y)
+        })
+    };
+    let moves: [[Vec2; 2]; 3] = [[Vec2::new(-20.0, 0.0), turned(178.0)], askew(1.0), askew(-1.0)];
+    for [at_p, at_q] in moves {
+        let (sk, report, walked) = evaluate(&stored, |sk| {
+            for (link, at) in ends.iter().zip([at_p, at_q]) {
+                assert!(!sk.update_link(link, &[LinkGeom::Point(at)]).unwrap());
+            }
+        });
+        assert!(report.keeps_orientation() && report.failing.is_empty() && walked.is_none(), "{at_p:?} {at_q:?}: {:?} {walked:?}", report.status);
+        assert!(sense(&sk) < 0.0 && sk.points[l1].pos.y > 9.0, "{at_p:?} {at_q:?}: {:?}", sk.points[l1].pos);
+    }
+}
