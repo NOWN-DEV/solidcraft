@@ -3,7 +3,7 @@
 //! not beside a line that has already moved past them.
 
 use super::*;
-use crate::{Analysis, ConstraintKind, flips_from_stored, solve, solve_after_edit, solve_after_link_move};
+use crate::{Analysis, ConstraintKind, flips_from_stored, solve, solve_after_edit, solve_after_link_move, solve_after_value_edit};
 
 fn source() -> LinkSource {
     LinkSource::SketchCurve { sketch: 1, curve: "rail".into() }
@@ -225,5 +225,237 @@ fn a_point_a_distance_along_a_linked_line_keeps_its_side() {
             assert!(report.is_some_and(|r| r.keeps_orientation()), "{mirrored_on} {y0} {y1}");
             assert!(ahead(&sk) > 0.0 && flips_from_stored(&sk, &stored).is_empty(), "{mirrored_on} {y0} {y1}: {}", ahead(&sk));
         }
+    }
+}
+
+/// An ellipse (12 by 10) centred where two linked walls cross (`rail` upright, `wall` level), its
+/// major axis ending on a third linked line (`tan`, 12 right of `rail`); a line from its centre to
+/// it parallel to `rail`; and a chord 5 from the centre square to `rail`. Drawn with the line up
+/// the rail and the chord pointing left. The sketch, its links (rail, wall, tan), the ellipse's
+/// centre, the line, the chord and the parallel and perpendicular constraints.
+struct Bore {
+    sk: Sketch,
+    links: [String; 3],
+    centre: usize,
+    line: usize,
+    chord: usize,
+    parallel: String,
+    square: String,
+}
+
+fn upright(x: f64) -> Vec<LinkGeom> {
+    vec![LinkGeom::Line(Vec2::new(x, -50.0), Vec2::new(x, 50.0))]
+}
+
+fn level(y: f64) -> Vec<LinkGeom> {
+    vec![LinkGeom::Line(Vec2::new(-50.0, y), Vec2::new(50.0, y))]
+}
+
+fn beside(x: f64) -> Vec<LinkGeom> {
+    upright(x + 12.0)
+}
+
+fn bore() -> Bore {
+    let mut sk = Sketch::new();
+    let walls = [("rail", upright(0.0)), ("wall", level(0.0)), ("tan", beside(0.0))];
+    let links = walls.map(|(name, geom)| sk.add_link(LinkKind::Project, LinkSource::SketchCurve { sketch: 1, curve: name.into() }, &geom).unwrap());
+    let [r, w, t] = [0, 1, 2].map(|i| sk.link_curves(&links[i])[0]);
+    let centre = sk.add_point(Vec2::new(0.0, 0.0), None).unwrap();
+    let m = sk.add_point(Vec2::new(12.0, 0.0), None).unwrap();
+    let e = sk.add_curve(CurveKind::Ellipse { c: centre, m, r: 10.0 }, None).unwrap();
+    for (p, c) in [(centre, r), (centre, w), (m, t), (m, w)] {
+        sk.add_constraint(ConstraintKind::PointOnCurve { p, c }, None).unwrap();
+    }
+    sk.add_constraint(ConstraintKind::Radius { c: e, value: 10.0 }, None).unwrap();
+    let line = sk.add_line(Vec2::new(0.0, 0.0), Vec2::new(0.0, 10.0), None, None, None).unwrap();
+    let (l0, l1) = sk.curves[line].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::Coincident { p: l0, q: centre }, None).unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: l1, c: e }, None).unwrap();
+    let parallel = sk.add_constraint(ConstraintKind::Parallel { a: line, b: r }, None).unwrap();
+    let chord = sk.add_line(Vec2::new(8.0, 5.0), Vec2::new(-8.0, 5.0), None, None, None).unwrap();
+    let (k0, k1) = sk.curves[chord].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: k0, c: e }, None).unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: k1, c: e }, None).unwrap();
+    let square = sk.add_constraint(ConstraintKind::Perpendicular { a: chord, b: r }, None).unwrap();
+    sk.add_constraint(ConstraintKind::PointLineDistance { p: centre, l: chord, value: 5.0 }, None).unwrap();
+    assert!(solve(&mut sk).ok());
+    let bore = Bore { sk, links, centre, line, chord, parallel, square };
+    assert_eq!(bore.turn(&bore.sk), (1.0, -1.0));
+    bore
+}
+
+impl Bore {
+    /// Which way the line points along y from the centre, and the chord along x (±1).
+    fn turn(&self, sk: &Sketch) -> (f64, f64) {
+        let dir = |l: usize| match sk.curves[l].kind {
+            CurveKind::Line { a, b } => sk.points[b].pos - sk.points[a].pos,
+            _ => Vec2::new(f64::NAN, f64::NAN),
+        };
+        let up = sk.points[self.centre].pos.dist(sk.points[sk.curves[self.line].kind.ends().unwrap().1].pos);
+        assert!((up - 10.0).abs() < 1e-6 && (dir(self.chord).len() - 2.0 * 75.0f64.sqrt() * 1.2).abs() < 1e-6, "{up} {}", dir(self.chord).len());
+        (dir(self.line).y.signum(), dir(self.chord).x.signum())
+    }
+
+    /// The walls moved: `rail` and `tan` to `x`, `wall` to `y`.
+    fn moved(&self, sk: &mut Sketch, x: f64, y: f64) {
+        for (link, geom) in self.links.iter().zip([upright(x), level(y), beside(x)]) {
+            assert!(!sk.update_link(link, &geom).unwrap(), "the link keeps its points");
+        }
+    }
+
+    /// [`follow`] the walls to (`x`, `y`).
+    fn follow(&self, x: f64, y: f64) -> Sketch {
+        follow(&self.sk, |sk| self.moved(sk, x, y))
+    }
+}
+
+/// What a document's evaluation does with a stored sketch when `change` moves its links (and
+/// may set new values): the sketch solved from the stored state, and walked there when that
+/// solve fails or turns something over. It must get there.
+#[track_caller]
+fn follow(stored: &Sketch, change: impl Fn(&mut Sketch)) -> Sketch {
+    let mut sk = stored.clone();
+    change(&mut sk);
+    let before = sk.positions_in(stored);
+    let report = solve_after_edit(&mut sk, &stored.driving_values(), before.as_deref());
+    if !report.keeps_orientation() || !flips_from_stored(&sk, stored).is_empty() {
+        let walked = solve_after_link_move(&mut sk, stored, &stored.driving_values(), Analysis::Full);
+        assert!(walked.is_some_and(|r| r.keeps_orientation()), "not walked: {:?}", flips_from_stored(&sk, stored));
+    }
+    sk
+}
+
+/// A line from the centre of an ellipse to it, parallel to a linked line, reaches it at either end
+/// of a diameter; a chord square to that line, its distance from the centre held, runs either way.
+/// Turned half round the centre, both solve every constraint and every side is kept (the centre is
+/// on the same side of the chord): only which way each points along the linked line tells the two
+/// apart. A solve from the stored state after the walls moved far landed on the turned image and
+/// reported it solved; the image counts as a flip now, and the walls walked far keep the senses.
+#[test]
+fn a_line_parallel_or_square_to_a_linked_line_keeps_its_sense_when_the_link_moves_far() {
+    let bore = bore();
+    let stored = &bore.sk;
+    let mut turned = stored.clone();
+    let c = turned.points[bore.centre].pos;
+    for l in [bore.line, bore.chord] {
+        let (a, b) = turned.curves[l].kind.ends().unwrap();
+        for p in [a, b] {
+            turned.points[p].pos = c * 2.0 - turned.points[p].pos;
+        }
+    }
+    assert!(solve(&mut turned).ok() && bore.turn(&turned) == (-1.0, 1.0));
+    let flips = flips_from_stored(&turned, stored);
+    assert!(flips.contains(&bore.parallel) && flips.contains(&bore.square), "{flips:?}");
+    // Far up the rail and off to the side, one jump lands on the turned image (a little way up,
+    // on the chord's other side): walked there, both senses are kept.
+    for (x, y) in [(0.0, 1000.0), (30.0, 40.0), (0.0, 15.0), (-108.0, 213.7), (-240.0, 0.0), (0.0, -100.0)] {
+        let sk = bore.follow(x, y);
+        assert_eq!(bore.turn(&sk), (1.0, -1.0), "({x}, {y})");
+        assert!(flips_from_stored(&sk, stored).is_empty(), "({x}, {y}): {:?}", flips_from_stored(&sk, stored));
+    }
+}
+
+/// A value edit with the links moved too: the walk after the link move starts from the new
+/// values solved where the links were stored, and keeps the senses that solve has. The bore made
+/// smaller keeps its senses, also with its walls far away. A dimension lifting an ellipse's
+/// centre up a linked rail takes a line from the centre to it, parallel to the rail, wherever the
+/// value edit alone takes it (a value edit keeps no sense of a parallel): moved with the rail as
+/// well, the sketch gets there the same way, not refused.
+#[test]
+fn a_value_edit_with_the_links_moved_keeps_the_senses_of_the_value_edit() {
+    let bore = bore();
+    let smaller = |sk: &mut Sketch| {
+        for c in &mut sk.constraints {
+            if let ConstraintKind::Radius { value, .. } | ConstraintKind::PointLineDistance { value, .. } = &mut c.kind {
+                *value *= 0.6;
+            }
+        }
+    };
+    let stored = &bore.sk;
+    for (x, y) in [(0.0, 0.0), (0.0, 1000.0), (30.0, 40.0)] {
+        let sk = follow(stored, |sk| {
+            smaller(sk);
+            if (x, y) != (0.0, 0.0) {
+                bore.moved(sk, x, y);
+            }
+        });
+        let dir = |l: usize| match sk.curves[l].kind {
+            CurveKind::Line { a, b } => sk.points[b].pos - sk.points[a].pos,
+            _ => Vec2::new(f64::NAN, f64::NAN),
+        };
+        assert!((dir(bore.line).len() - 6.0).abs() < 1e-6, "({x}, {y}): {:?}", dir(bore.line));
+        assert!(dir(bore.line).y > 0.0 && dir(bore.chord).x < 0.0, "({x}, {y}): {:?} {:?}", dir(bore.line), dir(bore.chord));
+    }
+
+    let mut sk = Sketch::new();
+    let link = sk.add_link(LinkKind::Project, source(), &upright(0.0)).unwrap();
+    let r = sk.link_curves(&link)[0];
+    let c = sk.add_point(Vec2::new(0.0, 1.0), None).unwrap();
+    let m = sk.add_point(Vec2::new(12.0, 1.0), None).unwrap();
+    let e = sk.add_curve(CurveKind::Ellipse { c, m, r: 10.0 }, None).unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: c, c: r }, None).unwrap();
+    let lift = sk.add_constraint(ConstraintKind::DistanceY { p: 0, q: c, value: 1.0 }, None).unwrap();
+    sk.add_constraint(ConstraintKind::HorizontalPoints { p: c, q: m }, None).unwrap();
+    sk.add_constraint(ConstraintKind::DistanceX { p: c, q: m, value: 12.0 }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Radius { c: e, value: 10.0 }, None).unwrap();
+    let l = sk.add_line(Vec2::new(0.0, 1.0), Vec2::new(0.0, 11.0), Some(c), None, None).unwrap();
+    let (_, l1) = sk.curves[l].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: l1, c: e }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Parallel { a: l, b: r }, None).unwrap();
+    assert!(solve(&mut sk).ok());
+    let stored = sk.clone();
+    let lift = stored.constraints.iter().position(|k| k.id == lift).unwrap();
+    let up = |sk: &Sketch| sk.points[l1].pos.y - sk.points[c].pos.y;
+    for value in [20.0, 1000.0] {
+        let lifted = |sk: &mut Sketch| sk.constraints[lift].kind.set_value(value);
+        let mut alone = stored.clone();
+        lifted(&mut alone);
+        assert!(solve_after_value_edit(&mut alone, &stored.driving_values()).keeps_orientation());
+        let sk = follow(&stored, |sk| {
+            lifted(sk);
+            assert!(!sk.update_link(&link, &upright(5.0)).unwrap());
+        });
+        assert!((sk.points[c].pos.y - value).abs() < 1e-9 && (up(&sk) - up(&alone)).abs() < 1e-6, "{value}: {} {}", up(&sk), up(&alone));
+    }
+}
+
+/// The senses a solve keeps are its own choices, not its sources'. A line drawn between two
+/// linked points that come back swapped (a source turned end for end) turns with them: a line
+/// from the centre of an ellipse to it held parallel to that line, which keeps its place, is no
+/// flip, and the sketch follows without a walk (walked, the two points would pass through each
+/// other).
+#[test]
+fn a_line_parallel_to_a_line_between_linked_points_that_swap_is_no_flip() {
+    let mut sk = Sketch::new();
+    let ends = [("start", Vec2::new(-20.0, 0.0)), ("end", Vec2::new(-20.0, 40.0))]
+        .map(|(name, at)| sk.add_link(LinkKind::Project, LinkSource::SketchPoint { sketch: 1, point: name.into() }, &[LinkGeom::Point(at)]).unwrap());
+    let [p, q] = [0, 1].map(|i| sk.link_points(&ends[i])[0]);
+    let g = sk.add_line(Vec2::new(-20.0, 0.0), Vec2::new(-20.0, 40.0), None, None, None).unwrap();
+    let (g0, g1) = sk.curves[g].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::Coincident { p: g0, q: p }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Coincident { p: g1, q }, None).unwrap();
+    let m = sk.add_point(Vec2::new(12.0, 0.0), None).unwrap();
+    sk.add_constraint(ConstraintKind::Fix { p: m }, None).unwrap();
+    let e = sk.add_curve(CurveKind::Ellipse { c: 0, m, r: 10.0 }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Radius { c: e, value: 10.0 }, None).unwrap();
+    let l = sk.add_line(Vec2::new(0.0, 0.0), Vec2::new(0.0, 10.0), Some(0), None, None).unwrap();
+    let (_, l1) = sk.curves[l].kind.ends().unwrap();
+    sk.add_constraint(ConstraintKind::PointOnCurve { p: l1, c: e }, None).unwrap();
+    sk.add_constraint(ConstraintKind::Parallel { a: l, b: g }, None).unwrap();
+    assert!(solve(&mut sk).ok() && sk.points[l1].pos.dist(Vec2::new(0.0, 10.0)) < 1e-6);
+    let stored = sk.clone();
+    for (low, high) in [(0.0, 40.0), (1000.0, 1040.0)] {
+        let swapped = |sk: &mut Sketch| {
+            for (link, y) in ends.iter().zip([high, low]) {
+                assert!(!sk.update_link(link, &[LinkGeom::Point(Vec2::new(-20.0, y))]).unwrap());
+            }
+        };
+        let mut jump = stored.clone();
+        swapped(&mut jump);
+        let before = jump.positions_in(&stored);
+        assert!(solve_after_edit(&mut jump, &stored.driving_values(), before.as_deref()).keeps_orientation());
+        assert!(flips_from_stored(&jump, &stored).is_empty(), "{low}: {:?}", flips_from_stored(&jump, &stored));
+        let sk = follow(&stored, swapped);
+        assert!(sk.points[l1].pos.dist(Vec2::new(0.0, 10.0)) < 1e-6, "{low}: {:?}", sk.points[l1].pos);
     }
 }

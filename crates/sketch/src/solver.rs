@@ -1628,12 +1628,28 @@ pub fn solve_after_edit_with_analysis(sk: &mut Sketch, old: &DrivingValues, stor
 }
 
 /// The orientations of `stored` that `solved` (the same sketch, its links moved and solved
-/// again) turned over, by constraint id: the sides of unsigned offsets and the turns of
-/// distance triangles, each read where `stored` has its points and where `solved` has them.
-/// A solve after its links moved checks none of these when no value changed, so a jump can
-/// land on the mirror image of a part of the sketch and still report it solved. Empty when the
-/// two sketches are not the same entities (a link was rebuilt).
+/// again) turned over, by constraint id: the sides of unsigned offsets, the turns of distance
+/// triangles and which way lines held parallel or square to each other point, each read where
+/// `stored` has its points and where `solved` has them. A solve after its links moved checks
+/// none of these when no value changed, so a jump can land on the mirror image of a part of the
+/// sketch (or turn it half round a point) and still report it solved. Empty when the two
+/// sketches are not the same entities (a link was rebuilt).
 pub fn flips_from_stored(solved: &Sketch, stored: &Sketch) -> Vec<String> {
+    flips(solved, stored, Turned::Both)
+}
+
+/// Which orientations [`flips`] compares.
+#[derive(Clone, Copy, PartialEq)]
+enum Turned {
+    /// The sides and turns a value edit keeps too ([`orients`]).
+    Sides,
+    /// The senses of parallel and perpendicular lines ([`senses`]).
+    Senses,
+    Both,
+}
+
+/// [`flips_from_stored`] of the orientations `which` names.
+fn flips(solved: &Sketch, stored: &Sketch, which: Turned) -> Vec<String> {
     let aligned = solved.points.len() == stored.points.len()
         && solved.curves.len() == stored.curves.len()
         && solved.constraints.len() == stored.constraints.len()
@@ -1648,8 +1664,15 @@ pub fn flips_from_stored(solved: &Sketch, stored: &Sketch) -> Vec<String> {
     let before = State { sk: stored, lay: &lay_before, x: &x_before };
     let now = State { sk: solved, lay: &lay_now, x: &x_now };
     let (blocks, _) = build_blocks(stored, &lay_before, &points_on_curves(stored));
+    let mut checked = Vec::new();
+    if which != Turned::Senses {
+        checked = orients(&before, &blocks);
+    }
+    if which != Turned::Sides {
+        checked.extend(senses(&before, &now, &blocks));
+    }
     let mut out: Vec<String> = Vec::new();
-    for (o, cs) in orients(&before, &blocks) {
+    for (o, cs) in checked {
         if reference_orientation(&before, o).zip(orientation(&now, o)).is_some_and(|(b, n)| b != n) {
             for ci in cs {
                 if let Some(c) = stored.constraints.get(ci)
@@ -1780,7 +1803,9 @@ pub fn solve_after_link_move(sk: &mut Sketch, stored: &Sketch, old: &DrivingValu
         p.pos = *s;
     }
     let report = solve_with(&mut done, &Hold::default(), Some(&solved), analysis, None);
-    (report.keeps_orientation() && flips_from_stored(&done, stored).is_empty()).then(|| {
+    // Sides and turns are the stored sketch's (the value edit kept them); the senses of parallel
+    // and perpendicular lines are the walk's start's, as the value edit left them (it keeps none).
+    (report.keeps_orientation() && flips(&done, stored, Turned::Sides).is_empty() && flips(&done, &first, Turned::Senses).is_empty()).then(|| {
         *sk = done;
         report
     })
@@ -1994,6 +2019,11 @@ enum Orient {
     /// both lie on `l` (its ends, points on it, or points coincident with either; one of them may
     /// lie on it by what else holds it).
     Along(usize, usize, usize, f64),
+    /// Which way line `a` points along line `b` (`Parallel`), or across it (`Perpendicular`,
+    /// `true`): either line turned end for end holds the constraint as well (a line from a
+    /// circle's centre to it reaches either end of a diameter). Only the solve after a link move
+    /// keeps it ([`flips_from_stored`]), not a value edit.
+    Sense(usize, usize, bool),
 }
 
 /// An orientation's signed offset in a state (a corner's distance from the opposite side, an
@@ -2031,6 +2061,15 @@ fn offset(s: &State, o: Orient) -> Option<(f64, f64, f64)> {
             let (a, b) = s.line(l);
             let (pp, pq) = (s.p(p), s.p(q));
             ((b - a).normalized()?.dot(pq - pp), size, coords(&[pp, pq, a, b]))
+        }
+        // The cosine (sine) of the angle between the lines, scaled to the shorter one: a line
+        // too short to have a direction is no reference.
+        Orient::Sense(a, b, square) => {
+            let ((a0, a1), (b0, b1)) = (s.line(a), s.line(b));
+            let (da, db) = (a1 - a0, b1 - b0);
+            let (ua, ub) = (da.normalized()?, db.normalized()?);
+            let size = da.len().min(db.len());
+            ((if square { ua.cross(ub) } else { ua.dot(ub) }) * size, size, coords(&[a0, a1, b0, b1]))
         }
     })
 }
@@ -2305,6 +2344,70 @@ fn orients(s: &State, sub: &[(Block, Vec<usize>)]) -> Vec<(Orient, Vec<usize>)> 
         }
     }
     out
+}
+
+/// The senses of the lines the driving constraints of `sub` hold parallel or square to each other
+/// ([`Orient::Sense`]), each with its constraint, where `before` is the reference state and `now`
+/// the solved one. A pair the solve cannot turn (both lines given: their ends fixed, linked or
+/// coincident with such a point) has none, nor one whose given line has turned more than a
+/// quarter round since: a source walked the other way (a projected edge whose ends come back
+/// swapped) turns its line end for end, which is not a flip of the solve.
+fn senses(before: &State, now: &State, sub: &[(Block, Vec<usize>)]) -> Vec<(Orient, Vec<usize>)> {
+    let sk = before.sk;
+    let ends = |l: usize| match sk.curves.get(l).map(|c| &c.kind) {
+        Some(CurveKind::Line { a, b }) => Some([*a, *b]),
+        _ => None,
+    };
+    let pairs: Vec<(usize, usize, bool, usize)> = sub
+        .iter()
+        .filter_map(|(b, _)| {
+            let (Block::User(ci, kind) | Block::TangentAt(ci, kind, _)) = b else { return None };
+            let (l, m, square) = match **kind {
+                ConstraintKind::Parallel { a, b } => (a, b, false),
+                ConstraintKind::Perpendicular { a, b } => (a, b, true),
+                _ => return None,
+            };
+            (ends(l).is_some() && ends(m).is_some()).then_some((l, m, square, *ci))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let given = given_points(sk);
+    let is_given = |l: usize| ends(l).is_some_and(|e| e.iter().all(|p| given.get(*p).copied().unwrap_or(false)));
+    let turned = |l: usize| {
+        let ((a0, a1), (b0, b1)) = (before.line(l), now.line(l));
+        (a1 - a0).dot(b1 - b0) <= 0.0
+    };
+    pairs
+        .into_iter()
+        .filter(|&(l, m, ..)| !(is_given(l) && is_given(m)) && ![l, m].into_iter().any(|x| is_given(x) && turned(x)))
+        .map(|(l, m, square, ci)| (Orient::Sense(l, m, square), vec![ci]))
+        .collect()
+}
+
+/// Points no solve moves: fixed or linked ones, and those coincident with one.
+fn given_points(sk: &Sketch) -> Vec<bool> {
+    let n = sk.points.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for c in &sk.constraints {
+        if let ConstraintKind::Coincident { p, q } = c.kind
+            && p < n
+            && q < n
+        {
+            union(&mut parent, p, q);
+        }
+    }
+    let mut held = vec![false; n];
+    for (i, locked) in sk.locked_points().into_iter().enumerate() {
+        if locked {
+            let r = find(&mut parent, i);
+            if let Some(h) = held.get_mut(r) {
+                *h = true;
+            }
+        }
+    }
+    (0..n).map(|i| held.get(find(&mut parent, i)).copied().unwrap_or(false)).collect()
 }
 
 /// Dimension continuation: solve the component `sub` from `x` (its previous solved state) for
