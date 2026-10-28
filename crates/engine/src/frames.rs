@@ -54,7 +54,7 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
         }
         "solid.revolve" => &[("face", Pick), ("axis", Axis), ("to", Make), ("targets", Body), ("participants", Body)],
         "solid.box" | "solid.sphere" => &[("corner", Make), ("center", Make)],
-        "solid.cylinder" | "solid.coil" | "solid.torus" => &[("base", Make), ("center", Make), ("axis", Dir)],
+        "solid.cylinder" | "solid.coil" | "solid.torus" | "solid.cone" => &[("base", Make), ("center", Make), ("axis", Dir)],
         "solid.fillet" | "solid.chamfer" => &[("edges", Picks), ("body", Body)],
         "solid.hole" => &[("position", Pick), ("direction", Dir), ("body", Body)],
         "solid.scale" => &[("origin", Make), ("bodies", Body)],
@@ -101,7 +101,7 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
 struct Frames {
     /// Worked out on first use: most commands pick no body, and a large assembly's frames cost
     /// a walk of every body on every command.
-    bodies: std::cell::OnceCell<Vec<(String, String, Mat)>>,
+    bodies: std::cell::OnceCell<crate::BodyFrames>,
     active: Mat,
     /// The frame of the sketch being edited (its component), else the active component's.
     sketch: Mat,
@@ -117,10 +117,7 @@ fn frames(s: &Session) -> Frames {
 impl Frames {
     /// World name, the component's own body name, and its frame, for every body.
     fn bodies(&self, s: &Session) -> &[(String, String, Mat)] {
-        self.bodies.get_or_init(|| {
-            let st = s.model.state();
-            s.placed_document().body_frames_with_source(&st).into_iter().map(|(world, own, _, _, m)| (world, own, m)).collect()
-        })
+        self.bodies.get_or_init(|| s.body_frames())
     }
 }
 
@@ -145,17 +142,19 @@ fn pt(p: Vec3) -> Value {
     serde_json::json!([p.x, p.y, p.z])
 }
 
-/// The frame of the body a world point lies on (the nearest), or of the named body.
-fn frame_at(s: &Session, f: &Frames, p: Vec3, body: Option<&str>) -> Option<Mat> {
+/// The frame of the body a world point lies on (the nearest), or of the named body, with the
+/// bodies whose faces meet there: the first is the body under the point, and more than one
+/// means the pick is ambiguous.
+fn frame_at(s: &Session, f: &Frames, p: Vec3, body: Option<&str>) -> Option<(Mat, Vec<String>)> {
     if let Some(b) = body
-        && let Some((_, _, m)) = f.bodies(s).iter().find(|(w, _, _)| w == b)
+        && let Some((_, own, m)) = f.bodies(s).iter().find(|(w, _, _)| w == b)
     {
-        return Some(*m);
+        return Some((*m, vec![own.clone()]));
     }
     let world = s.world_state();
-    let mut best: Option<(f64, Mat)> = None;
+    let mut best: Option<(f64, Mat, Vec<String>)> = None;
     for wb in &world.bodies {
-        let Some((_, _, m)) = f.bodies(s).iter().find(|(w, _, _)| *w == wb.name) else { continue };
+        let Some((_, own, m)) = f.bodies(s).iter().find(|(w, _, _)| *w == wb.name) else { continue };
         let mesh = wb.mesh();
         let bb = mesh.bounds();
         let tol = (bb.diagonal() * 1e-3).max(1e-3);
@@ -169,11 +168,23 @@ fn frame_at(s: &Session, f: &Frames, p: Vec3, body: Option<&str>) -> Option<Mat>
             continue;
         }
         let d = mesh.triangles.iter().filter_map(|t| mesh.tri(t)).map(|[a, b, c]| tri_dist(p, a, b, c)).fold(f64::INFINITY, f64::min);
-        if d <= tol && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-            best = Some((d, *m));
+        if d > tol {
+            continue;
+        }
+        // Bodies whose faces are as near the point as the nearest one meet there: two of them
+        // make the pick ambiguous. The same body placed twice is one body, not a tie.
+        let as_near = best.as_ref().is_some_and(|(bd, _, _)| (d - *bd).abs() <= 1e-8);
+        if as_near {
+            if let Some((_, _, names)) = &mut best
+                && !names.contains(own)
+            {
+                names.push(own.clone());
+            }
+        } else if best.as_ref().is_none_or(|(bd, _, _)| d < *bd) {
+            best = Some((d, *m, vec![own.clone()]));
         }
     }
-    best.map(|(_, m)| m)
+    best.map(|(_, m, names)| (m, names))
 }
 
 fn tri_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
@@ -198,9 +209,17 @@ struct Mapper<'a> {
 impl Mapper<'_> {
     fn pick(&mut self, v: &Value, body: Option<&str>) -> Option<Value> {
         let p = vec3(v)?;
-        let m = if self.here { self.f.sketch } else { frame_at(self.s, &self.f, p, body).unwrap_or(self.f.active) };
+        let under = if self.here { None } else { frame_at(self.s, &self.f, p, body) };
+        let m = if self.here { self.f.sketch } else { under.as_ref().map(|(m, _)| *m).unwrap_or(self.f.active) };
         self.first.get_or_insert(m);
-        self.local_point(&m, p)
+        let out = self.local_point(&m, p);
+        // The command sees the pick in the frame of the body under it. Remember the bodies
+        // whose faces meet there, so a face of that body is found and a body that only
+        // shares its place in the model does not make the pick ambiguous (#419).
+        if let Some((_, names)) = &under {
+            remember(out.as_ref().and_then(vec3).unwrap_or(p), names.clone());
+        }
+        out
     }
 
     fn local_point(&mut self, m: &Mat, p: Vec3) -> Option<Value> {
@@ -318,6 +337,36 @@ thread_local! {
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The outermost command's coordinates were mapped here (its table lists them).
     static MAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The picks of the running command: the point it sees and the bodies whose faces meet
+    /// there (the first is the body under it; more than one means the pick is ambiguous).
+    static PICKS: std::cell::RefCell<Vec<(Vec3, Vec<String>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many picks of one command are remembered (a command takes few).
+const MAX_PICKS: usize = 4096;
+/// How many bodies may meet at one pick (an ambiguous pick names them).
+const MAX_PICK_BODIES: usize = 64;
+
+/// Remember the bodies whose faces meet at a pick, against the point the command sees.
+fn remember(point: Vec3, names: Vec<String>) {
+    let names: Vec<String> = names.into_iter().take(MAX_PICK_BODIES).collect();
+    PICKS.with(|picks| {
+        let mut picks = picks.borrow_mut();
+        if picks.len() < MAX_PICKS {
+            picks.push((point, names));
+        }
+    });
+}
+
+/// The bodies whose faces meet at `point`, when the running command picked it: the first is
+/// the body under the pick, and more than one means the pick is ambiguous.
+pub(crate) fn picked(point: Vec3) -> Option<Vec<String>> {
+    PICKS.with(|picks| picks.borrow().iter().find(|(p, _)| *p == point).map(|(_, names)| names.clone()))
+}
+
+/// Forget the picks of the last command: a new one starts with none.
+pub(crate) fn forget_picks() {
+    PICKS.with(|picks| picks.borrow_mut().clear());
 }
 
 /// Did this module map the running command's coordinates? (Otherwise a new feature's geometry

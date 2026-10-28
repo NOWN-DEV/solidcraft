@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icons/app/linux/exports/hicolor/256x256/apps/ai.storyteller.solidcraft.png" width="96" height="96" alt="SolidCraft" />
+  <img src="assets/icons/app/linux/exports/hicolor/256x256/apps/io.tangencylabs.solidcraft.png" width="96" height="96" alt="SolidCraft" />
 </p>
 
 <h1 align="center">SolidCraft</h1>
@@ -52,7 +52,7 @@
 
 ## Download
 
-- **Windows:** the [installer][windows-msi], or `winget install bherbruck.SolidCraft`.
+- **Windows:** the [installer][windows-msi].
 - **macOS:** the [disk image][macos-dmg] (Apple silicon and Intel).
 - **Linux:** the [AppImage][linux-appimage], or `sudo snap install solidcraft` ([Snap Store][snap-store]).
 - **Web:** [try it in your browser][web-app], no install.
@@ -74,7 +74,7 @@ other is a tracked bug.
 - **Parameters and configurations** with unit-aware expressions.
 - **Assemblies** with joints, motion studies, contact sets, interference and mass properties.
 - **Sheet metal** with flanges, hems, fold/unfold and flat patterns, and plastic enclosure features.
-- **Files:** STEP, IGES, 3MF, STL, OBJ and glTF in and out where supported, URDF export, `.solidcraft` designs.
+- **Files:** STEP, IGES, 3MF, STL, OBJ and glTF in and out where supported, URDF export, `.sc` designs (`.solidcraft` files from earlier releases still open).
 - **Desktop app, browser app, headless CLI and MCP server**, all running the same commands.
 
 The full list is in [docs/capabilities.md](docs/capabilities.md) and [docs/features.md](docs/features.md);
@@ -96,8 +96,10 @@ More commands, the Windows cross-build and the browser build are in [docs/buildi
 
 `solidcraft-cli mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server. Headless it
 runs its own design session, or with `--connect` it drives the running app so you can watch.
-Claude Code: `claude mcp add solidcraft -- solidcraft-cli mcp`. Tools, access rules and an
-example session: [docs/mcp.md](docs/mcp.md).
+Claude Code: `claude mcp add solidcraft -- solidcraft-cli mcp`. If a terminal doesn't find
+`solidcraft-cli` (older Windows installers don't put it on `PATH`), give its full path (by default
+`"C:\Program Files\SolidCraft\solidcraft-cli.exe"`). Tools, access rules and an example session:
+[docs/mcp.md](docs/mcp.md).
 
 ## Scripts
 
@@ -118,6 +120,12 @@ the clean-room and licence rules, and where help is wanted most. Open work is in
 
 SolidCraft's continuous integration runs on [Blacksmith](https://www.blacksmith.sh), which
 sponsors its CI minutes.
+
+## Disclaimer
+
+The files in this repository are provided as is, without warranty, liability or indemnity, and
+Tangency Labs and the contributors accept no responsibility for any harmful or unlawful use of
+them: read [DISCLAIMER.md](DISCLAIMER.md).
 
 ## Licence
 

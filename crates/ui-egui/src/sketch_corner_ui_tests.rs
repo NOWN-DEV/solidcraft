@@ -653,10 +653,10 @@ fn trim_hover_shows_the_piece_a_click_takes_away() {
 }
 
 /// #3141: the 2-tangent circle tool, clicked on two sides of a rectangle drawn away from the
-/// origin, puts its circle in the corner between the clicks without moving the rectangle, and
-/// fixed sides no longer make it fail.
+/// origin, offers its default radius before it puts the circle in the corner between the clicks.
+/// A typed radius reaches the command, neither path moves the rectangle, and fixed sides work.
 #[test]
-fn two_tangent_circle_clicked_on_two_sides_fits_the_corner_and_moves_nothing() {
+fn two_tangent_circle_takes_its_default_or_a_typed_radius_and_moves_nothing() {
     for fixed in [false, true] {
         let mut h = crate::scenario::Harness::new();
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
@@ -673,10 +673,25 @@ fn two_tangent_circle_clicked_on_two_sides_fits_the_corner_and_moves_nothing() {
         h.step(&json!({"start":"sketch.circle.two_tangent"})).unwrap();
         h.step(&json!({"click":{"world":[-550,0,0]}})).unwrap();
         h.step(&json!({"click":{"world":[-800,250,0]}})).unwrap();
+        let before_circle = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+        assert!(!before_circle.curves.iter().any(|c| matches!(c.kind, CurveKind::Circle { .. })), "the second pick waits for Radius");
+        let tool = h.app.tool.as_ref().unwrap();
+        assert_eq!(tool.dims.iter().map(|dimension| dimension.label).collect::<Vec<_>>(), ["Radius"]);
+        let offered = tool.dims[0].value.parse::<f64>().unwrap_or_default();
+        assert!((offered - 50.0).abs() < 1e-6, "the shorter 500 mm side offers 50 mm: {offered}");
+        let radius = if fixed {
+            h.step(&json!({"key":"A","cmd":true})).unwrap();
+            h.step(&json!({"text":"30"})).unwrap();
+            30.0
+        } else {
+            50.0
+        };
+        h.step(&json!({"key":"Enter"})).unwrap();
         let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
         let circle = sk.curves.iter().position(|c| matches!(c.kind, CurveKind::Circle { .. }));
         let circle = circle.unwrap_or_else(|| panic!("fixed {fixed}: no circle: {:?}", h.app.status));
-        assert!(sk.center(circle).unwrap().dist(Vec2::new(-750.0, 50.0)) < 1e-6, "fixed {fixed}: {:?}", sk.center(circle));
+        assert!(sk.center(circle).unwrap().dist(Vec2::new(-800.0 + radius, radius)) < 1e-6, "fixed {fixed}: {:?}", sk.center(circle));
+        assert!((sk.radius(circle).unwrap() - radius).abs() < 1e-6, "fixed {fixed}: {:?}", sk.radius(circle));
         let after = points(&h);
         assert!(before.iter().zip(&after).all(|(a, b)| a.dist(*b) < 1e-9), "fixed {fixed}: the rectangle moved: {after:?}");
     }
@@ -712,6 +727,41 @@ fn centre_circle_clicked_through_a_line_end_stays_on_it() {
     );
 }
 
+/// #7299: the centre arc tool, its centre snapped to a rectangle's corner, ties the arc to the
+/// corner with a Coincident (which the sketch shows as a glyph), not by quietly sharing the corner
+/// as its centre.
+#[test]
+fn centre_arc_on_an_existing_point_is_tied_by_a_coincident() {
+    use solidcraft_engine::sketch::ConstraintKind;
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0":[10,10],"p1":[40,30]})).unwrap();
+    h.step(&json!({"call":"ui.view","params":{"view":"fit"}})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    let at_corner = |p: Option<_>| p.is_some_and(|p: Vec2| (p.x - 40.0).abs() < 1e-9 && (p.y - 30.0).abs() < 1e-9);
+    let corner = (0..sk.points.len()).find(|&i| at_corner(sk.point(i))).unwrap();
+    h.step(&json!({"start":"sketch.arc.center_point"})).unwrap();
+    for at in [[40, 30, 0], [34, 30, 0], [40, 24, 0]] {
+        h.step(&json!({"move":{"world":at}})).unwrap();
+        h.step(&json!({"click":{"world":at}})).unwrap();
+    }
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    let centre = sk.curves.iter().find_map(|c| match c.kind {
+        CurveKind::Arc { c, .. } => Some(c),
+        _ => None,
+    });
+    let centre = centre.unwrap_or_else(|| panic!("an arc is drawn: {:?}", h.app.status));
+    assert_ne!(centre, corner, "the arc has a centre of its own");
+    assert!(at_corner(sk.point(centre)), "the centre is on the corner");
+    let tied = sk
+        .constraints
+        .iter()
+        .any(|k| matches!(k.kind, ConstraintKind::Coincident { p, q } if (p, q) == (corner, centre) || (p, q) == (centre, corner)));
+    assert!(tied, "a Coincident ties the centre to the corner: {:?}", sk.constraints);
+}
+
 /// #4691: the Point tool clicked on a line's midpoint makes a point held there (a MidPoint
 /// constraint), not a free point that happens to sit on the middle.
 #[test]
@@ -727,4 +777,39 @@ fn a_point_clicked_on_a_line_midpoint_is_held_there() {
     let sk = &state.sketch(sid).unwrap().sketch;
     let held = sk.constraints.iter().any(|c| matches!(c.kind, solidcraft_engine::sketch::ConstraintKind::Midpoint { .. }));
     assert!(held, "no MidPoint constraint: {:?}", sk.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+}
+
+/// #7299: the centre circle tool, its centre snapped to a rectangle's corner, ties the circle
+/// to the corner with a Coincident (which the sketch shows as a glyph that can be picked and
+/// deleted), not by quietly sharing the corner as its centre.
+#[test]
+fn centre_circle_on_an_existing_point_is_tied_by_a_coincident() {
+    use solidcraft_engine::sketch::ConstraintKind;
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0":[10,10],"p1":[40,30]})).unwrap();
+    h.step(&json!({"call":"ui.view","params":{"view":"fit"}})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    let at_corner = |p: Option<_>| p.is_some_and(|p: Vec2| (p.x - 40.0).abs() < 1e-9 && (p.y - 30.0).abs() < 1e-9);
+    let corner = (0..sk.points.len()).find(|&i| at_corner(sk.point(i))).unwrap();
+    h.step(&json!({"start":"sketch.circle.center"})).unwrap();
+    for at in [[40, 30, 0], [34, 24, 0]] {
+        h.step(&json!({"move":{"world":at}})).unwrap();
+        h.step(&json!({"click":{"world":at}})).unwrap();
+    }
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    let centre = sk.curves.iter().find_map(|c| match c.kind {
+        CurveKind::Circle { c, .. } => Some(c),
+        _ => None,
+    });
+    let centre = centre.unwrap_or_else(|| panic!("a circle is drawn: {:?}", h.app.status));
+    assert_ne!(centre, corner, "the circle has a centre of its own");
+    assert!(at_corner(sk.point(centre)), "the centre is on the corner");
+    let tied = sk
+        .constraints
+        .iter()
+        .any(|k| matches!(k.kind, ConstraintKind::Coincident { p, q } if (p, q) == (corner, centre) || (p, q) == (centre, corner)));
+    assert!(tied, "a Coincident ties the centre to the corner: {:?}", sk.constraints);
 }

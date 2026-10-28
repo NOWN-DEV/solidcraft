@@ -557,3 +557,120 @@ fn left_history_sidebar_leaves_bottom_readouts_at_the_bottom() {
         assert!((readout.bottom() - (viewport.bottom() - 12.0)).abs() < 0.01, "{name}: {readout:?} in {viewport:?}");
     }
 }
+
+/// The frame-rate readout and its details sit just left of a pane over the view's bottom-right
+/// corner (the Assistant), follow it as it opens, changes width and closes, and stay in the
+/// visible view; with the pane on the left they keep the corner (#6755).
+#[test]
+fn frame_rate_readout_stays_beside_a_right_pane() {
+    use crate::scenario::{handle_at, rect_of};
+    for mode in [LayoutMode::Floating, LayoutMode::Docked] {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.call("ui.set", json!({"layout": mode}));
+        h.app.preferences.show_frame_rate = true;
+        h.app.preferences.frame_rate_details = true;
+        h.app.preferences.agent_chat_side = "right".into();
+        h.frames(3);
+        let in_corner = |h: &Harness| {
+            let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+            let readout = rect_of("viewport:frame_rate").expect("the readout is drawn");
+            assert!((readout.right() - (viewport.right() - 12.0)).abs() < 0.01, "{mode:?}: {readout:?} in {viewport:?}");
+        };
+        in_corner(&h);
+        // The Assistant's narrowest, a middle and its widest width.
+        for width in [280.0, 480.0, 760.0] {
+            h.call("ui.agent_chat", json!({"open": true, "picker": false, "side": "right", "width": width}));
+            h.frames(3);
+            let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+            let pane = rect_of("agent_chat:panel").expect("the Assistant is drawn");
+            let readout = rect_of("viewport:frame_rate").expect("the readout is drawn");
+            assert!(viewport.contains_rect(readout), "{mode:?}, {width}: {readout:?} outside {viewport:?}");
+            assert!(readout.right() <= pane.left() - 12.0 + 0.01, "{mode:?}, {width}: {readout:?} under {pane:?}");
+            if mode == LayoutMode::Floating {
+                assert!((readout.right() - (pane.left() - 12.0)).abs() < 0.01, "{width}: {readout:?} not just left of {pane:?}");
+            }
+            for covered in crate::shell::covered_rects(&h.app) {
+                assert!(!readout.intersects(covered), "{mode:?}, {width}: {readout:?} under {covered:?}");
+            }
+            let details = handle_at("viewport:frame_details").expect("the details are drawn");
+            assert!(viewport.contains(details) && details.x < pane.left(), "{mode:?}, {width}: details at {details:?}, pane {pane:?}");
+        }
+        h.call("ui.agent_chat", json!({"open": false}));
+        h.frames(3);
+        assert!(rect_of("agent_chat:panel").is_none());
+        in_corner(&h);
+        // On the left the pane leaves the corner free.
+        h.call("ui.agent_chat", json!({"open": true, "side": "left"}));
+        h.frames(3);
+        assert!(rect_of("agent_chat:panel").is_some());
+        in_corner(&h);
+    }
+}
+
+/// The View angles readout (#6032) sits under the orientation gizmo only while View ▸ View angles
+/// is on, follows the view live with its projection, and its card turns the view to typed angles
+/// through `view.apply`, without touching the design or its history.
+#[test]
+fn view_angles_readout_shows_only_when_on_and_applies_typed_angles() {
+    use solidcraft_engine::render::ViewAngles;
+    for style in ["axes", "cube"] {
+        let mut h = Harness::new();
+        h.call("ui.prefs", json!({"navigator_style": style}));
+        h.app.preferences.look_at_anim = false;
+        h.settle();
+        let design = h.app.session.doc.to_json();
+        assert!(!h.app.preferences.show_view_angles, "off by default");
+        assert!(crate::scenario::rect_of("view_angles:readout").is_none());
+        // View ▸ View angles runs view.angle_readout.
+        let view = crate::scenario::handle_at("nav:view").unwrap();
+        h.call("ui.click", json!({"x": view.x, "y": view.y}));
+        let check = crate::scenario::handle_at("view:view_angles").unwrap();
+        h.call("ui.click", json!({"x": check.x, "y": check.y}));
+        assert!(h.app.preferences.show_view_angles);
+        h.call("ui.click", json!({"x": view.x, "y": view.y}));
+        h.call("ui.view", json!({"view": "front"}));
+        h.settle();
+        let readout = crate::scenario::rect_of("view_angles:readout").expect("the readout shows once it is on");
+        let axis = crate::scenario::rect_of("axis_view:outer").unwrap();
+        assert!(
+            readout.top() >= axis.bottom() && readout.right() <= axis.right() && readout.right() > axis.center().x,
+            "{style}: {readout:?} under {axis:?}"
+        );
+        let lines = |h: &Harness| crate::view_angles::lines(&h.app);
+        assert_eq!(lines(&h), ("Pitch 0.0° · Yaw 0.0° · Roll 0.0°".to_string(), "Ortho".to_string()));
+        h.call("ui.view", json!({"view": "right"}));
+        h.app.ui.perspective = true;
+        h.settle();
+        assert_eq!(lines(&h), ("Pitch 0.0° · Yaw -90.0° · Roll 0.0°".to_string(), "Persp".to_string()));
+        h.call("ui.view", json!({"view": "top"}));
+        h.settle();
+        assert_eq!(lines(&h).0, "Pitch 90.0° · Yaw 0.0° · Roll 0.0°");
+        // A click on the readout opens the card with the current angles; Apply turns the view.
+        let camera = h.app.cam;
+        h.call("ui.click", json!({"x": readout.center().x, "y": readout.center().y}));
+        assert_eq!(h.app.cam, camera, "the click opens the card, it does not move the view");
+        assert!(crate::scenario::rect_of("view_angles:card").is_some());
+        let draft = h.ctx.data(|d| d.get_temp::<ViewAngles>(crate::view_angles::draft_id())).expect("the card holds the typed angles");
+        assert!((draft.pitch - 90.0).abs() < 1e-3 && draft.yaw == 0.0 && draft.roll == 0.0, "{draft:?}");
+        h.ctx.data_mut(|d| d.insert_temp(crate::view_angles::draft_id(), ViewAngles { yaw: 30.0, pitch: 15.0, roll: -10.0 }));
+        h.frame();
+        let apply = crate::scenario::handle_at("dialog:button:Apply").unwrap();
+        h.call("ui.click", json!({"x": apply.x, "y": apply.y}));
+        h.settle();
+        let a = h.app.cam.view_angles();
+        assert!((a.yaw - 30.0).abs() < 1e-9 && (a.pitch - 15.0).abs() < 1e-9 && (a.roll + 10.0).abs() < 1e-9, "{a:?}");
+        assert_eq!((h.app.cam.target, h.app.cam.distance), (camera.target, camera.distance), "only the orientation changes");
+        assert_eq!(lines(&h).0, "Pitch 15.0° · Yaw 30.0° · Roll -10.0°");
+        // A click elsewhere closes the card; the command turns the readout off again.
+        let centre = h.app.viewport.rect.unwrap().center();
+        h.call("ui.click", json!({"x": centre.x, "y": centre.y}));
+        assert!(crate::scenario::rect_of("view_angles:card").is_none());
+        h.call("engine.execute", json!({"command": "view.angle_readout", "params": {"enabled": false}}));
+        h.settle();
+        assert!(!h.app.preferences.show_view_angles);
+        assert!(crate::scenario::rect_of("view_angles:readout").is_none());
+        assert_eq!(h.app.session.doc.to_json(), design);
+        assert!(h.app.session.undo.is_empty());
+    }
+}

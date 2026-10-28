@@ -16,7 +16,8 @@ pub enum Surface {
     Palette,
     /// Workspace switcher and ribbon cards.
     Chrome,
-    /// Native application/title bar; its presentation is independent of workspace layout.
+    /// Native application/title bar and the optional status bar along the window's bottom edge;
+    /// their presentation is independent of workspace layout.
     ApplicationBar,
     /// Movable system windows and modal dialogs; never become workspace docks.
     Window,
@@ -73,6 +74,32 @@ impl Container {
         Self { surface, layout, joined: None }
     }
 
+    /// Floating workspace cards retain their shared chrome even in compact ribbon layouts.
+    pub(crate) fn floating_card(surface: Surface) -> Self {
+        Self::for_layout(LayoutMode::Floating, surface)
+    }
+
+    /// Shared bottom-strip placement, used by History and other workspace strips.
+    pub(crate) fn bottom_strip_rect(self, available: egui::Rect, height: f32) -> egui::Rect {
+        let inset = available.shrink(self.gap());
+        egui::Rect::from_min_max(egui::pos2(inset.left(), (inset.bottom() - height).max(inset.top())), inset.max)
+    }
+
+    /// Anchored navigation surfaces share the compass/nav-bar frame and token padding.
+    pub(crate) fn navigation_card<R>(
+        ctx: &Context,
+        id: Id,
+        anchor: egui::Pos2,
+        pivot: egui::Align2,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<R> {
+        let container = Self::new(ctx, Surface::Navigation);
+        container.area(id).movable(false).pivot(pivot).fixed_pos(anchor).order(egui::Order::Middle).show(ctx, |ui| {
+            let frame = container.frame(ctx, Tokens::get().overlay, Side::Left).inner_margin(Tokens::get().space_4);
+            container.show_frame(ui, frame, ctx.content_rect(), |ui| super::scope(ui, add)).inner
+        })
+    }
+
     /// Declare contacts from shell geometry; styling remains entirely in the container.
     pub fn joined(mut self, edges: DockEdges) -> Self {
         self.joined = Some(edges);
@@ -111,10 +138,11 @@ impl Container {
         }
     }
 
-    /// Movable tool sheets round all exposed corners, joining only their right dock edge.
+    /// Movable tool sheets round all exposed corners, joining only their right dock edge (or the
+    /// edges they were declared `joined` at).
     pub(crate) fn tool_frame(self, mut frame: Frame, right_docked: bool) -> Frame {
         if self.surface == Surface::Feature && !self.floating() {
-            frame.corner_radius = Self::compact_rounding(DockEdges { right: right_docked, ..Default::default() });
+            frame.corner_radius = Self::compact_rounding(self.joined.unwrap_or(DockEdges { right: right_docked, ..Default::default() }));
         }
         frame
     }
@@ -223,7 +251,10 @@ impl Container {
     }
 
     pub fn area(self, id: Id) -> egui::Area {
-        egui::Area::new(id).enabled(self.input_enabled())
+        // Persistent workspace cards stay below tool/system windows even when clicked.
+        // Other areas keep egui's normal window layer; popups choose their own order.
+        let order = if self.surface == Surface::Panel { egui::Order::Background } else { egui::Order::Middle };
+        egui::Area::new(id).enabled(self.input_enabled()).order(order)
     }
 
     pub fn edge(self, id: impl Into<Id>, edge: Edge) -> egui::Panel {

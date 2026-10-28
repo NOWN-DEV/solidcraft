@@ -28,7 +28,7 @@ Where SolidCraft can replace itself safely, the window also has **Update now**:
 
 | Installed as | Update now does |
 |---|---|
-| AppImage | Downloads the new AppImage next to the old one, verifies it, renames it over the old file and offers **Restart now** |
+| AppImage | Downloads the new AppImage next to the old one, verifies it, renames it over the old file and offers **Restart now**; a file named like a release (`solidcraft-<version>-linux-<arch>.AppImage`) takes the new release's name, so tools such as Gearlever keep finding its update data, and any other name is kept |
 | Windows installer (`.msi`) | **Install (closes SolidCraft)**: downloads and verifies the `.msi`, closes SolidCraft (asking about unsaved designs first) and starts the installer |
 | Windows portable `.zip` or `.exe` | Downloads and verifies the package, swaps in the new `solidcraft.exe` (and `solidcraft-cli.exe`) and offers **Restart now**; the old file is removed at the next start |
 | macOS | **Download and open**: downloads and verifies the `.dmg` and opens it; drag SolidCraft to Applications to replace the old copy |
@@ -98,7 +98,7 @@ and SolidCraft picks the one matching how it was installed:
 | Installed as | Detected by | Download | How to update |
 |---|---|---|---|
 | AppImage | `APPIMAGE` is set | `solidcraft-linux-<arch>.AppImage` | Replace the old AppImage with the new one |
-| Flatpak | `FLATPAK_ID` is set | doesn't check (see below) | `flatpak update ai.storyteller.solidcraft` |
+| Flatpak | `FLATPAK_ID` is set | doesn't check (see below) | `flatpak update io.tangencylabs.solidcraft` |
 | Snap from the Snap Store | `SNAP` is set | release page | `sudo snap refresh solidcraft` (snapd also refreshes by itself) |
 | Snap from a downloaded file | `SNAP_REVISION` starts with `x` | `solidcraft-linux-<arch>.snap` | `sudo snap install --dangerous ./solidcraft-linux-<arch>.snap` |
 | `.deb` | under `/usr`, dpkg knows `solidcraft` | `solidcraft-linux-<arch>.deb` | `sudo apt install ./solidcraft-linux-<arch>.deb` |

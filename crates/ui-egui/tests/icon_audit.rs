@@ -107,6 +107,7 @@ fn assistant(h: &mut Harness, requested: &mut BTreeMap<String, bool>) {
             title: "solid.fillet".into(),
             kind: "other".into(),
             status: Some(ToolStatus::Failed),
+            input: None,
             output: Some("Use a smaller radius".into()),
         },
         Item::Approval { id: 1, title: "Export plate.step".into(), tool: "export".into(), answer: None },
@@ -169,6 +170,42 @@ fn requested_menu_icons_have_artwork_and_match_manifest() {
     let mut requested = BTreeMap::new();
     collect(&mut h, "initial browser and timeline", &mut requested);
     assistant(&mut h, &mut requested);
+
+    let navigation = h.app.preferences.navigation_bar.clone();
+    h.call("ui.prefs", json!({"navigation_bar":{"slots":["orbit","pan","zoom","spin","fit","look_at","home","visual_style","projection","display","grid","ground_shadow","ambient_occlusion"]}}));
+    collect(&mut h, "navigation catalogue", &mut requested);
+    let size = h.ctx.content_rect().size();
+    h.call("ui.resize", json!({"width":500,"height":800}));
+    h.frames(3);
+    click(&mut h, "nav:more");
+    h.frames(3);
+    collect(&mut h, "navigation overflow", &mut requested);
+    escape(&mut h);
+    h.call("ui.resize", json!({"width":size.x,"height":size.y}));
+    h.call("ui.prefs", json!({"navigation_bar":navigation}));
+    h.frames(3);
+
+    for (handle, surface) in [("nav:slot:visual_style", "navigation visual styles"), ("nav:view", "navigation display")] {
+        click(&mut h, handle);
+        h.frames(3);
+        collect(&mut h, surface, &mut requested);
+        click(&mut h, handle);
+    }
+
+    h.step(&json!({"click":{"handle":"nav:slot:pan"},"button":"right"})).unwrap();
+    h.frames(3);
+    collect(&mut h, "navigation context menu", &mut requested);
+    escape(&mut h);
+    h.call("ui.prefs", json!({"open":"Interface/Navigation bar"}));
+    h.frames(20);
+    collect(&mut h, "navigation editor and available tiles", &mut requested);
+    click(&mut h, "prefs:navbar:slot:pan");
+    h.step(&json!({"click":{"handle":"prefs:navbar:slot:pan"},"button":"right"})).unwrap();
+    h.frames(3);
+    collect(&mut h, "navigation editor slot menu", &mut requested);
+    escape(&mut h);
+    h.call("ui.prefs", json!({"button":"cancel"}));
+    h.frames(3);
 
     ribbon(&mut h, &mut requested);
     h.app.start("inspect.colored_components");

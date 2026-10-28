@@ -4,6 +4,9 @@ use super::*;
 pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = crate::theme::Tokens::get();
     ui_kit::settings_heading(ui, app.tr("prefs.graphics"), app.tr("prefs.graphics_note"));
+    if let Some(note) = &app.graphics_fallback {
+        ui_kit::text(ui, note, ui_kit::Text::Hint("graphics_fallback"));
+    }
     if app.services.graphics_path.is_some() {
         ui_kit::settings_section(ui, "graphics_card", app.tr("prefs.graphics_card"), |ui| {
             let adapters = &app.services.graphics_adapters;
@@ -160,6 +163,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     ui_kit::checkbox(ui, app.tr("ui.frame_rate_details"), &mut app.preferences.frame_rate_details)
                         .on_hover_text(app.tr("settings.frame_rate_details_note"));
                 });
+                crate::prefs::view_angles_checkbox(app, left);
                 setting::reference_geometry_through_bodies(app, left).on_hover_text(app.tr("settings.reference_geometry_through_bodies_help"));
                 setting::sketch_halo(app, left);
             }
