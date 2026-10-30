@@ -18,7 +18,7 @@ API = "https://api.github.com"
 ALLOWED_REPOS = {"tangency-labs/solidcraft", "tangency-labs/solidcore"}
 WRITE_ACTIONS = {
     "pr_create", "issue_create", "comment", "review_reply",
-    "edit", "edit_comment", "delete_comment", "close", "reopen",
+    "edit", "edit_comment", "delete_comment", "close", "reopen", "fork",
 }
 READ_ACTIONS = {"read", "list", "search"}
 MAX_BODY = 65000
@@ -136,6 +136,7 @@ def validate(req, deny):
         "delete_comment": ("comment_id",),
         "close": ("number",),
         "reopen": ("number",),
+        "fork": (),
         "read": ("number",),
         "list": (),
         "search": ("query",),
@@ -213,6 +214,8 @@ def run(gh, req, login, dry_run=False):
         call = ("POST", f"/repos/{repo}/pulls",
                 {"title": req["title"], "head": head, "base": req["base"], "body": req.get("body", ""),
                  "draft": bool(req.get("draft", True)), "maintainer_can_modify": True})
+    elif action == "fork":
+        call = ("POST", f"/repos/{repo}/forks", {"default_branch_only": True})
     elif action == "issue_create":
         call = ("POST", f"/repos/{repo}/issues", {"title": req["title"], "body": req["body"]})
     elif action == "comment":

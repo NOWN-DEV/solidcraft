@@ -103,6 +103,13 @@ class Run(unittest.TestCase):
         method, path, data = gh.calls[-1]
         self.assertEqual((method, path, data["draft"], data["head"]), ("POST", f"/repos/{REPO}/pulls", True, "NOWN-DEV:fix"))
 
+    def test_fork_targets_allowed_repo(self):
+        gh = FakeGitHub()
+        relay.run(gh, req(action="fork", repo="tangency-labs/solidcore"), "NOWN-DEV")
+        self.assertEqual(gh.calls[-1][:2], ("POST", "/repos/tangency-labs/solidcore/forks"))
+        with self.assertRaises(relay.RelayError):
+            relay.validate(req(action="fork", repo="someone/else"), DENY)
+
     def test_dry_run_writes_nothing(self):
         gh = FakeGitHub()
         out = relay.run(gh, req(action="comment", number=4, body="hi"), "NOWN-DEV", dry_run=True)

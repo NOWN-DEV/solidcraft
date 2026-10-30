@@ -18,6 +18,7 @@ Targets: `tangency-labs/solidcraft` and `tangency-labs/solidcore` only.
 | `edit` | `number`, `title` and/or `body` | Own issues and PRs only. |
 | `edit_comment`, `delete_comment` | `comment_id`, `comment_kind` (`issue` or `review`), `body` | Own comments only. |
 | `close`, `reopen` | `number` | Own issues and PRs only. |
+| `fork` | (none) | Forks the target repository to this account (default branch only). |
 | `read` | `number` | Item, comments; for a PR also reviews, review comments, head SHA, mergeability, checks. |
 | `list` | `state` (`open`, `closed`, `all`) | Issues and PRs this account opened. |
 | `search` | `query` | GitHub issue search, limited to the target repository. |
