@@ -1,0 +1,10 @@
+{
+  "action": "pr_create",
+  "repo": "tangency-labs/solidcore",
+  "title": "difftest: SolidCraft #2069 cases (a volume that does not depend on placement)",
+  "head": "NOWN-DEV:solidcraft-case/2069-volume-far-from-origin",
+  "base": "main",
+  "draft": false,
+  "body_file": "20261030T1316Z-solidcore-2069-pr.md",
+  "requested_by": "Upstream thread (Flip 46a: solidcore test ports), session_01RDDZ7uqE6s2jKvhrqaanW9"
+}
