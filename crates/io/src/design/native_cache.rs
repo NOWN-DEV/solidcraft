@@ -1,11 +1,11 @@
 //! The model cache: a design's evaluated timeline (every feature's result and the state after
 //! it, [`SavedModel`]), saved with it so opening need not evaluate it again. Bodies use
-//! SolidCraft's exact native B-rep encoding; the key ties the cache to the exact document, build
-//! and platform that computed it (docs/design-container.md).
+//! SolidCraft's exact native B-rep encoding; the key ties the cache to the exact document, and to
+//! the source and platform that computed it (docs/design-container.md).
 use super::*;
 use solidcraft_doc::{ModelState, SavedModel};
 
-const FORMAT: &str = "solidcraft-model-cache/4";
+const FORMAT: &str = "solidcraft-model-cache/5";
 const PRODUCER: &str = "solidcraft-truck-adapter/3";
 const MANIFEST: &str = "cache/model.json";
 const PAYLOAD: &str = "cache/bodies.bin";
@@ -15,10 +15,17 @@ const MAX_RECORDS: usize = 200_000;
 const MAX_UNIQUE: usize = 100_000;
 const MAX_MANIFEST: usize = 32 << 20;
 
-/// The build that computed a cache: the same source, compiled for the same platform, computes the
-/// same numbers, so only its own caches are its results.
+/// The build that wrote a cache (recorded; earlier builds read only their own caches).
 fn build() -> String {
     format!("{}/{}-{}", env!("SOLIDCRAFT_SOURCE_COMMIT"), std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// What computed a cache: the same evaluation source (build.rs), compiled for the same platform,
+/// computes the same numbers, so only caches of that source are its results. An update that left
+/// that source as it was (only the interface or the commands changed) reads the caches of the
+/// build before it; one that changed it (a kernel fix, the codec) evaluates the design again.
+fn evaluation() -> String {
+    format!("{}/{}-{}", env!("SOLIDCRAFT_EVALUATION_SOURCE"), std::env::consts::ARCH, std::env::consts::OS)
 }
 
 /// A 4 x 4 matrix as its 16 numbers, in storage order.
@@ -50,7 +57,7 @@ pub(super) fn encode_model(model: &SavedModel, document: &[u8], space: usize) ->
         .iter()
         .map(|(s, placed)| std::iter::once(s).chain(placed.as_ref().and_then(|(part, _)| encoded.parts.get(*part))).map(|s| (*s, size(s))).collect())
         .collect();
-    let mut budget = space.min(MAX_DESIGN_BYTES);
+    let mut budget = space.min(max_design());
     for _ in 0..16 {
         let Some((thin, kept, counted)) = model.thinned(&pieces, budget) else { break };
         // Only the final state, which is kept whatever it costs: nothing smaller is left to try. What
@@ -184,7 +191,7 @@ impl Encoded {
         let shares = parts.iter().map(|p| slice(*self.parts.get(*p).ok_or_else(|| invalid("display share"))?)).collect::<Result<Vec<_>>>()?;
         let stored = order.iter().map(|s| self.slices.get(*s).ok_or_else(|| invalid("cached body"))).collect::<Result<Vec<_>>>()?;
         let length = stored.iter().fold(0usize, |n, bytes| n.saturating_add(bytes.len()));
-        if length > MAX_DESIGN_BYTES || stored.len() > MAX_UNIQUE {
+        if length > max_design() || stored.len() > MAX_UNIQUE {
             return Err(invalid("model cache size"));
         }
         let mut data = Vec::with_capacity(length);
@@ -195,7 +202,7 @@ impl Encoded {
         }
         let manifest = serde_json::to_vec(&json!({
             "format": FORMAT, "producer": PRODUCER, "app": env!("CARGO_PKG_VERSION"), "build": build(),
-            "document": digest(document), "payload": digest(&data),
+            "evaluation": evaluation(), "document": digest(document), "payload": digest(&data),
             "slices": slices, "shares": shares, "bodies": table, "model": records,
         }))
         .map_err(invalid)?;
@@ -203,24 +210,25 @@ impl Encoded {
     }
 }
 
-/// The final state of the model a design keeps, when this build computed it for exactly this
-/// document. Any failure is a miss, never a document error.
+/// The final state of the model a design keeps, when this build's evaluation source computed it
+/// for exactly this document. Any failure is a miss, never a document error.
 pub fn read_design_geometry(bytes: &[u8]) -> Option<std::sync::Arc<ModelState>> {
-    if bytes.len() > MAX_DESIGN_BYTES || !is_design_container(bytes) {
+    if bytes.len() > max_design() || !is_design_container(bytes) {
         return None;
     }
     DesignContainerReader::new(Cursor::new(bytes)).ok()?.geometry()?.final_state().ok()
 }
 
-/// Whether `manifest` is a model cache this build wrote for `document`.
+/// Whether `manifest` is a model cache of this build's evaluation source for `document`. The
+/// application version and commit that wrote it are not asked: another version of the same
+/// evaluation source computed the same model.
 fn current(manifest: &Value, document: &[u8]) -> bool {
     let is = |key: &str, value: &str| manifest.get(key).and_then(Value::as_str) == Some(value);
     is("format", FORMAT)
         && is("producer", PRODUCER)
-        && is("app", env!("CARGO_PKG_VERSION"))
-        && is("build", &build())
+        && is("evaluation", &evaluation())
         && is("document", &digest(document))
-        && source_trusted(env!("SOLIDCRAFT_SOURCE_COMMIT"), cfg!(any(test, feature = "trust-unknown-source")))
+        && source_trusted(env!("SOLIDCRAFT_EVALUATION_SOURCE"), cfg!(any(test, feature = "trust-unknown-source")))
 }
 
 /// A build of unknown source (no git) never trusts a cache, unless `in_tests`: test builds
@@ -241,7 +249,7 @@ pub(super) fn read_geometry_with<R: Read + Seek>(reader: &mut PackageReader<R>, 
     }
     // Validate the small parametric metadata before decoding any geometry.
     Document::from_json(std::str::from_utf8(document).map_err(invalid)?)?;
-    let data = reader.limited_part(PAYLOAD, MAX_DESIGN_BYTES)?;
+    let data = reader.limited_part(PAYLOAD, max_design())?;
     if manifest.get("payload").and_then(Value::as_str) != Some(digest(&data).as_str()) {
         return Err(invalid("model cache payload key"));
     }
