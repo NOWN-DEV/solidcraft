@@ -365,3 +365,12 @@ SolidCraft changes:
   (the `wp::pointer_gestures` module); drop the example and test targets.
 - `src/event.rs`, `src/changelog/unreleased.md`: the platform notes of both events and the
   changelog entry.
+- `src/platform_impl/windows/drop_handler.rs`, `src/platform_impl/linux/x11/event_processor.rs`:
+  while files are dragged over a window, send `WindowEvent::CursorMoved` with where the drag is
+  (Windows: `IDropTarget`'s `DragEnter`, `DragOver` and `Drop`, screen to client coordinates;
+  X11: each `XdndPosition`, root to window coordinates). winit 0.30 gives `HoveredFile` and
+  `DroppedFile` no position, and neither platform sends the window pointer motion while a drag
+  runs, so the app could not tell where files were dropped (the design tabs open files dropped
+  on them at that place). macOS and Wayland are unchanged.
+- `src/platform_impl/windows/definitions.rs`: `IDropTarget`'s `pt` is a `POINTL` passed by value,
+  as COM declares it; winit 0.30 declared a pointer, harmless only while nothing read it.

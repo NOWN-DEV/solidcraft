@@ -27,7 +27,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("open")
         .key("Ctrl+O")
         .noundo()
-        .params("path: .sc design (or a .solidcraft design from an earlier release), .dxf/.svg drawing (opens as a new, unsaved design with an XY sketch, using sketch.insert_dxf/sketch.insert_svg units and defaults), or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make), or a .ply/.xyz/.pts point cloud (opens as a new design holding it, as pointcloud.insert makes; its `units` and `max_points` as there); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh)"),
+        .params("path: .sc design (or a .solidcraft design from an earlier release), .dxf/.svg drawing (opens as a new, unsaved design with an XY sketch, using sketch.insert_dxf/sketch.insert_svg units and defaults), or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make), or a .ply/.xyz/.pts point cloud (opens as a new design holding it, as pointcloud.insert makes; its `units` and `max_points` as there); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere); tab?: whole number (the desktop app: open it as a design in a new tab at this place among the tabs, 0 the first, past the last at the end, never in place of the design shown; a design already open shows its tab instead; elsewhere ignored) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh)"),
     CommandSpec::new("file.insert_step", "Insert STEP", insert_step)
         .at("SOLID", "INSERT")
         .icon("import")
@@ -272,6 +272,9 @@ fn insert_step(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = path_arg(p, "doc.open")?;
+    if p.get("tab").is_some_and(|v| !v.is_null() && v.as_u64().is_none()) {
+        return Err(bad("doc.open", "`tab` must be a whole number, 0 or more"));
+    }
     if !solidcraft_io::is_step_path(path) && p.get("names").is_some_and(|v| !v.is_null()) {
         return Err(bad("doc.open", "`names` applies to STEP and IGES files only"));
     }
@@ -1627,6 +1630,27 @@ mod tests {
             assert_eq!(s.doc.name, stem);
             assert_eq!(r["name"], stem);
             assert!(!s.is_dirty(), "showing the file's name is not a change to save");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_takes_a_tab_place_and_refuses_anything_but_a_whole_number() {
+        let dir = name_dir("open-tab");
+        let path = dir.join("bracket.solidcraft");
+        std::fs::write(&path, solidcraft_io::write_design(&Document::new("Bracket"))).unwrap();
+        // Headless there are no tabs: the place is checked and the design opens as without it.
+        for tab in [json!(0), json!(3), json!(u64::MAX), Value::Null] {
+            let mut s = Session::default();
+            let r = s.execute("doc.open", &json!({"path": path, "tab": tab})).unwrap();
+            assert_eq!(r["name"], "Bracket", "tab {tab}");
+        }
+        for tab in [json!(-1), json!(1.5), json!("2"), json!(f64::MAX), json!([0]), json!({"at": 0})] {
+            let mut s = Session::default();
+            let before = s.doc.clone();
+            let e = s.execute("doc.open", &json!({"path": path, "tab": tab})).unwrap_err().to_string();
+            assert!(e.contains("`tab`"), "tab {tab}: {e}");
+            assert_eq!(*s.doc, *before, "a refused open leaves the design");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

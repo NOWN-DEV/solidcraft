@@ -5,7 +5,10 @@
 - **Title bar.** On Windows and Linux the application bar is the window's title bar. On the left:
   the File menu (New, Open, Save, Save As, Export…), undo and redo, the Home tab (the start page)
   and one tab per open design (each with its own undo history, selection and camera; a dot marks
-  unsaved changes). On the right: Report a bug, Help (?), Preferences (which hold the theme) and the
+  unsaved changes). Files dragged from a file manager onto the tabs open there, each as a design
+  in a new tab: a mark shows the place between the tabs. A CAD, mesh, drawing or point cloud file
+  dropped there becomes a design of its own; dropped on the view instead, it is inserted into a
+  design that has features. On the right: Report a bug, Help (?), Preferences (which hold the theme) and the
   window's buttons.
 - **Toolbar.** The workspace switcher (DESIGN) sits on the left. The tabs (MODEL, SURFACE,
   ASSEMBLE, INSERT, INSPECT, MANAGE, VIEW and SHEET METAL) hold sections of commands. SKETCH appears while

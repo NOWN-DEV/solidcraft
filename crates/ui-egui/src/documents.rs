@@ -93,6 +93,19 @@ pub struct Documents {
     /// the link (opened, adopted in place, the link just made).
     /// Coming back to its tab reads again those that differ (`linked_source::update_changed`).
     pub(crate) link_stamps: Vec<(u64, crate::linked_source::Stamp)>,
+    /// The tab bar as last drawn, for files dropped on it.
+    pub(crate) file_drop_zone: Option<FileDropZone>,
+    /// Files dragged over the tab bar: the place among the tabs they would open at.
+    pub file_drop: Option<usize>,
+}
+
+/// Where files dropped on the tab bar go: the bar's row, and the places between the tabs shown
+/// (from the left end of the first to the right end of the last), each with the tab index a file
+/// dropped there opens at.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileDropZone {
+    rect: Rect,
+    gaps: Vec<(f32, usize)>,
 }
 
 impl Documents {
@@ -345,6 +358,30 @@ pub(crate) fn same_path(a: &str, b: &str) -> bool {
 
 /// Open `session` in a new tab after the active one and switch to it (`fit`: frame its model).
 pub fn open_tab(app: &mut SolveApp, session: Session) -> Result<(), String> {
+    let at = app.docs.active.saturating_add(1);
+    insert_tab(app, session, at)
+}
+
+/// Open `session` in a new tab at place `at` among the tabs (past the last: at the end) and
+/// switch to it, framing its model. Not while a "save changes?" prompt is open or tabs are being
+/// closed one after another, as for [`move_tab`].
+pub fn open_tab_at(app: &mut SolveApp, session: Session, at: usize) -> Result<(), String> {
+    tab_room(app)?;
+    insert_tab(app, session, at)
+}
+
+/// Whether [`open_tab_at`] can open a tab now, or why not.
+pub fn tab_room(app: &SolveApp) -> Result<(), String> {
+    if app.docs.closing.is_some() || app.docs.quitting.is_some() || app.docs.batch.is_some() {
+        return Err("tabs are being closed; open the file once that is done".into());
+    }
+    if app.docs.count() >= MAX_OPEN {
+        return Err("too many open designs; close a tab before opening another".into());
+    }
+    Ok(())
+}
+
+fn insert_tab(app: &mut SolveApp, session: Session, at: usize) -> Result<(), String> {
     if app.docs.slots.is_empty() {
         app.docs.slots.push(None);
         app.docs.active = 0;
@@ -352,8 +389,11 @@ pub fn open_tab(app: &mut SolveApp, session: Session) -> Result<(), String> {
     if app.docs.slots.len() >= MAX_OPEN {
         return Err(format!("at most {MAX_OPEN} designs can be open"));
     }
-    let at = app.docs.active + 1;
+    let at = at.min(app.docs.slots.len());
     app.docs.slots.insert(at, Some(DocSlot::new(session)));
+    if at <= app.docs.active {
+        app.docs.active += 1;
+    }
     switch(app, at);
     app.fit_view();
     Ok(())
@@ -717,6 +757,7 @@ pub fn control(app: &mut SolveApp, p: &Value) -> Value {
         "read_only": app.session.read_only,
         "open_elsewhere": app.lock_prompts.len(),
         "changed_on_disk": app.disk_prompt,
+        "file_drop": app.docs.file_drop,
     })
 }
 
@@ -864,6 +905,31 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
         }
         None => d.remove::<TabDrag>(drag_id),
     });
+    // Files dragged over the bar open as designs of their own: a mark shows the place among the
+    // tabs they would open at.
+    let mut gaps = Vec::with_capacity(shown + 1);
+    let mut gap = x0;
+    gaps.push((gap, first));
+    for (k, w) in widths.iter().enumerate() {
+        gap += w;
+        gaps.push((gap, first + k + 1));
+    }
+    let zone = FileDropZone { rect: Rect::from_x_y_ranges(x0..=x1.max(x0), r.y_range()), gaps };
+    app.docs.file_drop = if ui.input(|i| !i.raw.hovered_files.is_empty()) { file_drop_at(&zone, pointer) } else { None };
+    if let Some(at) = app.docs.file_drop
+        && let Some(&(gx, _)) = zone.gaps.iter().find(|(_, i)| *i == at)
+    {
+        // In the 2-pixel gap a tab leaves at its right.
+        let x = (gx - 1.0).clamp(x0 + 1.0, x1.max(x0 + 1.0));
+        let mark = Rect::from_center_size(pos2(x, r.center().y), vec2(3.0, r.height() - 6.0));
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("sc_doc_file_drop")));
+        painter.rect_filled(mark, 1.5, t.accent);
+        for y in [mark.top(), mark.bottom()] {
+            painter.circle_filled(pos2(x, y), 3.5, t.accent);
+        }
+        crate::scenario::publish_handle("tab:file_drop", mark.center());
+    }
+    app.docs.file_drop_zone = Some(zone);
     let mut x = strip_end;
     // More tabs than fit: a chevron lists them all.
     if shown < n {
@@ -976,6 +1042,41 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
                 move_tab(app, from, to);
             }
         }
+    }
+}
+
+/// Where files dropped with the pointer at `pointer` would open among the tabs: the place
+/// between tabs (or at either end) nearest it, when it is over the tab bar.
+fn file_drop_at(zone: &FileDropZone, pointer: Option<egui::Pos2>) -> Option<usize> {
+    let p = pointer.filter(|p| zone.rect.contains(*p))?;
+    zone.gaps.iter().min_by(|a, b| (a.0 - p.x).abs().total_cmp(&(b.0 - p.x).abs())).map(|(_, at)| *at)
+}
+
+/// Files dropped on the tab bar open, each as a design in a new tab, at the place the bar marked
+/// (a CAD, mesh, drawing or point cloud file as a new design holding it, never inserted into
+/// the design shown). Called before the app's own drop handling, so those taken are not opened
+/// twice. The pointer is where it was last seen, as for the agent chat's drops.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn take_file_drops(app: &mut SolveApp, ctx: &egui::Context) {
+    if ctx.input(|i| i.raw.dropped_files.is_empty()) {
+        return;
+    }
+    let pointer = ctx.input(|i| i.pointer.latest_pos());
+    let Some(at) = app.docs.file_drop_zone.as_ref().and_then(|z| file_drop_at(z, pointer)) else { return };
+    let files = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+    app.docs.file_drop = None;
+    open_files_at(app, files.iter().map(|f| f.path().to_string_lossy().to_string()), at);
+}
+
+/// Open each of `paths` as a design in a new tab, the first at place `at`, the others after it
+/// in their order. A file already open shows its tab instead; one that can't be read says why.
+pub fn open_files_at(app: &mut SolveApp, paths: impl Iterator<Item = String>, at: usize) {
+    let mut at = at;
+    for path in paths.filter(|p| !p.is_empty()) {
+        let mut request = crate::file_load::Request::new(&path, crate::file_load::Kind::Open);
+        request.tab = Some(at);
+        at = at.saturating_add(1);
+        let _ = crate::file_load::begin_request(app, request);
     }
 }
 
@@ -1509,6 +1610,129 @@ mod tests {
         h.app.synthetic.extend([escape, egui::Event::PointerMoved(t1), button(t1, false)]);
         h.frames(16);
         assert_eq!(h.app.docs.active, 2, "Escape put it back");
+    }
+
+    #[derive(Debug)]
+    struct DroppedPath(std::path::PathBuf);
+
+    impl egui::DroppedFile for DroppedPath {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    fn dropped(files: &[&std::path::Path]) -> Vec<egui::DroppedFileHandle> {
+        files.iter().map(|p| std::sync::Arc::new(DroppedPath(p.to_path_buf())) as egui::DroppedFileHandle).collect()
+    }
+
+    fn names(app: &SolveApp) -> Vec<String> {
+        tabs_info(app).into_iter().map(|(name, _)| name).collect()
+    }
+
+    /// Files dragged over the tab bar show where they would open; dropped there, each opens as a
+    /// design in a new tab at that place (a mesh too, never inserted into the design shown), and
+    /// one that can't be read says so and opens nothing. Dropped elsewhere they do what they did.
+    #[test]
+    fn files_dropped_on_the_tab_bar_open_in_new_tabs_there() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-tab-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plate = dir.join("plate.solidcraft");
+        let mut saved = Session::default();
+        saved.execute("solid.box", &json!({"length": 40, "width": 30, "height": 2})).unwrap();
+        saved.execute("file.save_as", &json!({"path": plate})).unwrap();
+        let tetra = dir.join("tetra.stl");
+        std::fs::write(&tetra, "solid t\nfacet normal 0 0 -1\n outer loop\n  vertex 0 0 0\n  vertex 0 10 0\n  vertex 10 0 0\n endloop\nendfacet\nfacet normal 0 -1 0\n outer loop\n  vertex 0 0 0\n  vertex 10 0 0\n  vertex 0 0 10\n endloop\nendfacet\nfacet normal -1 0 0\n outer loop\n  vertex 0 0 0\n  vertex 0 0 10\n  vertex 0 10 0\n endloop\nendfacet\nfacet normal 1 1 1\n outer loop\n  vertex 10 0 0\n  vertex 0 10 0\n  vertex 0 0 10\n endloop\nendfacet\nendsolid t\n").unwrap();
+        let junk = dir.join("junk.step");
+        std::fs::write(&junk, "not a STEP file").unwrap();
+
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.custom_titlebar = true;
+        h.call("ui.resize", json!({"width": 1400, "height": 720}));
+        h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        open_tab(&mut h.app, Session::default()).unwrap();
+        switch(&mut h.app, 0);
+        h.frames(3);
+        let at = |h: &mut crate::scenario::Harness, handle: &str| {
+            let [x, y] = h.at(&json!({"handle": handle})).unwrap();
+            egui::pos2(x as f32, y as f32)
+        };
+        let between = {
+            let (a, b) = (at(&mut h, "tab:design:0"), at(&mut h, "tab:design:1"));
+            egui::pos2((a.x + b.x) / 2.0, a.y)
+        };
+        let hovered = || vec![egui::HoveredFile { path: Some(tetra.clone()), mime: String::new() }];
+        h.drag_files(between, hovered(), Vec::new());
+        assert_eq!(h.app.docs.file_drop, Some(1), "between the two tabs");
+        assert!(h.at(&json!({"handle": "tab:file_drop"})).is_ok(), "and marked there");
+        assert_eq!(h.call("ui.documents", json!({}))["file_drop"], 1);
+        h.drag_files(egui::pos2(700.0, 400.0), hovered(), Vec::new());
+        assert_eq!(h.app.docs.file_drop, None, "nothing marked over the 3D view");
+
+        h.drop_files(between, dropped(&[&plate, &tetra, std::path::Path::new("")]));
+        h.settle();
+        assert_eq!(names(&h.app), ["Untitled", "plate", "tetra", "Untitled"], "both open in order between the tabs");
+        assert_eq!(h.app.docs.active, 2, "the last one opened is shown");
+        assert_eq!(h.app.session.model.state().bodies.len(), 1, "the mesh is a design of its own");
+        assert_eq!(h.app.docs.file_drop, None);
+        switch(&mut h.app, 0);
+        assert_eq!(h.app.session.doc.features.len(), 1, "the design that was shown took nothing in");
+        assert_eq!(h.app.session.model.state().bodies.len(), 1);
+
+        // At the end of the strip: unreadable files say so and open nothing.
+        h.frames(3);
+        let end = at(&mut h, "tab:new") - vec2(14.0, 0.0);
+        h.drop_files(end, dropped(&[&junk, &dir.join("missing.stl")]));
+        h.settle();
+        assert_eq!(h.app.docs.count(), 4, "{:?}", names(&h.app));
+        assert!(h.app.status.as_ref().is_some_and(|(_, _, error)| *error), "{:?}", h.app.status);
+        assert_eq!(h.app.docs.active, 0);
+        assert_eq!(h.app.session.doc.features.len(), 1);
+
+        // Dropped on the 3D view, a mesh still goes into the design shown.
+        h.drop_files(egui::pos2(700.0, 400.0), dropped(&[&tetra]));
+        h.settle();
+        assert_eq!(h.app.docs.count(), 4);
+        assert_eq!(h.app.session.model.state().bodies.len(), 2, "inserted as before");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `doc.open`'s `tab` over the control channel opens the file in a new tab at that place;
+    /// past the last tab it goes at the end, and a place that is no whole number is refused.
+    #[test]
+    fn doc_open_with_a_tab_place_opens_a_new_tab_there() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-tab-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for name in ["first", "last"] {
+            let path = dir.join(format!("{name}.solidcraft"));
+            let mut s = Session::default();
+            s.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5})).unwrap();
+            s.execute("file.save_as", &json!({"path": path})).unwrap();
+            paths.push(path.to_string_lossy().to_string());
+        }
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        let open = |h: &mut crate::scenario::Harness, path: &str, tab: Value| {
+            h.call_queued("engine.execute", json!({"command": "doc.open", "params": {"path": path, "tab": tab}})).0
+        };
+        let r = open(&mut h, &paths[0], json!(0));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(names(&h.app), ["first", "Untitled"], "a new tab before the design shown, not in its place");
+        assert_eq!(h.app.docs.active, 0);
+        let r = open(&mut h, &paths[1], json!(u64::MAX));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(names(&h.app), ["first", "Untitled", "last"]);
+        for tab in [json!(-1), json!(0.5), json!("1")] {
+            let r = open(&mut h, &paths[0], tab.clone());
+            assert_eq!(r["ok"], false, "tab {tab}: {r}");
+        }
+        assert_eq!(h.app.docs.count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #5366: Ctrl+W closes the design shown: a saved one at once (the last one leaves the start

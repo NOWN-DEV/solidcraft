@@ -58,6 +58,9 @@ pub struct Request {
     /// The saved design this request is for, when it must not run on another: one shown in its
     /// place by the time the request starts drops it.
     pub design: Option<String>,
+    /// An open into a new design tab at this place among the tabs (files dropped on the tab bar,
+    /// `doc.open`'s `tab`), never in place of the design shown.
+    pub tab: Option<usize>,
 }
 
 impl Request {
@@ -70,6 +73,7 @@ impl Request {
             options: Default::default(),
             allow_hosts: Vec::new(),
             design: None,
+            tab: None,
         }
     }
     fn insert(&self) -> bool {
@@ -257,6 +261,14 @@ pub fn begin_request(app: &mut SolveApp, request: Request) -> Result<(), String>
                 Ok(Value::Null)
             }
             Kind::Open => {
+                // A blank tab at the place asked for, which the open then takes.
+                if let Some(at) = request.tab
+                    && let Err(e) = crate::documents::open_tab_at(app, Session::default(), at)
+                {
+                    app.set_status(e.clone(), true);
+                    request.answer(Err(e.clone()));
+                    return Err(e);
+                }
                 app.open_path(&request.path);
                 // Opened in place of the blank tab it made, with no switch to it.
                 crate::edit_in_place::attach(app);
@@ -371,9 +383,30 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
         options.remove("path");
         options.retain(|_, v| !v.is_null());
     }
-    let request = Request { path: path.into(), kind, reply: Some(req.reply.clone()), scope, options, allow_hosts: Vec::new(), design: None };
+    // The tab to open in is the window's business, not the command's.
+    let tab = match options.remove("tab") {
+        None => None,
+        Some(v) if kind == Kind::Open => match open_tab_param(&v) {
+            Ok(at) => Some(at),
+            Err(e) => {
+                let _ = req.reply.send(json!({"ok": false, "error": e}));
+                return None;
+            }
+        },
+        Some(v) => {
+            options.insert("tab".into(), v);
+            None
+        }
+    };
+    let request = Request { path: path.into(), kind, reply: Some(req.reply.clone()), scope, options, allow_hosts: Vec::new(), design: None, tab };
     let _ = begin_request(app, request);
     None
+}
+
+/// `doc.open`'s `tab`: a place among the design tabs (0 is the first; one past the last tabs
+/// are clamped to the end).
+fn open_tab_param(v: &Value) -> Result<usize, String> {
+    v.as_u64().map(|at| usize::try_from(at).unwrap_or(usize::MAX)).ok_or_else(|| "doc.open: `tab` must be a whole number, 0 or more".to_string())
 }
 
 /// An autosave that failed to load goes back in the recovery list, so it can be discarded (or
@@ -419,6 +452,14 @@ fn start(app: &mut SolveApp) {
         let e = "too many open designs; close a tab before opening another";
         app.set_status(e, true);
         request.answer(Err(e.into()));
+        return;
+    }
+    if request.kind == Kind::Open
+        && request.tab.is_some()
+        && let Err(e) = crate::documents::tab_room(app)
+    {
+        app.set_status(e.clone(), true);
+        request.answer(Err(e));
         return;
     }
     let insert = request.insert();
@@ -914,13 +955,25 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
                 request.answer(r);
             }
             Ok(_) if reuse_open(app, request) => {}
-            Ok(made) if running.matches(&app.session) => {
+            Ok(_) if request.kind == Kind::Open && request.tab.is_some() && crate::documents::tab_room(app).is_err() => {
+                let e = crate::documents::tab_room(app).err().unwrap_or_default();
+                request.answer(Err(e.clone()));
+                app.set_status(e, true);
+            }
+            // A design opened into a tab of its own does not care what the shown one did meanwhile.
+            Ok(made) if running.matches(&app.session) || (request.kind == Kind::Open && request.tab.is_some()) => {
                 // Not meshed yet: framing it while it goes in must not mesh it here.
                 app.open_meshing_next = true;
                 crate::frame_watch::step(app, "before the open");
                 if request.insert() {
                     app.session.accept_computed(made.session);
                     app.big_operation = true;
+                } else if let Some(at) = request.tab.filter(|_| request.kind == Kind::Open) {
+                    // Room was checked just above; the window has not changed since.
+                    if let Err(e) = crate::documents::open_tab_at(app, made.session, at) {
+                        app.set_status(e, true);
+                    }
+                    app.home.add_recent(&request.path);
                 } else {
                     crate::documents::adopt(app, made.session);
                     if request.kind == Kind::Open {
