@@ -1,0 +1,10 @@
+{
+  "action": "pr_create",
+  "repo": "tangency-labs/solidcore",
+  "title": "difftest: SolidCraft #2947 case (a plate across a revolved ring's seam)",
+  "head": "NOWN-DEV:solidcraft-case/2947-plate-across-revolved-seam",
+  "base": "main",
+  "draft": true,
+  "body_file": "20261030T1151Z-solidcore-2947-pr.md",
+  "requested_by": "Upstream thread (Flip 46a: solidcore test ports), session_01RDDZ7uqE6s2jKvhrqaanW9"
+}
