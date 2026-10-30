@@ -1,0 +1,40 @@
+name: Upstream relay
+
+# Runs the request files a push adds under requests/ on this branch against the
+# upstream repositories (see README.md). Only pushes to nown-relay run it, and
+# the token lives in the 'upstream' environment, which only nown-relay may use.
+on:
+  push:
+    branches: [nown-relay]
+    paths: ['requests/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    environment: upstream
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run requests
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+          RELAY_DENY_PATTERN: ${{ secrets.RELAY_DENY_PATTERN }}
+        run: python3 relay/relay.py "$GITHUB_EVENT_PATH"
+      - name: Keep results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-results
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 14
