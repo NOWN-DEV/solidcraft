@@ -189,7 +189,9 @@ def run(gh, req, login, dry_run=False):
             out["review_comments"] = [dict(slim(c, ("id", "in_reply_to_id", "path", "line", "body", "created_at", "html_url")),
                                            author=(c.get("user") or {}).get("login"))
                                       for c in gh.pages(f"/repos/{repo}/pulls/{n}/comments")]
-            out["checks"] = [slim(c, ("name", "status", "conclusion", "html_url"))
+            out["checks"] = [dict(slim(c, ("name", "status", "conclusion", "html_url", "completed_at")),
+                                  **({"output": slim(c["output"], ("title", "summary"))}
+                                     if c.get("conclusion") == "failure" and c.get("output") else {}))
                              for c in gh.pages(f"/repos/{repo}/commits/{sha}/check-runs")]
         return out
 
