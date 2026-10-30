@@ -68,13 +68,22 @@ class GitHub:
         return out
 
 
-def added_request_files(event):
-    """Request files added by the commits of this push, in name order."""
+def added_request_files(event, compare=None):
+    """Request files this push added, in name order.
+
+    Actions push events do not list the files of each commit, so the push is
+    compared (before...after) through the API; a new branch runs nothing.
+    """
+    def wanted(path):
+        return path.startswith(REQUEST_DIR + "/") and path.endswith(".json")
+
     files = set()
     for commit in event.get("commits") or []:
-        for path in commit.get("added") or []:
-            if path.startswith(REQUEST_DIR + "/") and path.endswith(".json"):
-                files.add(path)
+        files.update(p for p in commit.get("added") or [] if wanted(p))
+    before, after = event.get("before", ""), event.get("after", "")
+    if compare and before and after and set(before) != {"0"}:
+        files.update(f["filename"] for f in compare(before, after)
+                     if f.get("status") == "added" and wanted(f.get("filename", "")))
     return sorted(files)
 
 
@@ -246,8 +255,16 @@ def main(argv):
     gh = GitHub(token)
     login = gh.call("GET", "/user")["login"]
     os.makedirs(RESULT_DIR, exist_ok=True)
-    files = added_request_files(event)
+    own = GitHub(os.environ.get("GITHUB_TOKEN", ""))
+    repo_self = os.environ.get("GITHUB_REPOSITORY", "")
+
+    def compare(before, after):
+        return own.call("GET", f"/repos/{repo_self}/compare/{before}...{after}").get("files") or []
+
+    files = added_request_files(event, compare)
     print(f"relay as {login}: {len(files)} request file(s)")
+    if not files:
+        print("::warning::no new request files in this push (a request runs once, when its file is added)")
     failed = 0
     for path in files:
         name = os.path.splitext(os.path.basename(path))[0]

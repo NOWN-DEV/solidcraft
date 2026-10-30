@@ -128,6 +128,18 @@ class Files(unittest.TestCase):
                              {"added": ["requests/body.md"], "modified": ["requests/c.json"]}]}
         self.assertEqual(relay.added_request_files(event), ["requests/a.json", "requests/b.json"])
 
+    def test_added_files_from_compare(self):
+        event = {"before": "a" * 40, "after": "b" * 40, "commits": [{"id": "b" * 40}]}
+        files = [{"filename": "requests/x.json", "status": "added"},
+                 {"filename": "requests/old.json", "status": "modified"},
+                 {"filename": "requests/x.md", "status": "added"},
+                 {"filename": "relay/relay.py", "status": "added"}]
+        self.assertEqual(relay.added_request_files(event, lambda b, a: files), ["requests/x.json"])
+
+    def test_new_branch_runs_nothing(self):
+        event = {"before": "0" * 40, "after": "b" * 40, "commits": []}
+        self.assertEqual(relay.added_request_files(event, lambda b, a: [{"filename": "requests/x.json", "status": "added"}]), [])
+
     def test_body_file_stays_in_requests(self):
         with tempfile.TemporaryDirectory() as root:
             os.makedirs(os.path.join(root, "requests"))

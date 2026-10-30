@@ -29,6 +29,7 @@ jobs:
         env:
           UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
           RELAY_DENY_PATTERN: ${{ secrets.RELAY_DENY_PATTERN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 relay/relay.py "$GITHUB_EVENT_PATH"
       - name: Keep results
         if: always()
