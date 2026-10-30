@@ -102,7 +102,7 @@ pub struct Documents {
 /// Where files dropped on the tab bar go: the bar's row, and the places between the tabs shown
 /// (from the left end of the first to the right end of the last), each with the tab index a file
 /// dropped there opens at.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct FileDropZone {
     rect: Rect,
     gaps: Vec<(f32, usize)>,
@@ -757,7 +757,6 @@ pub fn control(app: &mut SolveApp, p: &Value) -> Value {
         "read_only": app.session.read_only,
         "open_elsewhere": app.lock_prompts.len(),
         "changed_on_disk": app.disk_prompt,
-        "file_drop": app.docs.file_drop,
     })
 }
 
@@ -1668,7 +1667,6 @@ mod tests {
         h.drag_files(between, hovered(), Vec::new());
         assert_eq!(h.app.docs.file_drop, Some(1), "between the two tabs");
         assert!(h.at(&json!({"handle": "tab:file_drop"})).is_ok(), "and marked there");
-        assert_eq!(h.call("ui.documents", json!({}))["file_drop"], 1);
         h.drag_files(egui::pos2(700.0, 400.0), hovered(), Vec::new());
         assert_eq!(h.app.docs.file_drop, None, "nothing marked over the 3D view");
 
