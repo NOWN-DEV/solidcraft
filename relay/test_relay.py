@@ -110,6 +110,15 @@ class Run(unittest.TestCase):
         with self.assertRaises(relay.RelayError):
             relay.validate(req(action="fork", repo="someone/else"), DENY)
 
+    def test_ready_only_own_pr(self):
+        gh = FakeGitHub({f"/repos/{REPO}/pulls/7": {"user": {"login": "someone"}, "node_id": "X"}})
+        with self.assertRaises(relay.RelayError):
+            relay.run(gh, req(action="ready", number=7), "NOWN-DEV")
+        gh = FakeGitHub({f"/repos/{REPO}/pulls/7": {"user": {"login": "NOWN-DEV"}, "node_id": "X"}})
+        relay.run(gh, req(action="ready", number=7), "NOWN-DEV")
+        method, path, data = gh.calls[-1]
+        self.assertEqual((method, path, data["variables"]), ("POST", "/graphql", {"id": "X"}))
+
     def test_dry_run_writes_nothing(self):
         gh = FakeGitHub()
         out = relay.run(gh, req(action="comment", number=4, body="hi"), "NOWN-DEV", dry_run=True)

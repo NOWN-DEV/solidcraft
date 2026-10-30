@@ -18,7 +18,7 @@ API = "https://api.github.com"
 ALLOWED_REPOS = {"tangency-labs/solidcraft", "tangency-labs/solidcore"}
 WRITE_ACTIONS = {
     "pr_create", "issue_create", "comment", "review_reply",
-    "edit", "edit_comment", "delete_comment", "close", "reopen", "fork",
+    "edit", "edit_comment", "delete_comment", "close", "reopen", "fork", "ready",
 }
 READ_ACTIONS = {"read", "list", "search"}
 MAX_BODY = 65000
@@ -137,6 +137,7 @@ def validate(req, deny):
         "close": ("number",),
         "reopen": ("number",),
         "fork": (),
+        "ready": ("number",),
         "read": ("number",),
         "list": (),
         "search": ("query",),
@@ -214,6 +215,12 @@ def run(gh, req, login, dry_run=False):
         call = ("POST", f"/repos/{repo}/pulls",
                 {"title": req["title"], "head": head, "base": req["base"], "body": req.get("body", ""),
                  "draft": bool(req.get("draft", True)), "maintainer_can_modify": True})
+    elif action == "ready":
+        pr = gh.call("GET", f"/repos/{repo}/pulls/{n}")
+        require_own(pr, login, f"#{n}")
+        mutation = ("mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) "
+                    "{ pullRequest { isDraft } } }")
+        call = ("POST", "/graphql", {"query": mutation, "variables": {"id": pr["node_id"]}})
     elif action == "fork":
         call = ("POST", f"/repos/{repo}/forks", {"default_branch_only": True})
     elif action == "issue_create":
