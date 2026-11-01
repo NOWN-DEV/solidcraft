@@ -1,0 +1,1 @@
+{"action": "pr_create", "repo": "tangency-labs/solidcraft", "title": "Sketch: a fillet against a mirrored reference keeps its short arc", "head": "NOWN-DEV:upstream-pr/fillet-mirrored-reference", "base": "main", "body_file": "20261101T0135Z-a-pr-fillet.md", "draft": false, "requested_by": "Flip, Workstation 1 (relayed for the SolidCraft engine thread)"}
