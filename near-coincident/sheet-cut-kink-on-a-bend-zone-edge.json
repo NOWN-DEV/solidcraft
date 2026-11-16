@@ -1,0 +1,145 @@
+{
+ "commands": [
+  {
+   "command": "sheet.manage_rules",
+   "params": {
+    "name": "R1",
+    "thickness": "1.5 mm",
+    "bend_radius": "2 mm",
+    "k_factor": "0.5",
+    "active": true
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Base"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      0,
+      0
+     ],
+     [
+      200,
+      0
+     ],
+     [
+      200,
+      100
+     ],
+     [
+      0,
+      100
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "base",
+    "sketch": "Base",
+    "rule": "R1",
+    "name": "Plate"
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      150.0,
+      0,
+      1.5
+     ],
+     [
+      150.0,
+      100,
+      1.5
+     ]
+    ],
+    "angle": "90 deg",
+    "position": "centerline",
+    "fixed": [
+     50,
+     50,
+     1.5
+    ],
+    "flip": false
+   }
+  },
+  {
+   "command": "sheet.unfold",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Hole"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      161.981845,
+      59.99997
+     ],
+     [
+      152.159845,
+      60.0
+     ],
+     [
+      147.840155,
+      60.0
+     ],
+     [
+      137.468155,
+      60.0
+     ],
+     [
+      137.468155,
+      40.0
+     ],
+     [
+      161.981845,
+      40.0
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "Hole",
+    "profiles": "all",
+    "distance": "6 mm",
+    "direction": "symmetric",
+    "operation": "cut",
+    "name": "HoleCut"
+   }
+  },
+  {
+   "command": "sheet.refold",
+   "params": {}
+  }
+ ]
+}

@@ -1,0 +1,130 @@
+{
+ "commands": [
+  {
+   "command": "sheet.manage_rules",
+   "params": {
+    "name": "R1",
+    "thickness": "1.5 mm",
+    "bend_radius": "2 mm",
+    "k_factor": "0.5",
+    "active": true
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Base"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      0,
+      0
+     ],
+     [
+      200,
+      0
+     ],
+     [
+      200,
+      100
+     ],
+     [
+      0,
+      100
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "base",
+    "sketch": "Base",
+    "rule": "R1",
+    "name": "Plate"
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      1000,
+      1000,
+      0
+     ],
+     "x_dir": [
+      1,
+      0,
+      0
+     ],
+     "y_dir": [
+      0,
+      1,
+      0
+     ]
+    },
+    "name": "Hole"
+   }
+  },
+  {
+   "command": "sketch.arc.three_point",
+   "params": {
+    "start": [
+     -945.0,
+     -950.0
+    ],
+    "through": [
+     -950.0,
+     -945.0
+    ],
+    "end": [
+     -955.0,
+     -950.0
+    ]
+   }
+  },
+  {
+   "command": "sketch.arc.three_point",
+   "params": {
+    "start": [
+     -955.0,
+     -950.0
+    ],
+    "through": [
+     -950.0,
+     -955.0
+    ],
+    "end": [
+     -945.0,
+     -950.0
+    ]
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "Hole",
+    "profiles": "all",
+    "distance": "6 mm",
+    "direction": "symmetric",
+    "operation": "cut",
+    "name": "HoleCut"
+   }
+  }
+ ]
+}

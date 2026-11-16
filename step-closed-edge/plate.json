@@ -1,0 +1,7 @@
+{"commands":[
+{"command":"sketch.create","params":{"plane":"XY","name":"S"}},
+{"command":"sketch.rectangle.two_point","params":{"p0":[0,0],"p1":[40,30]}},
+{"command":"sketch.circle.center","params":{"center":[20,15],"radius":6}},
+{"command":"sketch.finish","params":{}},
+{"command":"solid.extrude","params":{"sketch":"S","distance":5}}
+]}

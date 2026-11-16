@@ -1,0 +1,186 @@
+{
+ "commands": [
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      0,
+      0,
+      -250.0
+     ],
+     "x_dir": [
+      0,
+      1,
+      0
+     ],
+     "y_dir": [
+      0,
+      0,
+      1
+     ]
+    },
+    "name": "A"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      -60,
+      0
+     ],
+     [
+      140,
+      0
+     ],
+     [
+      140,
+      250
+     ],
+     [
+      94,
+      250
+     ],
+     [
+      94,
+      235
+     ],
+     [
+      67,
+      235
+     ],
+     [
+      67,
+      250
+     ],
+     [
+      27,
+      250
+     ],
+     [
+      27,
+      235
+     ],
+     [
+      0,
+      235
+     ],
+     [
+      0,
+      250
+     ],
+     [
+      -60,
+      250
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "A",
+    "distance": 24.0,
+    "operation": "new",
+    "body_name": "A"
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      0,
+      0,
+      -15.0
+     ],
+     "x_dir": [
+      1,
+      0,
+      0
+     ],
+     "y_dir": [
+      0,
+      1,
+      0
+     ]
+    },
+    "name": "B"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      -16,
+      1
+     ],
+     [
+      44,
+      1
+     ],
+     [
+      44,
+      93
+     ],
+     [
+      -16,
+      93
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      24.1,
+      27
+     ],
+     [
+      24.1,
+      66.9999872272142
+     ],
+     [
+      -0.1,
+      67.00003680879706
+     ],
+     [
+      -0.1,
+      27
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "B",
+    "distance": 2.5,
+    "operation": "new",
+    "body_name": "B"
+   }
+  },
+  {
+   "command": "inspect.interference",
+   "params": {
+    "budget_s": 240
+   }
+  }
+ ]
+}

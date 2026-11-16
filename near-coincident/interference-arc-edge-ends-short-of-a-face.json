@@ -1,0 +1,183 @@
+{
+ "commands": [
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      0,
+      0,
+      -250.0
+     ],
+     "x_dir": [
+      0,
+      1,
+      0
+     ],
+     "y_dir": [
+      0,
+      0,
+      1
+     ]
+    },
+    "name": "A"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      1300,
+      150
+     ],
+     [
+      1600,
+      150
+     ],
+     [
+      1600,
+      250
+     ],
+     [
+      1300,
+      250
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "A",
+    "distance": 24.0,
+    "operation": "new",
+    "body_name": "A"
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      0,
+      0,
+      -15.0
+     ],
+     "x_dir": [
+      1,
+      0,
+      0
+     ],
+     "y_dir": [
+      0,
+      1,
+      0
+     ]
+    },
+    "name": "B"
+   }
+  },
+  {
+   "command": "sketch.arc.three_point",
+   "params": {
+    "start": [
+     150.0,
+     1458.28743710662
+    ],
+    "end": [
+     23.999,
+     1462.9619168493916
+    ],
+    "through": [
+     87.0,
+     1462.6152655693797
+    ]
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      23.999,
+      1462.9619168493916
+     ],
+     [
+      -50.0,
+      1463.3
+     ]
+    ]
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      -50.0,
+      1463.3
+     ],
+     [
+      -50.0,
+      1363.3
+     ]
+    ]
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      -50.0,
+      1363.3
+     ],
+     [
+      150.0,
+      1363.3
+     ]
+    ]
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      150.0,
+      1363.3
+     ],
+     [
+      150.0,
+      1458.28743710662
+     ]
+    ]
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "B",
+    "distance": 2.5,
+    "operation": "new",
+    "body_name": "B"
+   }
+  },
+  {
+   "command": "inspect.interference",
+   "params": {
+    "budget_s": 240
+   }
+  }
+ ]
+}
