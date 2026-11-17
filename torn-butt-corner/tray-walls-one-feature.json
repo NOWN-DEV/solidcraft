@@ -1,0 +1,90 @@
+{
+ "commands": [
+  {
+   "command": "sheet.manage_rules",
+   "params": {
+    "name": "R1",
+    "thickness": "1.5 mm",
+    "bend_radius": "1.5 mm",
+    "k_factor": "0.5",
+    "corner_relief_shape": "tear",
+    "gap": "0.2 mm",
+    "active": true
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Base"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      0,
+      0
+     ],
+     [
+      300,
+      0
+     ],
+     [
+      300,
+      200
+     ],
+     [
+      0,
+      200
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "base",
+    "sketch": "Base",
+    "rule": "R1",
+    "name": "Plate"
+   }
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "edge",
+    "edges": [
+     [
+      150,
+      0,
+      1.5
+     ],
+     [
+      150,
+      200,
+      1.5
+     ],
+     [
+      0,
+      100,
+      1.5
+     ],
+     [
+      300,
+      100,
+      1.5
+     ]
+    ],
+    "height": 40,
+    "name": "Walls"
+   }
+  }
+ ]
+}

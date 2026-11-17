@@ -1,0 +1,147 @@
+{
+ "commands": [
+  {
+   "command": "sheet.manage_rules",
+   "params": {
+    "name": "R1",
+    "thickness": "1.5 mm",
+    "bend_radius": "1.5 mm",
+    "k_factor": "0.5",
+    "active": true
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Base"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      0,
+      92
+     ],
+     [
+      0,
+      0
+     ],
+     [
+      60,
+      0
+     ],
+     [
+      60,
+      92
+     ]
+    ]
+   }
+  },
+  {
+   "command": "sketch.arc.three_point",
+   "params": {
+    "start": [
+     60,
+     92
+    ],
+    "through": [
+     57.65685424949238,
+     97.65685424949238
+    ],
+    "end": [
+     52,
+     100
+    ]
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      52,
+      100
+     ],
+     [
+      40,
+      100
+     ],
+     [
+      40,
+      130
+     ],
+     [
+      20,
+      130
+     ],
+     [
+      20,
+      100
+     ],
+     [
+      8,
+      100
+     ]
+    ]
+   }
+  },
+  {
+   "command": "sketch.arc.three_point",
+   "params": {
+    "start": [
+     8,
+     100
+    ],
+    "through": [
+     2.3431457505076194,
+     97.65685424949238
+    ],
+    "end": [
+     0,
+     92
+    ]
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "base",
+    "sketch": "Base",
+    "rule": "R1",
+    "name": "Plate"
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      20,
+      101.76714586764426,
+      1.5
+     ],
+     [
+      40,
+      101.76714586764426,
+      1.5
+     ]
+    ],
+    "angle": "90 deg",
+    "position": "centerline",
+    "fixed": [
+     30,
+     50,
+     1.5
+    ],
+    "flip": false
+   }
+  }
+ ]
+}

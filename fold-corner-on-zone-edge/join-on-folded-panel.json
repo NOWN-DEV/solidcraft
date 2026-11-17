@@ -1,0 +1,137 @@
+{
+ "commands": [
+  {
+   "command": "sheet.manage_rules",
+   "params": {
+    "name": "R1",
+    "thickness": "1.5 mm",
+    "bend_radius": "1.5 mm",
+    "k_factor": "0.5",
+    "active": true
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Base"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      0,
+      0
+     ],
+     [
+      100,
+      0
+     ],
+     [
+      100,
+      60
+     ],
+     [
+      65.89048622548086,
+      60
+     ],
+     [
+      65.89048622548086,
+      30
+     ],
+     [
+      0,
+      30
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "base",
+    "sketch": "Base",
+    "rule": "R1",
+    "name": "Plate"
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      60.0,
+      0,
+      1.5
+     ],
+     [
+      60.0,
+      30,
+      1.5
+     ]
+    ],
+    "angle": "90 deg",
+    "position": "start",
+    "radius": "3 mm",
+    "fixed": [
+     20,
+     15,
+     1.5
+    ],
+    "flip": false
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "YZ",
+    "offset": "63 mm",
+    "name": "Block"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      35,
+      10
+     ],
+     [
+      50,
+      10
+     ],
+     [
+      50,
+      20
+     ],
+     [
+      35,
+      20
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.extrude",
+   "params": {
+    "sketch": "Block",
+    "distance": "1.5 mm",
+    "operation": "join",
+    "name": "Block"
+   }
+  }
+ ]
+}
