@@ -1,0 +1,186 @@
+{
+ "commands": [
+  {
+   "command": "sheet.manage_rules",
+   "params": {
+    "name": "R1",
+    "thickness": "1.5 mm",
+    "bend_radius": "1.1 mm",
+    "k_factor": "0",
+    "active": true
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": "XY",
+    "name": "Flat"
+   }
+  },
+  {
+   "command": "sketch.line",
+   "params": {
+    "points": [
+     [
+      0.88,
+      -24
+     ],
+     [
+      299.12,
+      -24
+     ],
+     [
+      299.12,
+      0.88
+     ],
+     [
+      324,
+      0.88
+     ],
+     [
+      324,
+      199.12
+     ],
+     [
+      299.12,
+      199.12
+     ],
+     [
+      299.12,
+      224
+     ],
+     [
+      0.88,
+      224
+     ],
+     [
+      0.88,
+      199.12
+     ],
+     [
+      -24,
+      199.12
+     ],
+     [
+      -24,
+      0.88
+     ],
+     [
+      0.88,
+      0.88
+     ]
+    ],
+    "closed": true
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sheet.flange",
+   "params": {
+    "type": "base",
+    "sketch": "Flat",
+    "rule": "R1",
+    "name": "Tray"
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      -30,
+      0,
+      0
+     ],
+     [
+      330,
+      0,
+      0
+     ]
+    ],
+    "angle": 90,
+    "position": "centerline",
+    "fixed": [
+     150,
+     100,
+     0
+    ]
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      300,
+      -30,
+      0
+     ],
+     [
+      300,
+      230,
+      0
+     ]
+    ],
+    "angle": 90,
+    "position": "centerline",
+    "fixed": [
+     150,
+     100,
+     0
+    ]
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      330,
+      200,
+      0
+     ],
+     [
+      -30,
+      200,
+      0
+     ]
+    ],
+    "angle": 90,
+    "position": "centerline",
+    "fixed": [
+     150,
+     100,
+     0
+    ]
+   }
+  },
+  {
+   "command": "sheet.fold",
+   "params": {
+    "points": [
+     [
+      0,
+      230,
+      0
+     ],
+     [
+      0,
+      -30,
+      0
+     ]
+    ],
+    "angle": 90,
+    "position": "centerline",
+    "fixed": [
+     150,
+     100,
+     0
+    ]
+   }
+  }
+ ]
+}

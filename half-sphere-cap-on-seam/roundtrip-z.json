@@ -1,0 +1,4 @@
+{"commands":[
+ {"command":"file.insert_step","params":{"path":"rod-capped-toward-z.step"}},
+ {"command":"file.export","params":{"path":"rod-capped-toward-z-roundtrip.step"}}
+]}
